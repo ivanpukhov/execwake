@@ -552,6 +552,109 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn records_dns_only_after_a_matching_response() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let executable = std::env::current_exe().expect("the test executable should be known");
+        let result = run_in_store(
+            vec![
+                executable.into_os_string(),
+                OsString::from("--ignored"),
+                OsString::from("--exact"),
+                OsString::from("runner::tests::dns_fixture_child"),
+                OsString::from("--nocapture"),
+                OsString::from("--test-threads=1"),
+            ],
+            &store,
+        )
+        .expect("the DNS fixture should run");
+        let connection =
+            Connection::open(result.session.database()).expect("the database should open");
+        let correlation = connection
+            .query_row(
+                "SELECT hostname, address, evidence, confidence FROM dns_correlation",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .expect("the DNS correlation should exist");
+
+        assert_eq!(
+            correlation,
+            (
+                "fixture.test".to_owned(),
+                "127.0.0.7".to_owned(),
+                "observed".to_owned(),
+                "high".to_owned(),
+            )
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn dns_fixture_child() {
+        use std::net::UdpSocket;
+
+        let server = UdpSocket::bind("127.0.0.1:0").expect("the DNS server should bind");
+        let server_address = server
+            .local_addr()
+            .expect("the server address should exist");
+        let server_thread = std::thread::spawn(move || {
+            let mut query = [0_u8; 512];
+            let (length, peer) = server
+                .recv_from(&mut query)
+                .expect("the server should receive a query");
+            let response = dns_fixture_response(&query[..length]);
+            server
+                .send_to(&response, peer)
+                .expect("the server should send a response");
+        });
+        let client = UdpSocket::bind("127.0.0.1:0").expect("the DNS client should bind");
+        client
+            .connect(server_address)
+            .expect("the DNS client should connect");
+        client
+            .send(&dns_fixture_query())
+            .expect("the DNS client should send a query");
+        let mut response = [0_u8; 512];
+        client
+            .recv(&mut response)
+            .expect("the DNS client should receive a response");
+        server_thread.join().expect("the DNS server should finish");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dns_fixture_query() -> Vec<u8> {
+        let mut packet = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        packet.extend_from_slice(&[
+            7, b'f', b'i', b'x', b't', b'u', b'r', b'e', 4, b't', b'e', b's', b't', 0,
+        ]);
+        packet.extend_from_slice(&[0, 1, 0, 1]);
+        packet
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dns_fixture_response(query: &[u8]) -> Vec<u8> {
+        let mut packet = query.to_vec();
+        packet[2] = 0x81;
+        packet[3] = 0x80;
+        packet[6] = 0;
+        packet[7] = 1;
+        packet.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 127, 0, 0, 7]);
+        packet
+    }
+
     #[cfg(unix)]
     fn exit_command(code: u8) -> Vec<OsString> {
         vec![

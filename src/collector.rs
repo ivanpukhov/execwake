@@ -86,6 +86,29 @@ pub struct FileDeltaRecord {
     pub after: FileState,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DnsConfidence {
+    High,
+}
+
+impl DnsConfidence {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DnsCorrelationRecord {
+    pub hostname: String,
+    pub address: String,
+    pub process: ProcessIdentity,
+    pub occurred_at_ms: i64,
+    pub evidence: EvidenceKind,
+    pub confidence: DnsConfidence,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectorEvent {
     pub category: &'static str,
@@ -102,6 +125,7 @@ pub trait CollectorSink {
     fn record_process_exec(&mut self, process: ProcessExecRecord) -> Result<(), SinkError>;
     fn record_process_exit(&mut self, process: ProcessExitRecord) -> Result<(), SinkError>;
     fn record_file_delta(&mut self, delta: FileDeltaRecord) -> Result<(), SinkError>;
+    fn record_dns_correlation(&mut self, dns: DnsCorrelationRecord) -> Result<(), SinkError>;
     fn record_event(&mut self, event: CollectorEvent) -> Result<(), SinkError>;
     fn set_coverage(&mut self, coverage: SessionCoverage) -> Result<(), SinkError>;
 }

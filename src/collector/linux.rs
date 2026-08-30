@@ -12,8 +12,9 @@ mod syscall;
 use syscall::SyscallState;
 
 use super::{
-    Collector, CollectorEvent, CollectorSink, FileDeltaRecord, FileState, FileStateKind,
-    ProcessExecRecord, ProcessExitRecord, ProcessIdentity, ProcessRecord, SinkError,
+    Collector, CollectorEvent, CollectorSink, DnsConfidence, DnsCorrelationRecord, FileDeltaRecord,
+    FileState, FileStateKind, ProcessExecRecord, ProcessExitRecord, ProcessIdentity, ProcessRecord,
+    SinkError,
 };
 use crate::privacy::PathRoots;
 use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage};
@@ -213,6 +214,28 @@ impl PtraceCollector {
                 process: Some(identity),
                 occurred_at_ms: unix_time_ms()?,
                 evidence: EvidenceKind::Observed,
+            })
+            .map_err(sink_error)?;
+        }
+        for event in observation.dns_events {
+            let occurred_at_ms = unix_time_ms()?;
+            let address = event.address.to_string();
+            sink.record_dns_correlation(DnsCorrelationRecord {
+                hostname: event.hostname.clone(),
+                address: address.clone(),
+                process: identity,
+                occurred_at_ms,
+                evidence: EvidenceKind::Observed,
+                confidence: DnsConfidence::High,
+            })
+            .map_err(sink_error)?;
+            sink.record_event(CollectorEvent {
+                category: "network",
+                operation: "dns",
+                target: format!("{} → {address}", event.hostname),
+                process: Some(identity),
+                occurred_at_ms,
+                evidence: EvidenceKind::Derived,
             })
             .map_err(sink_error)?;
         }

@@ -9,8 +9,8 @@ use fs2::FileExt;
 use rusqlite::{params, Connection, OpenFlags};
 
 use crate::collector::{
-    CollectorEvent, CollectorSink, FileDeltaRecord, ProcessExecRecord, ProcessExitRecord,
-    ProcessRecord, SinkError,
+    CollectorEvent, CollectorSink, DnsCorrelationRecord, FileDeltaRecord, ProcessExecRecord,
+    ProcessExitRecord, ProcessRecord, SinkError,
 };
 use crate::session::{CategoryCoverage, SessionCoverage, CURRENT_SCHEMA_VERSION};
 
@@ -417,6 +417,25 @@ impl CollectorSink for ActiveSession {
             .map_err(|error| Box::new(error) as SinkError)
     }
 
+    fn record_dns_correlation(&mut self, dns: DnsCorrelationRecord) -> Result<(), SinkError> {
+        self.connection
+            .execute(
+                "INSERT INTO dns_correlation (
+                     hostname, address, process_id, occurred_at_ms, evidence, confidence
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    dns.hostname,
+                    dns.address,
+                    database_process_id(dns.process.get())?,
+                    dns.occurred_at_ms,
+                    dns.evidence.as_str(),
+                    dns.confidence.as_str(),
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| Box::new(error) as SinkError)
+    }
+
     fn record_event(&mut self, event: CollectorEvent) -> Result<(), SinkError> {
         let process_id = event
             .process
@@ -556,6 +575,15 @@ fn initialize_database(
              after_size INTEGER,
              after_modified_at_ns INTEGER,
              evidence TEXT NOT NULL CHECK (evidence = 'derived')
+         );
+         CREATE TABLE dns_correlation (
+             correlation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             hostname TEXT NOT NULL,
+             address TEXT NOT NULL,
+             process_id INTEGER NOT NULL REFERENCES process(process_id),
+             occurred_at_ms INTEGER NOT NULL,
+             evidence TEXT NOT NULL CHECK (evidence IN ('observed', 'inferred', 'derived')),
+             confidence TEXT NOT NULL CHECK (confidence IN ('high'))
          );",
     )?;
 

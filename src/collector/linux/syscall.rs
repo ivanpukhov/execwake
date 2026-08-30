@@ -21,6 +21,7 @@ pub struct FileObservation {
     pub events: Vec<FileEvent>,
     pub mutation_paths: Vec<PathBuf>,
     pub network_events: Vec<NetworkEvent>,
+    pub dns_events: Vec<DnsEvent>,
 }
 
 pub struct NetworkEvent {
@@ -29,10 +30,16 @@ pub struct NetworkEvent {
     pub endpoint: SocketAddr,
 }
 
+pub struct DnsEvent {
+    pub hostname: String,
+    pub address: std::net::IpAddr,
+}
+
 #[derive(Clone)]
 struct SocketInformation {
     transport: &'static str,
     local: Option<SocketAddr>,
+    dns_queries: std::collections::HashMap<u16, String>,
 }
 
 enum PendingNetworkOperation {
@@ -57,6 +64,22 @@ enum PendingNetworkOperation {
         source: i32,
         requested: Option<i32>,
     },
+    Send {
+        descriptor: i32,
+        buffer: u64,
+        length: usize,
+    },
+    Receive {
+        descriptor: i32,
+        buffer: u64,
+        length: usize,
+    },
+}
+
+#[derive(Default)]
+struct NetworkObservation {
+    events: Vec<NetworkEvent>,
+    dns_events: Vec<DnsEvent>,
 }
 
 enum PendingFileOperation {
@@ -104,7 +127,7 @@ impl SyscallState {
             SyscallStop::Entry(registers) => {
                 self.pending = decode_file_operation(process_id, &registers).unwrap_or(None);
                 self.pending_network =
-                    decode_network_operation(process_id, &registers).unwrap_or(None);
+                    decode_network_operation(process_id, &registers, &self.sockets).unwrap_or(None);
                 let mutation_paths = self
                     .pending
                     .as_ref()
@@ -114,6 +137,7 @@ impl SyscallState {
                     events: Vec::new(),
                     mutation_paths,
                     network_events: Vec::new(),
+                    dns_events: Vec::new(),
                 })
             }
             SyscallStop::Exit(result) => {
@@ -123,7 +147,7 @@ impl SyscallState {
                     .filter(|_| result >= 0)
                     .map(|pending| finish_file_operation(pending, result))
                     .unwrap_or_default();
-                let network_events = self
+                let network = self
                     .pending_network
                     .take()
                     .filter(|_| result >= 0)
@@ -134,13 +158,15 @@ impl SyscallState {
                 Ok(FileObservation {
                     events,
                     mutation_paths: Vec::new(),
-                    network_events,
+                    network_events: network.events,
+                    dns_events: network.dns_events,
                 })
             }
             SyscallStop::Other => Ok(FileObservation {
                 events: Vec::new(),
                 mutation_paths: Vec::new(),
                 network_events: Vec::new(),
+                dns_events: Vec::new(),
             }),
         }
     }
@@ -188,6 +214,7 @@ enum SyscallStop {
 fn decode_network_operation(
     process_id: libc::pid_t,
     registers: &Registers,
+    sockets: &std::collections::HashMap<i32, SocketInformation>,
 ) -> io::Result<Option<PendingNetworkOperation>> {
     let number = registers.number;
     let arguments = registers.arguments;
@@ -251,6 +278,25 @@ fn decode_network_operation(
             requested: None,
         }));
     }
+    let descriptor = arguments[0] as i32;
+    if sockets.contains_key(&descriptor)
+        && (number == libc::SYS_sendto || number == libc::SYS_write)
+    {
+        return Ok(Some(PendingNetworkOperation::Send {
+            descriptor,
+            buffer: arguments[1],
+            length: arguments[2] as usize,
+        }));
+    }
+    if sockets.contains_key(&descriptor)
+        && (number == libc::SYS_recvfrom || number == libc::SYS_read)
+    {
+        return Ok(Some(PendingNetworkOperation::Receive {
+            descriptor,
+            buffer: arguments[1],
+            length: arguments[2] as usize,
+        }));
+    }
     Ok(None)
 }
 
@@ -259,7 +305,7 @@ fn finish_network_operation(
     operation: PendingNetworkOperation,
     result: i64,
     sockets: &mut std::collections::HashMap<i32, SocketInformation>,
-) -> Vec<NetworkEvent> {
+) -> NetworkObservation {
     match operation {
         PendingNetworkOperation::Socket { transport } => {
             sockets.insert(
@@ -267,62 +313,102 @@ fn finish_network_operation(
                 SocketInformation {
                     transport,
                     local: None,
+                    dns_queries: std::collections::HashMap::new(),
                 },
             );
-            Vec::new()
+            NetworkObservation::default()
         }
         PendingNetworkOperation::Bind {
             descriptor,
             endpoint,
         } => {
             let Some(socket) = sockets.get_mut(&descriptor) else {
-                return Vec::new();
+                return NetworkObservation::default();
             };
             let endpoint =
                 descriptor_socket_address(process_id, descriptor, false).unwrap_or(endpoint);
             socket.local = Some(endpoint);
-            vec![NetworkEvent {
-                operation: "bind",
-                transport: socket.transport,
-                endpoint,
-            }]
+            NetworkObservation {
+                events: vec![NetworkEvent {
+                    operation: "bind",
+                    transport: socket.transport,
+                    endpoint,
+                }],
+                dns_events: Vec::new(),
+            }
         }
         PendingNetworkOperation::Connect {
             descriptor,
             endpoint,
         } => sockets
             .get(&descriptor)
-            .map(|socket| {
-                vec![NetworkEvent {
+            .map_or_else(NetworkObservation::default, |socket| NetworkObservation {
+                events: vec![NetworkEvent {
                     operation: "connect",
                     transport: socket.transport,
                     endpoint: descriptor_socket_address(process_id, descriptor, true)
                         .unwrap_or(endpoint),
-                }]
-            })
-            .unwrap_or_default(),
-        PendingNetworkOperation::Listen { descriptor } => sockets
-            .get(&descriptor)
-            .and_then(|socket| {
-                descriptor_socket_address(process_id, descriptor, false)
-                    .or(socket.local)
-                    .map(|endpoint| NetworkEvent {
-                        operation: "listen",
-                        transport: socket.transport,
-                        endpoint,
-                    })
-            })
-            .into_iter()
-            .collect(),
+                }],
+                dns_events: Vec::new(),
+            }),
+        PendingNetworkOperation::Listen { descriptor } => NetworkObservation {
+            events: sockets
+                .get(&descriptor)
+                .and_then(|socket| {
+                    descriptor_socket_address(process_id, descriptor, false)
+                        .or(socket.local)
+                        .map(|endpoint| NetworkEvent {
+                            operation: "listen",
+                            transport: socket.transport,
+                            endpoint,
+                        })
+                })
+                .into_iter()
+                .collect(),
+            dns_events: Vec::new(),
+        },
         PendingNetworkOperation::Close { descriptor } => {
             sockets.remove(&descriptor);
-            Vec::new()
+            NetworkObservation::default()
         }
         PendingNetworkOperation::Duplicate { source, requested } => {
             if let Some(socket) = sockets.get(&source).cloned() {
                 sockets.insert(requested.unwrap_or(result as i32), socket);
             }
-            Vec::new()
+            NetworkObservation::default()
+        }
+        PendingNetworkOperation::Send {
+            descriptor,
+            buffer,
+            length,
+        } => {
+            if let Some(socket) = sockets.get_mut(&descriptor) {
+                let length = usize::try_from(result).unwrap_or(0).min(length).min(65_537);
+                if let Ok(bytes) = read_memory(process_id, buffer, length) {
+                    if let Some((transaction, hostname)) = parse_dns_query(&bytes) {
+                        socket.dns_queries.insert(transaction, hostname);
+                    }
+                }
+            }
+            NetworkObservation::default()
+        }
+        PendingNetworkOperation::Receive {
+            descriptor,
+            buffer,
+            length,
+        } => {
+            let Some(socket) = sockets.get_mut(&descriptor) else {
+                return NetworkObservation::default();
+            };
+            let length = usize::try_from(result).unwrap_or(0).min(length).min(65_537);
+            let dns_events = read_memory(process_id, buffer, length)
+                .ok()
+                .map(|bytes| parse_dns_response(&bytes, &mut socket.dns_queries))
+                .unwrap_or_default();
+            NetworkObservation {
+                events: Vec::new(),
+                dns_events,
+            }
         }
     }
 }
@@ -408,6 +494,174 @@ fn parse_socket_address(bytes: &[u8]) -> Option<SocketAddr> {
         )));
     }
     None
+}
+
+fn parse_dns_query(bytes: &[u8]) -> Option<(u16, String)> {
+    let message = dns_message(bytes)?;
+    if message.len() < 12 || u16::from_be_bytes([message[2], message[3]]) & 0x8000 != 0 {
+        return None;
+    }
+    if u16::from_be_bytes([message[4], message[5]]) == 0 {
+        return None;
+    }
+    let (hostname, offset) = parse_dns_name(message, 12, 0)?;
+    if offset.checked_add(4)? > message.len() || hostname.is_empty() {
+        return None;
+    }
+    Some((u16::from_be_bytes([message[0], message[1]]), hostname))
+}
+
+fn parse_dns_response(
+    bytes: &[u8],
+    queries: &mut std::collections::HashMap<u16, String>,
+) -> Vec<DnsEvent> {
+    let Some(message) = dns_message(bytes) else {
+        return Vec::new();
+    };
+    if message.len() < 12 {
+        return Vec::new();
+    }
+    let flags = u16::from_be_bytes([message[2], message[3]]);
+    if flags & 0x8000 == 0 || flags & 0x000f != 0 {
+        return Vec::new();
+    }
+    let transaction = u16::from_be_bytes([message[0], message[1]]);
+    let Some(expected_hostname) = queries.remove(&transaction) else {
+        return Vec::new();
+    };
+    let question_count = usize::from(u16::from_be_bytes([message[4], message[5]]));
+    let answer_count = usize::from(u16::from_be_bytes([message[6], message[7]]));
+    let mut offset = 12;
+    let mut question_hostname = None;
+    for index in 0..question_count {
+        let Some((hostname, next)) = parse_dns_name(message, offset, 0) else {
+            return Vec::new();
+        };
+        offset = next;
+        if offset
+            .checked_add(4)
+            .map_or(true, |end| end > message.len())
+        {
+            return Vec::new();
+        }
+        if index == 0 {
+            question_hostname = Some(hostname);
+        }
+        offset += 4;
+    }
+    if question_hostname.as_deref() != Some(expected_hostname.as_str()) {
+        return Vec::new();
+    }
+
+    let mut names = vec![expected_hostname.clone()];
+    let mut events = Vec::new();
+    for _ in 0..answer_count {
+        let Some((owner, next)) = parse_dns_name(message, offset, 0) else {
+            break;
+        };
+        offset = next;
+        if offset
+            .checked_add(10)
+            .map_or(true, |end| end > message.len())
+        {
+            break;
+        }
+        let record_type = u16::from_be_bytes([message[offset], message[offset + 1]]);
+        let class = u16::from_be_bytes([message[offset + 2], message[offset + 3]]);
+        let data_length = usize::from(u16::from_be_bytes([
+            message[offset + 8],
+            message[offset + 9],
+        ]));
+        offset += 10;
+        let Some(data_end) = offset.checked_add(data_length) else {
+            break;
+        };
+        if data_end > message.len() {
+            break;
+        }
+        if class == 1 && names.contains(&owner) {
+            match (record_type, data_length) {
+                (1, 4) => events.push(DnsEvent {
+                    hostname: expected_hostname.clone(),
+                    address: std::net::IpAddr::V4(Ipv4Addr::new(
+                        message[offset],
+                        message[offset + 1],
+                        message[offset + 2],
+                        message[offset + 3],
+                    )),
+                }),
+                (28, 16) => {
+                    let mut address = [0_u8; 16];
+                    address.copy_from_slice(&message[offset..data_end]);
+                    events.push(DnsEvent {
+                        hostname: expected_hostname.clone(),
+                        address: std::net::IpAddr::V6(Ipv6Addr::from(address)),
+                    });
+                }
+                (5, _) => {
+                    if let Some((canonical, _)) = parse_dns_name(message, offset, 0) {
+                        names.push(canonical);
+                    }
+                }
+                _ => {}
+            }
+        }
+        offset = data_end;
+    }
+    events
+}
+
+fn dns_message(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    if bytes.len() >= 14 {
+        let framed_length = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+        if framed_length == bytes.len() - 2 {
+            return Some(&bytes[2..]);
+        }
+    }
+    Some(bytes)
+}
+
+fn parse_dns_name(message: &[u8], start: usize, depth: usize) -> Option<(String, usize)> {
+    if depth > 8 || start >= message.len() {
+        return None;
+    }
+    let mut labels = Vec::new();
+    let mut offset = start;
+    loop {
+        let length = *message.get(offset)?;
+        if length == 0 {
+            offset += 1;
+            return Some((labels.join(".").to_ascii_lowercase(), offset));
+        }
+        if length & 0xc0 == 0xc0 {
+            let second = *message.get(offset + 1)?;
+            let pointer = usize::from(u16::from_be_bytes([length & 0x3f, second]));
+            let (suffix, _) = parse_dns_name(message, pointer, depth + 1)?;
+            labels.push(suffix);
+            return Some((labels.join(".").to_ascii_lowercase(), offset + 2));
+        }
+        if length > 63 {
+            return None;
+        }
+        let label_start = offset + 1;
+        let label_end = label_start.checked_add(usize::from(length))?;
+        let label = message.get(label_start..label_end)?;
+        if label.is_empty()
+            || !label
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_'))
+        {
+            return None;
+        }
+        labels.push(std::str::from_utf8(label).ok()?.to_owned());
+        if labels.iter().map(String::len).sum::<usize>() + labels.len() > 254 {
+            return None;
+        }
+        offset = label_end;
+    }
 }
 
 fn decode_file_operation(
@@ -846,9 +1100,10 @@ fn native_u64(bytes: &[u8], offset: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::net::{Ipv6Addr, SocketAddr};
 
-    use super::parse_socket_address;
+    use super::{parse_dns_query, parse_dns_response, parse_socket_address};
 
     #[test]
     fn parses_ipv6_socket_addresses() {
@@ -865,5 +1120,42 @@ mod tests {
                     .expect("the expected address should parse")
             )
         );
+    }
+
+    #[test]
+    fn correlates_only_matching_dns_responses() {
+        let query = dns_query();
+        let response = dns_response();
+        let (transaction, hostname) = parse_dns_query(&query).expect("the query should parse");
+        let mut queries = HashMap::new();
+        queries.insert(transaction, hostname);
+
+        let events = parse_dns_response(&response, &mut queries);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].hostname, "fixture.test");
+        assert_eq!(events[0].address.to_string(), "127.0.0.7");
+        assert!(parse_dns_response(&response, &mut HashMap::new()).is_empty());
+    }
+
+    fn dns_query() -> Vec<u8> {
+        let mut packet = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        packet.extend_from_slice(&[
+            7, b'f', b'i', b'x', b't', b'u', b'r', b'e', 4, b't', b'e', b's', b't', 0,
+        ]);
+        packet.extend_from_slice(&[0, 1, 0, 1]);
+        packet
+    }
+
+    fn dns_response() -> Vec<u8> {
+        let mut packet = dns_query();
+        packet[2] = 0x81;
+        packet[3] = 0x80;
+        packet[6] = 0;
+        packet[7] = 1;
+        packet.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 127, 0, 0, 7]);
+        packet
     }
 }
