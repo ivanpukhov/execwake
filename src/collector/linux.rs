@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus};
 use std::ptr;
@@ -11,8 +12,8 @@ mod syscall;
 use syscall::SyscallState;
 
 use super::{
-    Collector, CollectorEvent, CollectorSink, ProcessExecRecord, ProcessExitRecord,
-    ProcessIdentity, ProcessRecord, SinkError,
+    Collector, CollectorEvent, CollectorSink, FileDeltaRecord, FileState, FileStateKind,
+    ProcessExecRecord, ProcessExitRecord, ProcessIdentity, ProcessRecord, SinkError,
 };
 use crate::privacy::PathRoots;
 use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage};
@@ -22,6 +23,7 @@ pub struct PtraceCollector {
     next_identity: u64,
     processes: HashMap<libc::pid_t, TracedProcess>,
     path_roots: PathRoots,
+    file_snapshots: HashMap<std::path::PathBuf, FileState>,
 }
 
 struct TracedProcess {
@@ -41,6 +43,7 @@ impl PtraceCollector {
                 env::current_dir().ok(),
                 Some(env::temp_dir()),
             ),
+            file_snapshots: HashMap::new(),
         }
     }
 
@@ -178,8 +181,13 @@ impl PtraceCollector {
             .get_mut(&process_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "syscall from unknown process"))?;
         let identity = process.identity;
-        let events = process.syscalls.observe_stop(process_id)?;
-        for event in events {
+        let observation = process.syscalls.observe_stop(process_id)?;
+        for path in observation.mutation_paths {
+            self.file_snapshots
+                .entry(path.clone())
+                .or_insert_with(|| capture_file_state(&path));
+        }
+        for event in observation.events {
             let target = event
                 .paths
                 .iter()
@@ -193,6 +201,37 @@ impl PtraceCollector {
                 process: Some(identity),
                 occurred_at_ms: unix_time_ms()?,
                 evidence: EvidenceKind::Observed,
+            })
+            .map_err(sink_error)?;
+        }
+        Ok(())
+    }
+
+    fn record_file_deltas(&self, sink: &mut dyn CollectorSink) -> io::Result<()> {
+        let mut paths: Vec<_> = self.file_snapshots.iter().collect();
+        paths.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (path, before) in paths {
+            let after = capture_file_state(path);
+            let target = self.path_roots.normalize(path);
+            sink.record_file_delta(FileDeltaRecord {
+                path: target.clone(),
+                before: *before,
+                after,
+            })
+            .map_err(sink_error)?;
+            let operation = match (before.kind, after.kind) {
+                (FileStateKind::Absent, kind) if kind != FileStateKind::Absent => "state-created",
+                (kind, FileStateKind::Absent) if kind != FileStateKind::Absent => "state-removed",
+                _ if *before == after => "state-restored",
+                _ => "state-changed",
+            };
+            sink.record_event(CollectorEvent {
+                category: "filesystem",
+                operation,
+                target,
+                process: None,
+                occurred_at_ms: unix_time_ms()?,
+                evidence: EvidenceKind::Derived,
             })
             .map_err(sink_error)?;
         }
@@ -317,6 +356,7 @@ impl Collector for PtraceCollector {
             }
         }
 
+        self.record_file_deltas(sink)?;
         sink.set_coverage(SessionCoverage {
             processes: CategoryCoverage::complete(),
             filesystem: CategoryCoverage::partial(0),
@@ -395,6 +435,42 @@ fn process_start_time(process_id: libc::pid_t) -> io::Result<u64> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process start time missing"))?
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid process start time"))
+}
+
+fn capture_file_state(path: &std::path::Path) -> FileState {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            let kind = if file_type.is_file() {
+                FileStateKind::File
+            } else if file_type.is_dir() {
+                FileStateKind::Directory
+            } else if file_type.is_symlink() {
+                FileStateKind::Symlink
+            } else {
+                FileStateKind::Other
+            };
+            let modified_at_ns = i128::from(metadata.mtime())
+                .checked_mul(1_000_000_000)
+                .and_then(|value| value.checked_add(i128::from(metadata.mtime_nsec())))
+                .and_then(|value| i64::try_from(value).ok());
+            FileState {
+                kind,
+                size: Some(metadata.size()),
+                modified_at_ns,
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => FileState {
+            kind: FileStateKind::Absent,
+            size: None,
+            modified_at_ns: None,
+        },
+        Err(_) => FileState {
+            kind: FileStateKind::Unknown,
+            size: None,
+            modified_at_ns: None,
+        },
+    }
 }
 
 #[cfg(test)]

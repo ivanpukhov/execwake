@@ -9,7 +9,8 @@ use fs2::FileExt;
 use rusqlite::{params, Connection, OpenFlags};
 
 use crate::collector::{
-    CollectorEvent, CollectorSink, ProcessExecRecord, ProcessExitRecord, ProcessRecord, SinkError,
+    CollectorEvent, CollectorSink, FileDeltaRecord, ProcessExecRecord, ProcessExitRecord,
+    ProcessRecord, SinkError,
 };
 use crate::session::{CategoryCoverage, SessionCoverage, CURRENT_SCHEMA_VERSION};
 
@@ -395,6 +396,27 @@ impl CollectorSink for ActiveSession {
             .map_err(|error| Box::new(error) as SinkError)
     }
 
+    fn record_file_delta(&mut self, delta: FileDeltaRecord) -> Result<(), SinkError> {
+        self.connection
+            .execute(
+                "INSERT INTO filesystem_delta (
+                     path, before_kind, before_size, before_modified_at_ns,
+                     after_kind, after_size, after_modified_at_ns, evidence
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'derived')",
+                params![
+                    delta.path,
+                    delta.before.kind.as_str(),
+                    delta.before.size,
+                    delta.before.modified_at_ns,
+                    delta.after.kind.as_str(),
+                    delta.after.size,
+                    delta.after.modified_at_ns,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| Box::new(error) as SinkError)
+    }
+
     fn record_event(&mut self, event: CollectorEvent) -> Result<(), SinkError> {
         let process_id = event
             .process
@@ -524,6 +546,16 @@ fn initialize_database(
              process_id INTEGER REFERENCES process(process_id),
              occurred_at_ms INTEGER NOT NULL,
              evidence TEXT NOT NULL CHECK (evidence IN ('observed', 'inferred', 'derived'))
+         );
+         CREATE TABLE filesystem_delta (
+             path TEXT PRIMARY KEY,
+             before_kind TEXT NOT NULL,
+             before_size INTEGER,
+             before_modified_at_ns INTEGER,
+             after_kind TEXT NOT NULL,
+             after_size INTEGER,
+             after_modified_at_ns INTEGER,
+             evidence TEXT NOT NULL CHECK (evidence = 'derived')
          );",
     )?;
 

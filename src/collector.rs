@@ -49,6 +49,43 @@ pub struct ProcessExitRecord {
     pub termination_signal: Option<i32>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileStateKind {
+    Absent,
+    File,
+    Directory,
+    Symlink,
+    Other,
+    Unknown,
+}
+
+impl FileStateKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::File => "file",
+            Self::Directory => "directory",
+            Self::Symlink => "symlink",
+            Self::Other => "other",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileState {
+    pub kind: FileStateKind,
+    pub size: Option<u64>,
+    pub modified_at_ns: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileDeltaRecord {
+    pub path: String,
+    pub before: FileState,
+    pub after: FileState,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectorEvent {
     pub category: &'static str,
@@ -64,6 +101,7 @@ pub trait CollectorSink {
     fn record_process(&mut self, process: ProcessRecord) -> Result<(), SinkError>;
     fn record_process_exec(&mut self, process: ProcessExecRecord) -> Result<(), SinkError>;
     fn record_process_exit(&mut self, process: ProcessExitRecord) -> Result<(), SinkError>;
+    fn record_file_delta(&mut self, delta: FileDeltaRecord) -> Result<(), SinkError>;
     fn record_event(&mut self, event: CollectorEvent) -> Result<(), SinkError>;
     fn set_coverage(&mut self, coverage: SessionCoverage) -> Result<(), SinkError>;
 }

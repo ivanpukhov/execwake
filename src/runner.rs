@@ -419,6 +419,7 @@ mod tests {
                     "cd \"$1\" && printf data > trace-created && cat trace-created >/dev/null \
                      && : > trace-created && mv trace-created trace-renamed \
                      && ln trace-renamed trace-linked && ln -s trace-renamed trace-symlink \
+                     && printf temporary > trace-transient && rm trace-transient \
                      && rm trace-linked trace-symlink trace-renamed",
                 ),
                 OsString::from("fixture"),
@@ -449,6 +450,16 @@ mod tests {
                 "missing {operation}: {operations:?}"
             );
         }
+
+        let transient = connection
+            .query_row(
+                "SELECT before_kind, after_kind FROM filesystem_delta
+                 WHERE path LIKE '%trace-transient'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("the create-delete state should be stored");
+        assert_eq!(transient, ("absent".to_owned(), "absent".to_owned()));
     }
 
     #[cfg(unix)]

@@ -14,6 +14,11 @@ pub struct FileEvent {
     pub paths: Vec<PathBuf>,
 }
 
+pub struct FileObservation {
+    pub events: Vec<FileEvent>,
+    pub mutation_paths: Vec<PathBuf>,
+}
+
 enum PendingFileOperation {
     Open {
         path: PathBuf,
@@ -46,22 +51,70 @@ impl SyscallState {
         Self { pending: None }
     }
 
-    pub fn observe_stop(&mut self, process_id: libc::pid_t) -> io::Result<Vec<FileEvent>> {
+    pub fn observe_stop(&mut self, process_id: libc::pid_t) -> io::Result<FileObservation> {
         match read_syscall_stop(process_id)? {
             SyscallStop::Entry(registers) => {
                 self.pending = decode_file_operation(process_id, &registers).unwrap_or(None);
-                Ok(Vec::new())
+                let mutation_paths = self
+                    .pending
+                    .as_ref()
+                    .map(PendingFileOperation::mutation_paths)
+                    .unwrap_or_default();
+                Ok(FileObservation {
+                    events: Vec::new(),
+                    mutation_paths,
+                })
             }
             SyscallStop::Exit(result) => {
                 let Some(pending) = self.pending.take() else {
-                    return Ok(Vec::new());
+                    return Ok(FileObservation {
+                        events: Vec::new(),
+                        mutation_paths: Vec::new(),
+                    });
                 };
                 if result < 0 {
-                    return Ok(Vec::new());
+                    return Ok(FileObservation {
+                        events: Vec::new(),
+                        mutation_paths: Vec::new(),
+                    });
                 }
-                Ok(finish_file_operation(pending, result))
+                Ok(FileObservation {
+                    events: finish_file_operation(pending, result),
+                    mutation_paths: Vec::new(),
+                })
             }
-            SyscallStop::Other => Ok(Vec::new()),
+            SyscallStop::Other => Ok(FileObservation {
+                events: Vec::new(),
+                mutation_paths: Vec::new(),
+            }),
+        }
+    }
+}
+
+impl PendingFileOperation {
+    fn mutation_paths(&self) -> Vec<PathBuf> {
+        match self {
+            Self::Open {
+                path,
+                flags,
+                existed: _,
+            } if flags & (libc::O_CREAT | libc::O_TRUNC) != 0 => vec![path.clone()],
+            Self::One {
+                operation,
+                path,
+                requires_data: _,
+            } if matches!(*operation, "write" | "truncate" | "unlink") => vec![path.clone()],
+            Self::Two {
+                operation: _,
+                first,
+                second,
+            } => vec![first.clone(), second.clone()],
+            Self::Mapping {
+                path,
+                read: _,
+                write: true,
+            } => vec![path.clone()],
+            _ => Vec::new(),
         }
     }
 }

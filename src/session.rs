@@ -1,6 +1,6 @@
 use crate::privacy::is_valid_environment_name;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionMode {
