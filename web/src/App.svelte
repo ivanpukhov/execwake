@@ -1,5 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import ProcessTree from './ProcessTree.svelte';
+  import Timeline from './Timeline.svelte';
+  import VirtualEventTable from './VirtualEventTable.svelte';
   import { durationMs, loadReport, type SessionReport } from './report';
 
   let report: SessionReport | null = null;
@@ -61,11 +64,25 @@
     </section>
 
     <div class="content-grid">
-      <section class="panel"><div class="panel-heading"><h2>Process tree</h2></div><p class="muted">Process details load here.</p></section>
-      <section class="panel"><div class="panel-heading"><h2>Timeline</h2></div><p class="muted">Execution timing loads here.</p></section>
+      <section class="panel">
+        <div class="panel-heading"><h2>Process tree</h2></div>
+        <ProcessTree processes={report.processes} />
+      </section>
+      <section class="panel">
+        <div class="panel-heading"><h2>Timeline</h2></div>
+        <Timeline
+          processes={report.processes}
+          events={report.events}
+          startedAtMs={report.startedAtMs}
+          endedAtMs={report.endedAtMs}
+        />
+      </section>
     </div>
 
-    <section class="panel"><div class="panel-heading"><h2>Events</h2></div><p class="muted">Observed events load here.</p></section>
+    <section class="panel">
+      <div class="panel-heading"><h2>Events</h2></div>
+      <VirtualEventTable events={report.events} startedAtMs={report.startedAtMs} />
+    </section>
   {:else}
     <section class="message" aria-live="polite"><p>Loading report…</p></section>
   {/if}
