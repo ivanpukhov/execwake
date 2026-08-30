@@ -1,7 +1,67 @@
 use std::env;
-use std::fs;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use fs2::FileExt;
+use rusqlite::{params, Connection, OpenFlags};
+
+use crate::session::CURRENT_SCHEMA_VERSION;
+
+#[derive(Debug)]
+pub enum StoreError {
+    Io(io::Error),
+    Database(rusqlite::Error),
+    InvalidInput(&'static str),
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "session storage error: {error}"),
+            Self::Database(error) => write!(formatter, "session database error: {error}"),
+            Self::InvalidInput(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+impl From<io::Error> for StoreError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionOutcome {
+    pub exit_code: Option<i32>,
+    pub termination_signal: Option<i32>,
+}
+
+impl SessionOutcome {
+    pub const fn exited(exit_code: i32) -> Self {
+        Self {
+            exit_code: Some(exit_code),
+            termination_signal: None,
+        }
+    }
+
+    pub const fn signaled(signal: i32) -> Self {
+        Self {
+            exit_code: None,
+            termination_signal: Some(signal),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionId(String);
@@ -107,6 +167,180 @@ impl SessionStore {
             "could not allocate a unique session id",
         ))
     }
+
+    pub fn begin(
+        &self,
+        command_name: &str,
+        argument_count: usize,
+    ) -> Result<ActiveSession, StoreError> {
+        if command_name.is_empty() || command_name.chars().any(|character| character.is_control()) {
+            return Err(StoreError::InvalidInput("invalid command name"));
+        }
+
+        let argument_count = i64::try_from(argument_count)
+            .map_err(|_| StoreError::InvalidInput("argument count is too large"))?;
+        let paths = self.new_session_paths()?;
+        let lock_file = create_private_file(paths.lock())?;
+        FileExt::try_lock_exclusive(&lock_file)?;
+        create_private_file(paths.database())?;
+
+        let result = initialize_database(&paths, command_name, argument_count);
+        match result {
+            Ok(connection) => Ok(ActiveSession {
+                paths,
+                connection,
+                lock_file: Some(lock_file),
+                finalized: false,
+            }),
+            Err(error) => {
+                let _ = FileExt::unlock(&lock_file);
+                drop(lock_file);
+                let _ = fs::remove_file(paths.lock());
+                let _ = fs::remove_file(paths.database());
+                Err(error)
+            }
+        }
+    }
+}
+
+pub struct ActiveSession {
+    paths: SessionPaths,
+    connection: Connection,
+    lock_file: Option<File>,
+    finalized: bool,
+}
+
+impl ActiveSession {
+    pub fn paths(&self) -> &SessionPaths {
+        &self.paths
+    }
+
+    pub fn finalize(mut self, outcome: SessionOutcome) -> Result<SessionPaths, StoreError> {
+        let ended_at_ms = unix_time_ms()?;
+        let transaction = self.connection.transaction()?;
+        let updated = transaction.execute(
+            "UPDATE session
+             SET state = 'finalized', finalized = 1, ended_at_ms = ?1,
+                 exit_code = ?2, termination_signal = ?3
+             WHERE singleton = 1 AND state = 'running' AND finalized = 0",
+            params![ended_at_ms, outcome.exit_code, outcome.termination_signal],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::InvalidInput("session is not running"));
+        }
+        transaction.commit()?;
+
+        let marker = create_private_file(self.paths.finalized())?;
+        marker.sync_all()?;
+        self.finalized = true;
+        let lock_file = self
+            .lock_file
+            .take()
+            .ok_or(StoreError::InvalidInput("session lock is missing"))?;
+        FileExt::unlock(&lock_file)?;
+        drop(lock_file);
+        fs::remove_file(self.paths.lock())?;
+
+        Ok(self.paths.clone())
+    }
+}
+
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        if !self.finalized {
+            if let Some(lock_file) = self.lock_file.as_ref() {
+                let _ = FileExt::unlock(lock_file);
+            }
+        }
+    }
+}
+
+fn initialize_database(
+    paths: &SessionPaths,
+    command_name: &str,
+    argument_count: i64,
+) -> Result<Connection, StoreError> {
+    let mut connection = Connection::open_with_flags(
+        paths.database(),
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.execute_batch(
+        "PRAGMA journal_mode = DELETE;
+         PRAGMA synchronous = FULL;
+         PRAGMA foreign_keys = ON;
+         CREATE TABLE session (
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+             id TEXT NOT NULL,
+             schema_version INTEGER NOT NULL,
+             mode TEXT NOT NULL CHECK (mode = 'observe'),
+             state TEXT NOT NULL CHECK (state IN ('running', 'finalized', 'interrupted')),
+             finalized INTEGER NOT NULL CHECK (finalized IN (0, 1)),
+             command_name TEXT NOT NULL,
+             argument_count INTEGER NOT NULL CHECK (argument_count >= 0),
+             started_at_ms INTEGER NOT NULL,
+             ended_at_ms INTEGER,
+             runner_pid INTEGER NOT NULL,
+             exit_code INTEGER,
+             termination_signal INTEGER,
+             interruption TEXT
+         );
+         CREATE TABLE coverage (
+             category TEXT PRIMARY KEY,
+             state TEXT NOT NULL CHECK (state IN ('complete', 'partial', 'unavailable')),
+             lost_events INTEGER NOT NULL CHECK (lost_events >= 0)
+         );",
+    )?;
+
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "INSERT INTO session (
+             singleton, id, schema_version, mode, state, finalized,
+             command_name, argument_count, started_at_ms, runner_pid
+         ) VALUES (1, ?1, ?2, 'observe', 'running', 0, ?3, ?4, ?5, ?6)",
+        params![
+            paths.id().as_str(),
+            i64::from(CURRENT_SCHEMA_VERSION),
+            command_name,
+            argument_count,
+            unix_time_ms()?,
+            i64::from(std::process::id()),
+        ],
+    )?;
+    for (category, state) in [
+        ("processes", "partial"),
+        ("filesystem", "unavailable"),
+        ("network", "unavailable"),
+        ("environment", "unavailable"),
+    ] {
+        transaction.execute(
+            "INSERT INTO coverage (category, state, lost_events) VALUES (?1, ?2, 0)",
+            params![category, state],
+        )?;
+    }
+    transaction.commit()?;
+
+    Ok(connection)
+}
+
+fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    options.open(path)
+}
+
+fn unix_time_ms() -> Result<i64, StoreError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StoreError::InvalidInput("system clock is before the Unix epoch"))?;
+    i64::try_from(duration.as_millis())
+        .map_err(|_| StoreError::InvalidInput("system time is out of range"))
 }
 
 fn default_storage_root() -> io::Result<PathBuf> {
@@ -176,7 +410,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{SessionId, SessionStore};
+    use rusqlite::Connection;
+
+    use super::{SessionId, SessionOutcome, SessionStore};
 
     struct TestDirectory(PathBuf);
 
@@ -240,5 +476,64 @@ mod tests {
             .mode();
 
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn sessions_are_finalized_in_sqlite_and_on_disk() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin("printf", 2)
+            .expect("a session should be started");
+        let database = session.paths().database().to_owned();
+        let marker = session.paths().finalized().to_owned();
+
+        let paths = session
+            .finalize(SessionOutcome::exited(7))
+            .expect("the session should be finalized");
+
+        assert_eq!(paths.database(), database);
+        assert!(marker.exists());
+        assert!(!paths.lock().exists());
+
+        let connection = Connection::open(database).expect("the database should open");
+        let row = connection
+            .query_row(
+                "SELECT state, finalized, command_name, argument_count, exit_code
+                 FROM session WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .expect("the session row should exist");
+
+        assert_eq!(row, ("finalized".to_owned(), 1, "printf".to_owned(), 2, 7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin("printf", 0)
+            .expect("a session should be started");
+
+        for path in [session.paths().database(), session.paths().lock()] {
+            let mode = fs::metadata(path)
+                .expect("session metadata should be available")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 }
