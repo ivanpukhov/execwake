@@ -2,7 +2,6 @@ mod report_launch;
 
 use std::env;
 use std::ffi::OsString;
-use std::io::{self, Write};
 use std::process;
 
 use execwake::cli::{help_text, Cli, Command, HelpTopic, ParseResult};
@@ -58,12 +57,10 @@ fn main() {
         Command::Diff(args) => {
             match execwake::semantic_diff::compare_paths(&args.before, &args.after) {
                 Ok(diff) => {
-                    let stdout = io::stdout();
-                    let mut output = stdout.lock();
-                    if let Err(error) = serde_json::to_writer_pretty(&mut output, &diff)
-                        .and_then(|()| writeln!(output).map_err(serde_json::Error::io))
+                    if let Err(error) =
+                        report_launch::present_diff(&args.before, &args.after, &diff)
                     {
-                        eprintln!("error: could not write comparison: {error}");
+                        eprintln!("error: could not present comparison: {error}");
                         process::exit(1);
                     }
                 }

@@ -1,16 +1,28 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import DiffView from './DiffView.svelte';
+  import Findings from './Findings.svelte';
   import ProcessTree from './ProcessTree.svelte';
   import Timeline from './Timeline.svelte';
   import VirtualEventTable from './VirtualEventTable.svelte';
-  import { durationMs, loadReport, type CoverageReport, type SessionReport } from './report';
+  import {
+    durationMs,
+    loadDiff,
+    loadReport,
+    type CoverageReport,
+    type SemanticDiff,
+    type SessionReport,
+  } from './report';
 
   let report: SessionReport | null = null;
+  let diff: SemanticDiff | null = null;
   let error = '';
+  const isDiff = window.location.pathname === '/diff';
 
   onMount(async () => {
     try {
-      report = await loadReport();
+      if (isDiff) diff = await loadDiff();
+      else report = await loadReport();
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Report could not be loaded.';
     }
@@ -29,7 +41,7 @@
 </script>
 
 <svelte:head>
-  <title>{report ? `${report.commandName} — ExecWake` : 'ExecWake report'}</title>
+  <title>{diff ? 'ExecWake comparison' : report ? `${report.commandName} — ExecWake` : 'ExecWake report'}</title>
 </svelte:head>
 
 <main class="page-shell">
@@ -38,6 +50,8 @@
       <h1>Report unavailable</h1>
       <p>{error}</p>
     </section>
+  {:else if diff}
+    <DiffView report={diff} />
   {:else if report}
     <header class="report-header">
       <div>
@@ -51,7 +65,12 @@
       <article><span>Duration</span><strong>{formatDuration(durationMs(report))}</strong></article>
       <article><span>Processes</span><strong>{report.processes.length}</strong></article>
       <article><span>Events</span><strong>{report.events.length}</strong></article>
-      <article><span>Arguments</span><strong>{report.argumentCount}</strong></article>
+      <article><span>Findings</span><strong>{report.findings.length}</strong></article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading"><div><p class="eyebrow">Findings</p><h2>Deterministic rules</h2></div></div>
+      <Findings findings={report.findings} />
     </section>
 
     <section class="panel">

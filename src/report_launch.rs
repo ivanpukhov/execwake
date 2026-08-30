@@ -1,19 +1,55 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use execwake::semantic_diff::SemanticDiff;
 use execwake::storage::{SessionId, SessionPaths, SessionStore};
 
 const INTERNAL_REPORT_COMMAND: &str = "__serve-report";
+const INTERNAL_DIFF_REPORT_COMMAND: &str = "__serve-diff";
 const REPORT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub fn serve_if_requested(arguments: &[OsString]) -> Option<io::Result<()>> {
-    (arguments.get(1).map(OsString::as_os_str) == Some(OsStr::new(INTERNAL_REPORT_COMMAND)))
-        .then(|| serve(&arguments[2..]))
+    match arguments.get(1).map(OsString::as_os_str) {
+        Some(command) if command == OsStr::new(INTERNAL_REPORT_COMMAND) => {
+            Some(serve(&arguments[2..]))
+        }
+        Some(command) if command == OsStr::new(INTERNAL_DIFF_REPORT_COMMAND) => {
+            Some(serve_diff(&arguments[2..]))
+        }
+        _ => None,
+    }
+}
+
+pub fn present_diff(before: &Path, after: &Path, diff: &SemanticDiff) -> io::Result<()> {
+    if !should_open_report() {
+        return write_diff(diff);
+    }
+
+    let (mut server, url) = match start_diff_report_server(before, after) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("Report unavailable: {error}");
+            return write_diff(diff);
+        }
+    };
+
+    match open_browser(&url) {
+        Ok(()) => {
+            eprintln!("Report: {url}");
+            Ok(())
+        }
+        Err(error) => {
+            stop_child(&mut server);
+            eprintln!("Report unavailable: {error}");
+            write_diff(diff)
+        }
+    }
 }
 
 pub fn present(session: &SessionPaths) {
@@ -70,6 +106,38 @@ fn serve(arguments: &[OsString]) -> io::Result<()> {
         .block_on(server.run())
 }
 
+fn serve_diff(arguments: &[OsString]) -> io::Result<()> {
+    if arguments.len() != 2 {
+        return Err(invalid_input("two session paths are required"));
+    }
+    let server = execwake::report::ReportServer::bind_diff(
+        PathBuf::from(&arguments[0]),
+        PathBuf::from(&arguments[1]),
+        REPORT_IDLE_TIMEOUT,
+    )?;
+    let url = server.open_url();
+
+    {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        writeln!(output, "{url}")?;
+        output.flush()?;
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(server.run())
+}
+
+fn write_diff(diff: &SemanticDiff) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer_pretty(&mut output, diff)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    writeln!(output)
+}
+
 fn should_open_report() -> bool {
     report_open_allowed(
         atty::is(atty::Stream::Stdin),
@@ -104,13 +172,32 @@ fn graphical_session_available() -> bool {
 }
 
 fn start_report_server(session: &SessionPaths) -> io::Result<(Child, String)> {
-    let mut child = Command::new(env::current_exe()?)
+    let child = Command::new(env::current_exe()?)
         .arg(INTERNAL_REPORT_COMMAND)
         .arg(session.id().as_str())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
+    read_server_url(child, |value| validated_report_url(value, session.id()))
+}
+
+fn start_diff_report_server(before: &Path, after: &Path) -> io::Result<(Child, String)> {
+    let child = Command::new(env::current_exe()?)
+        .arg(INTERNAL_DIFF_REPORT_COMMAND)
+        .arg(before)
+        .arg(after)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    read_server_url(child, validated_diff_url)
+}
+
+fn read_server_url(
+    mut child: Child,
+    validate: impl FnOnce(&str) -> Option<String>,
+) -> io::Result<(Child, String)> {
     let stdout = child
         .stdout
         .take()
@@ -156,7 +243,7 @@ fn start_report_server(session: &SessionPaths) -> io::Result<(Child, String)> {
     }
 
     let url = line.trim_end_matches(|character| character == '\r' || character == '\n');
-    let Some(url) = validated_report_url(url, session.id()) else {
+    let Some(url) = validate(url) else {
         stop_child(&mut child);
         return Err(io::Error::new(
             io::ErrorKind::Other,
@@ -168,13 +255,21 @@ fn start_report_server(session: &SessionPaths) -> io::Result<(Child, String)> {
 }
 
 fn validated_report_url(value: &str, id: &SessionId) -> Option<String> {
+    validated_route_url(value, id.as_str())
+}
+
+fn validated_diff_url(value: &str) -> Option<String> {
+    validated_route_url(value, "diff")
+}
+
+fn validated_route_url(value: &str, route_id: &str) -> Option<String> {
     let remainder = value.strip_prefix("http://127.0.0.1:")?;
     let (port, path) = remainder.split_once('/')?;
     let port: u16 = port.parse().ok()?;
     if port == 0 {
         return None;
     }
-    let token = path.strip_prefix(&format!("open/{}?token=", id.as_str()))?;
+    let token = path.strip_prefix(&format!("open/{route_id}?token="))?;
     if token.len() != 64
         || !token
             .bytes()
@@ -183,7 +278,7 @@ fn validated_report_url(value: &str, id: &SessionId) -> Option<String> {
         return None;
     }
 
-    let normalized = format!("http://127.0.0.1:{port}/open/{}?token={token}", id.as_str());
+    let normalized = format!("http://127.0.0.1:{port}/open/{route_id}?token={token}");
     (normalized == value).then_some(normalized)
 }
 
@@ -237,7 +332,7 @@ fn invalid_input(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{report_open_allowed, validated_report_url};
+    use super::{report_open_allowed, validated_diff_url, validated_report_url};
     use execwake::storage::SessionId;
 
     #[test]
@@ -249,6 +344,8 @@ mod tests {
         assert_eq!(validated_report_url(&url, &id), Some(url));
         assert!(validated_report_url("http://localhost:7319/open/x?token=a", &id).is_none());
         assert!(validated_report_url("http://127.0.0.1:0/open/x?token=a", &id).is_none());
+        let diff_url = format!("http://127.0.0.1:7319/open/diff?token={token}");
+        assert_eq!(validated_diff_url(&diff_url), Some(diff_url));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path as FilePath, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,11 +45,33 @@ impl Activity {
 
 #[derive(Clone)]
 struct AppState {
-    session: SessionPaths,
+    source: Arc<ReportSource>,
     token: Arc<str>,
     host: Arc<str>,
     origin: Arc<str>,
     activity: Activity,
+}
+
+#[derive(Clone)]
+enum ReportSource {
+    Session(SessionPaths),
+    Diff { before: PathBuf, after: PathBuf },
+}
+
+impl ReportSource {
+    fn route_id(&self) -> &str {
+        match self {
+            Self::Session(session) => session.id().as_str(),
+            Self::Diff { .. } => "diff",
+        }
+    }
+
+    fn location(&self) -> String {
+        match self {
+            Self::Session(session) => format!("/session/{}", session.id().as_str()),
+            Self::Diff { .. } => "/diff".to_owned(),
+        }
+    }
 }
 
 pub struct ReportServer {
@@ -61,14 +83,22 @@ pub struct ReportServer {
 
 impl ReportServer {
     pub fn bind(session: SessionPaths, idle_timeout: Duration) -> io::Result<Self> {
+        validate_session(&session)?;
+        Self::bind_source(ReportSource::Session(session), idle_timeout)
+    }
+
+    pub fn bind_diff(before: PathBuf, after: PathBuf, idle_timeout: Duration) -> io::Result<Self> {
+        crate::semantic_diff::compare_paths(&before, &after).map_err(server_error)?;
+        Self::bind_source(ReportSource::Diff { before, after }, idle_timeout)
+    }
+
+    fn bind_source(source: ReportSource, idle_timeout: Duration) -> io::Result<Self> {
         if idle_timeout.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "idle timeout must be greater than zero",
             ));
         }
-        validate_session(&session)?;
-
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
@@ -79,7 +109,7 @@ impl ReportServer {
             listener,
             address,
             state: AppState {
-                session,
+                source: Arc::new(source),
                 token: random_token()?.into(),
                 host,
                 origin,
@@ -97,7 +127,7 @@ impl ReportServer {
         format!(
             "{}/open/{}?token={}",
             self.state.origin,
-            self.state.session.id().as_str(),
+            self.state.source.route_id(),
             self.state.token
         )
     }
@@ -106,6 +136,8 @@ impl ReportServer {
         let protected = Router::new()
             .route("/session/:id", get(index))
             .route("/api/session/:id", get(session_api))
+            .route("/diff", get(diff_index))
+            .route("/api/diff", get(diff_api))
             .route("/assets/app.js", get(app_javascript))
             .route("/assets/app.css", get(app_styles))
             .route_layer(middleware::from_fn_with_state(
@@ -145,7 +177,7 @@ async fn open_report(
     Path(id): Path<String>,
     Query(query): Query<OpenQuery>,
 ) -> Response {
-    if id != state.session.id().as_str() || !constant_time_eq(&query.token, &state.token) {
+    if id != state.source.route_id() || !constant_time_eq(&query.token, &state.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -153,7 +185,7 @@ async fn open_report(
     let mut response = StatusCode::SEE_OTHER.into_response();
     response.headers_mut().insert(
         LOCATION,
-        HeaderValue::from_str(&format!("/session/{id}"))
+        HeaderValue::from_str(&state.source.location())
             .expect("a validated session id is a valid header value"),
     );
     response.headers_mut().insert(
@@ -168,10 +200,18 @@ async fn open_report(
 }
 
 async fn index(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if id == state.session.id().as_str() {
-        Html(REPORT_SHELL).into_response()
-    } else {
-        StatusCode::NOT_FOUND.into_response()
+    match state.source.as_ref() {
+        ReportSource::Session(session) if id == session.id().as_str() => {
+            Html(REPORT_SHELL).into_response()
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn diff_index(State(state): State<AppState>) -> Response {
+    match state.source.as_ref() {
+        ReportSource::Diff { .. } => Html(REPORT_SHELL).into_response(),
+        ReportSource::Session(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -188,12 +228,26 @@ async fn app_styles() -> Response {
 }
 
 async fn session_api(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if id != state.session.id().as_str() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
-    let database = state.session.database().to_owned();
+    let database = match state.source.as_ref() {
+        ReportSource::Session(session) if id == session.id().as_str() => {
+            session.database().to_owned()
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
     match tokio::task::spawn_blocking(move || load_report(database)).await {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn diff_api(State(state): State<AppState>) -> Response {
+    let (before, after) = match state.source.as_ref() {
+        ReportSource::Diff { before, after } => (before.clone(), after.clone()),
+        ReportSource::Session(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match tokio::task::spawn_blocking(move || crate::semantic_diff::compare_paths(&before, &after))
+        .await
+    {
         Ok(Ok(report)) => Json(report).into_response(),
         Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -359,7 +413,7 @@ fn validate_session(session: &SessionPaths) -> io::Result<()> {
     Ok(())
 }
 
-fn is_regular_file(path: &std::path::Path) -> bool {
+fn is_regular_file(path: &FilePath) -> bool {
     fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_file())
         .unwrap_or(false)
@@ -383,6 +437,7 @@ struct SessionReport {
     coverage: Vec<CoverageReport>,
     processes: Vec<ProcessReport>,
     events: Vec<EventReport>,
+    findings: Vec<FindingReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -418,6 +473,18 @@ struct EventReport {
     evidence: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FindingReport {
+    finding_id: i64,
+    rule_id: String,
+    rule_version: i64,
+    severity: String,
+    process_id: i64,
+    subject: String,
+    evidence_event_ids: Vec<i64>,
+}
+
 fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
     let connection = Connection::open_with_flags(
         database,
@@ -448,6 +515,7 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
                 coverage: Vec::new(),
                 processes: Vec::new(),
                 events: Vec::new(),
+                findings: Vec::new(),
             })
         },
     )?;
@@ -455,6 +523,7 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
     report.coverage = query_coverage(&connection)?;
     report.processes = query_processes(&connection)?;
     report.events = query_events(&connection)?;
+    report.findings = query_findings(&connection)?;
     Ok(report)
 }
 
@@ -516,6 +585,42 @@ fn query_events(connection: &Connection) -> rusqlite::Result<Vec<EventReport>> {
         })?
         .collect();
     rows
+}
+
+fn query_findings(connection: &Connection) -> rusqlite::Result<Vec<FindingReport>> {
+    let mut statement = connection.prepare(
+        "SELECT finding_id, rule_id, rule_version, severity, process_id, subject
+         FROM finding
+         ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                  rule_id, rule_version, process_id, subject",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(FindingReport {
+                finding_id: row.get(0)?,
+                rule_id: row.get(1)?,
+                rule_version: row.get(2)?,
+                severity: row.get(3)?,
+                process_id: row.get(4)?,
+                subject: row.get(5)?,
+                evidence_event_ids: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    rows.into_iter()
+        .map(|mut finding| {
+            let mut evidence_statement = connection.prepare(
+                "SELECT event_id FROM finding_evidence
+                 WHERE finding_id = ?1 ORDER BY event_id",
+            )?;
+            finding.evidence_event_ids = evidence_statement
+                .query_map([finding.finding_id], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(finding)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -613,6 +718,7 @@ mod tests {
         .await;
         assert!(report.starts_with("HTTP/1.1 200 OK"));
         assert!(report.contains("\"commandName\":\"printf\""));
+        assert!(report.contains("\"findings\":[]"));
 
         let asset = request(
             address,
@@ -638,6 +744,60 @@ mod tests {
             .expect("the report server should stop after its idle timeout")
             .expect("the server task should finish")
             .expect("the report server should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn serves_a_token_protected_diff_report() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let before = store
+            .begin("npm", 2)
+            .expect("the first session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the first session should finalize");
+        let after = store
+            .begin("npm", 2)
+            .expect("the second session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the second session should finalize");
+        let server = ReportServer::bind_diff(
+            before.database().to_owned(),
+            after.database().to_owned(),
+            Duration::from_millis(200),
+        )
+        .expect("the diff server should bind");
+        let address = server.address();
+        let open_path = server
+            .open_url()
+            .strip_prefix(&format!("http://{address}"))
+            .expect("the open URL should use the bound address")
+            .to_owned();
+        let task = tokio::spawn(server.run());
+
+        let opened = request(
+            address,
+            &format!("GET {open_path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert!(opened.starts_with("HTTP/1.1 303 See Other"));
+        let cookie = header(&opened, "set-cookie").expect("a token cookie should be set");
+        assert_eq!(header(&opened, "location"), Some("/diff"));
+
+        let report = request(
+            address,
+            &format!(
+                "GET /api/diff HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(report.starts_with("HTTP/1.1 200 OK"));
+        assert!(report.contains("\"whatChanged\":[\"No comparable finding changes.\"]"));
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the diff server should stop after its idle timeout")
+            .expect("the diff server task should finish")
+            .expect("the diff server should stop cleanly");
     }
 
     #[test]

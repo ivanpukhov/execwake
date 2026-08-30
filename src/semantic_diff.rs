@@ -590,7 +590,7 @@ fn summarize_findings(findings: &[FindingChange]) -> Vec<String> {
 
     let summary: Vec<_> = changes.into_iter().map(summary_line).collect();
     if summary.is_empty() {
-        vec!["No finding changes.".to_owned()]
+        vec!["No comparable finding changes.".to_owned()]
     } else {
         summary
     }
@@ -656,7 +656,7 @@ fn summary_line(change: &FindingChange) -> String {
                 finding_description(after)
             )
         }
-        ChangeStatus::Unchanged => "No finding changes.".to_owned(),
+        ChangeStatus::Unchanged => "No comparable finding changes.".to_owned(),
     }
 }
 
@@ -900,6 +900,6 @@ mod tests {
 
         let diff = compare(before, after);
 
-        assert_eq!(diff.what_changed, ["No finding changes."]);
+        assert_eq!(diff.what_changed, ["No comparable finding changes."]);
     }
 }
