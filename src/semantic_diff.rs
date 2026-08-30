@@ -158,12 +158,12 @@ pub struct SemanticDiff {
     pub compatibility: Vec<CategoryCompatibility>,
     pub behavior: Vec<BehaviorChange>,
     pub findings: Vec<FindingChange>,
+    pub what_changed: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FindingKey {
     rule_id: String,
-    rule_version: u32,
     process: String,
     subject: String,
 }
@@ -183,6 +183,7 @@ pub fn compare(before: SessionSnapshot, after: SessionSnapshot) -> SemanticDiff 
         .collect();
     let behavior = compare_behavior(&before.behavior.facts, &after.behavior.facts, &comparable);
     let findings = compare_findings(&before.findings, &after.findings, &comparable);
+    let what_changed = summarize_findings(&findings);
 
     SemanticDiff {
         before: before.info,
@@ -190,6 +191,7 @@ pub fn compare(before: SessionSnapshot, after: SessionSnapshot) -> SemanticDiff 
         compatibility,
         behavior,
         findings,
+        what_changed,
     }
 }
 
@@ -529,8 +531,8 @@ fn compare_findings(
             let category = finding_category(&key.rule_id);
             let category_comparable = comparable.get(&category).copied().unwrap_or(false);
             change_status(
-                left.map(|finding| finding.severity),
-                right.map(|finding| finding.severity),
+                left.map(|finding| (finding.rule_version, finding.severity)),
+                right.map(|finding| (finding.rule_version, finding.severity)),
                 category_comparable,
             )
             .map(|status| FindingChange {
@@ -559,9 +561,127 @@ fn change_status<T: Eq>(
 fn finding_key(finding: &FindingSnapshot) -> FindingKey {
     FindingKey {
         rule_id: finding.rule_id.clone(),
-        rule_version: finding.rule_version,
         process: finding.process.clone(),
         subject: finding.subject.clone(),
+    }
+}
+
+fn summarize_findings(findings: &[FindingChange]) -> Vec<String> {
+    let mut changes: Vec<_> = findings
+        .iter()
+        .filter(|change| change.status != ChangeStatus::Unchanged)
+        .collect();
+    changes.sort_by_key(|change| {
+        let finding = change.after.as_ref().or(change.before.as_ref());
+        (
+            summary_status_order(change.status),
+            finding.map_or(0, |finding| severity_order(finding.severity)),
+            finding
+                .map(|finding| finding.rule_id.clone())
+                .unwrap_or_default(),
+            finding
+                .map(|finding| finding.process.clone())
+                .unwrap_or_default(),
+            finding
+                .map(|finding| finding.subject.clone())
+                .unwrap_or_default(),
+        )
+    });
+
+    let summary: Vec<_> = changes.into_iter().map(summary_line).collect();
+    if summary.is_empty() {
+        vec!["No finding changes.".to_owned()]
+    } else {
+        summary
+    }
+}
+
+const fn summary_status_order(status: ChangeStatus) -> u8 {
+    match status {
+        ChangeStatus::New => 0,
+        ChangeStatus::Changed => 1,
+        ChangeStatus::Removed => 2,
+        ChangeStatus::Unchanged => 3,
+    }
+}
+
+const fn severity_order(severity: Severity) -> u8 {
+    match severity {
+        Severity::High => 0,
+        Severity::Medium => 1,
+        Severity::Low => 2,
+    }
+}
+
+fn summary_line(change: &FindingChange) -> String {
+    match change.status {
+        ChangeStatus::New => {
+            let finding = change
+                .after
+                .as_ref()
+                .expect("a new finding has an after value");
+            format!(
+                "New {} finding: {}.",
+                finding.severity.as_str(),
+                finding_description(finding)
+            )
+        }
+        ChangeStatus::Removed => {
+            let finding = change
+                .before
+                .as_ref()
+                .expect("a removed finding has a before value");
+            format!(
+                "Removed {} finding: {}.",
+                finding.severity.as_str(),
+                finding_description(finding)
+            )
+        }
+        ChangeStatus::Changed => {
+            let before = change
+                .before
+                .as_ref()
+                .expect("a changed finding has a before value");
+            let after = change
+                .after
+                .as_ref()
+                .expect("a changed finding has an after value");
+            format!(
+                "Changed finding {} from rule version {} {} to version {} {}: {}.",
+                after.rule_id,
+                before.rule_version,
+                before.severity.as_str(),
+                after.rule_version,
+                after.severity.as_str(),
+                finding_description(after)
+            )
+        }
+        ChangeStatus::Unchanged => "No finding changes.".to_owned(),
+    }
+}
+
+fn finding_description(finding: &FindingSnapshot) -> String {
+    match finding.rule_id.as_str() {
+        "EW-FS-001" => format!(
+            "process {} accessed credential path {}",
+            finding.process, finding.subject
+        ),
+        "EW-FS-002" => format!(
+            "process {} accessed private configuration path {}",
+            finding.process, finding.subject
+        ),
+        "EW-ENV-001" => format!(
+            "process {} read credential environment name {}",
+            finding.process, finding.subject
+        ),
+        "EW-NET-001" => format!(
+            "process {} opened public listener {}",
+            finding.process, finding.subject
+        ),
+        _ => format!(
+            "process {} matched rule {} for {}",
+            finding.process, finding.rule_id, finding.subject
+        ),
     }
 }
 
@@ -590,9 +710,11 @@ mod tests {
     use crate::behavior::{
         BehaviorCategory, BehaviorFact, BehaviorKey, BehaviorSet, BehaviorValue,
     };
+    use crate::findings::Severity;
 
     use super::{
-        compare, ChangeStatus, CompatibilityIssue, CoverageSnapshot, SessionInfo, SessionSnapshot,
+        compare, ChangeStatus, CompatibilityIssue, CoverageSnapshot, FindingSnapshot, SessionInfo,
+        SessionSnapshot,
     };
 
     fn fact(path: &str, operations: &[&str], event_id: i64) -> BehaviorFact {
@@ -643,6 +765,18 @@ mod tests {
                 process_roles: BTreeMap::new(),
             },
             findings: Vec::new(),
+        }
+    }
+
+    fn finding(rule_version: u32, severity: Severity) -> FindingSnapshot {
+        FindingSnapshot {
+            finding_id: i64::from(rule_version),
+            rule_id: "EW-FS-001".to_owned(),
+            rule_version,
+            severity,
+            process: "root/npm".to_owned(),
+            subject: "$HOME/.ssh/id_ed25519".to_owned(),
+            evidence_event_ids: vec![1],
         }
     }
 
@@ -727,5 +861,45 @@ mod tests {
         assert_eq!(diff.behavior.len(), 1);
         assert_eq!(diff.behavior[0].status, ChangeStatus::Changed);
         assert_eq!(diff.behavior[0].key.subject(), "$HOME/.npmrc");
+    }
+
+    #[test]
+    fn summarizes_finding_changes_with_fixed_deterministic_templates() {
+        let coverage = CoverageSnapshot {
+            state: "partial".to_owned(),
+            lost_events: 0,
+        };
+        let mut before = snapshot("ptrace", coverage.clone(), Vec::new());
+        before.findings = vec![finding(1, Severity::Medium)];
+        let mut after = snapshot("ptrace", coverage, Vec::new());
+        after.findings = vec![finding(2, Severity::High)];
+
+        let first = compare(before.clone(), after.clone());
+        let second = compare(before, after);
+
+        assert_eq!(first.findings.len(), 1);
+        assert_eq!(first.findings[0].status, ChangeStatus::Changed);
+        assert_eq!(
+            first.what_changed,
+            ["Changed finding EW-FS-001 from rule version 1 medium to version 2 high: process root/npm accessed credential path $HOME/.ssh/id_ed25519."]
+        );
+        assert_eq!(
+            serde_json::to_vec(&first.what_changed).expect("summary should serialize"),
+            serde_json::to_vec(&second.what_changed).expect("summary should serialize")
+        );
+    }
+
+    #[test]
+    fn uses_a_neutral_summary_when_findings_do_not_change() {
+        let coverage = CoverageSnapshot {
+            state: "partial".to_owned(),
+            lost_events: 0,
+        };
+        let before = snapshot("ptrace", coverage.clone(), Vec::new());
+        let after = snapshot("ptrace", coverage, Vec::new());
+
+        let diff = compare(before, after);
+
+        assert_eq!(diff.what_changed, ["No finding changes."]);
     }
 }
