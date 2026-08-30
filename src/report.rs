@@ -1,3 +1,4 @@
+use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -7,7 +8,7 @@ use std::time::{Duration, Instant};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST, LOCATION,
-    ORIGIN, REFERRER_POLICY, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
+    ORIGIN, REFERRER_POLICY, SET_COOKIE, TRANSFER_ENCODING, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
@@ -66,12 +67,7 @@ impl ReportServer {
                 "idle timeout must be greater than zero",
             ));
         }
-        if !session.database().is_file() || !session.finalized().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "report session is not finalized",
-            ));
-        }
+        validate_session(&session)?;
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
@@ -131,6 +127,7 @@ impl ReportServer {
         axum::Server::from_tcp(self.listener)
             .map_err(server_error)?
             .http1_header_read_timeout(REQUEST_TIMEOUT)
+            .http1_max_buf_size(BODY_LIMIT)
             .serve(app.into_make_service())
             .with_graceful_shutdown(shutdown)
             .await
@@ -217,16 +214,19 @@ async fn validate_request<B>(
         .get(ORIGIN)
         .map(|value| value.to_str().ok() == Some(state.origin.as_ref()))
         .unwrap_or(true);
-    let valid_length = request
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .map_or(true, |length| length <= BODY_LIMIT);
+    let valid_length = match request.headers().get(CONTENT_LENGTH) {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or(false, |length| length <= BODY_LIMIT),
+        None => true,
+    };
+    let valid_encoding = !request.headers().contains_key(TRANSFER_ENCODING);
 
     let mut response = if !valid_host || !valid_origin {
         StatusCode::FORBIDDEN.into_response()
-    } else if !valid_length {
+    } else if !valid_length || !valid_encoding {
         StatusCode::PAYLOAD_TOO_LARGE.into_response()
     } else {
         next.run(request).await
@@ -315,6 +315,52 @@ fn random_token() -> io::Result<String> {
 
 fn server_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::new(io::ErrorKind::Other, error)
+}
+
+fn validate_session(session: &SessionPaths) -> io::Result<()> {
+    if !is_regular_file(session.database()) || !is_regular_file(session.finalized()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "report session is not finalized",
+        ));
+    }
+
+    let connection = Connection::open_with_flags(
+        session.database(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(server_error)?;
+    let (id, state, finalized) = connection
+        .query_row(
+            "SELECT id, state, finalized FROM session WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .map_err(server_error)?;
+
+    if id != session.id().as_str()
+        || finalized != 1
+        || !matches!(state.as_str(), "finalized" | "interrupted")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "report session metadata is inconsistent",
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_regular_file(path: &std::path::Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Serialize)]
@@ -474,7 +520,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::ReportServer;
+    use super::{ReportServer, BODY_LIMIT};
     use crate::storage::{SessionOutcome, SessionStore};
 
     struct TestDirectory(PathBuf);
@@ -526,6 +572,25 @@ mod tests {
         assert!(rejected.contains("content-security-policy:"));
         assert!(!rejected.contains("access-control-allow-origin"));
 
+        let oversized = request(
+            address,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                BODY_LIMIT + 1
+            ),
+        )
+        .await;
+        assert!(oversized.starts_with("HTTP/1.1 413 Payload Too Large"));
+
+        let chunked = request(
+            address,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: {address}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n0\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(chunked.starts_with("HTTP/1.1 413 Payload Too Large"));
+
         let opened = request(
             address,
             &format!("GET {open_path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"),
@@ -569,6 +634,27 @@ mod tests {
             .expect("the report server should stop after its idle timeout")
             .expect("the server task should finish")
             .expect("the report server should stop cleanly");
+    }
+
+    #[test]
+    fn rejects_a_database_with_mismatched_session_metadata() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin("printf", 0)
+            .expect("a session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the session should finalize");
+        let connection = rusqlite::Connection::open(session.database())
+            .expect("the session database should open");
+        connection
+            .execute(
+                "UPDATE session SET id = 'ffffffffffffffffffffffffffffffff' WHERE singleton = 1",
+                [],
+            )
+            .expect("the session id should be changed");
+
+        assert!(ReportServer::bind(session, Duration::from_secs(1)).is_err());
     }
 
     async fn request(address: std::net::SocketAddr, request: &str) -> String {

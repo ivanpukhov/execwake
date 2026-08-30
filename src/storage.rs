@@ -561,15 +561,28 @@ fn absolute_environment_path(name: &str) -> io::Result<PathBuf> {
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::DirBuilderExt;
 
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true).mode(0o700).create(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
 
     #[cfg(not(unix))]
     fs::create_dir_all(path)?;
+
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session storage path is not a directory",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
 
     Ok(())
 }
@@ -618,6 +631,31 @@ mod tests {
     #[test]
     fn storage_requires_an_absolute_path() {
         assert!(SessionStore::at(PathBuf::from("sessions")).is_err());
+    }
+
+    #[test]
+    fn storage_rejects_a_file_in_place_of_the_directory() {
+        let directory = TestDirectory::new();
+        fs::create_dir(&directory.0).expect("the test directory should be created");
+        let file = directory.0.join("sessions");
+        fs::write(&file, b"not a directory").expect("the test file should be created");
+
+        assert!(SessionStore::at(file).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_rejects_a_symlink_in_place_of_the_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        fs::create_dir(&directory.0).expect("the test directory should be created");
+        let target = directory.0.join("target");
+        let link = directory.0.join("sessions");
+        fs::create_dir(&target).expect("the target directory should be created");
+        symlink(target, &link).expect("the symlink should be created");
+
+        assert!(SessionStore::at(link).is_err());
     }
 
     #[test]
