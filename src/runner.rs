@@ -398,6 +398,21 @@ mod tests {
         assert_eq!(identities, processes);
         assert!(children >= 2);
         assert!(execs >= 2);
+
+        let environment_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM environment_variable", [], |row| {
+                row.get(0)
+            })
+            .expect("environment names should be counted");
+        let environment_columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(environment_variable)")
+            .expect("the environment schema should be readable")
+            .query_map([], |row| row.get(1))
+            .expect("the environment columns should be queried")
+            .collect::<Result<_, _>>()
+            .expect("the environment columns should be read");
+        assert!(environment_count > 0);
+        assert_eq!(environment_columns, ["name", "process_id", "evidence"]);
     }
 
     #[cfg(target_os = "linux")]

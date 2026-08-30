@@ -9,8 +9,8 @@ use fs2::FileExt;
 use rusqlite::{params, Connection, OpenFlags};
 
 use crate::collector::{
-    CollectorEvent, CollectorSink, DnsCorrelationRecord, FileDeltaRecord, ProcessExecRecord,
-    ProcessExitRecord, ProcessRecord, SinkError,
+    CollectorEvent, CollectorSink, DnsCorrelationRecord, EnvironmentVariableRecord,
+    FileDeltaRecord, ProcessExecRecord, ProcessExitRecord, ProcessRecord, SinkError,
 };
 use crate::session::{CategoryCoverage, SessionCoverage, CURRENT_SCHEMA_VERSION};
 
@@ -436,6 +436,24 @@ impl CollectorSink for ActiveSession {
             .map_err(|error| Box::new(error) as SinkError)
     }
 
+    fn record_environment_variable(
+        &mut self,
+        environment: EnvironmentVariableRecord,
+    ) -> Result<(), SinkError> {
+        self.connection
+            .execute(
+                "INSERT INTO environment_variable (name, process_id, evidence)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    environment.name,
+                    database_process_id(environment.process.get())?,
+                    environment.evidence.as_str(),
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| Box::new(error) as SinkError)
+    }
+
     fn record_event(&mut self, event: CollectorEvent) -> Result<(), SinkError> {
         let process_id = event
             .process
@@ -584,6 +602,12 @@ fn initialize_database(
              occurred_at_ms INTEGER NOT NULL,
              evidence TEXT NOT NULL CHECK (evidence IN ('observed', 'inferred', 'derived')),
              confidence TEXT NOT NULL CHECK (confidence IN ('high'))
+         );
+         CREATE TABLE environment_variable (
+             name TEXT NOT NULL,
+             process_id INTEGER NOT NULL REFERENCES process(process_id),
+             evidence TEXT NOT NULL CHECK (evidence IN ('inferred', 'derived')),
+             PRIMARY KEY (name, process_id)
          );",
     )?;
 

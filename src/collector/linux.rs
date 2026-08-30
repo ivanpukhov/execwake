@@ -12,11 +12,11 @@ mod syscall;
 use syscall::SyscallState;
 
 use super::{
-    Collector, CollectorEvent, CollectorSink, DnsConfidence, DnsCorrelationRecord, FileDeltaRecord,
-    FileState, FileStateKind, ProcessExecRecord, ProcessExitRecord, ProcessIdentity, ProcessRecord,
-    SinkError,
+    Collector, CollectorEvent, CollectorSink, DnsConfidence, DnsCorrelationRecord,
+    EnvironmentVariableRecord, FileDeltaRecord, FileState, FileStateKind, ProcessExecRecord,
+    ProcessExitRecord, ProcessIdentity, ProcessRecord, SinkError,
 };
-use crate::privacy::PathRoots;
+use crate::privacy::{is_valid_environment_name, PathRoots};
 use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage};
 
 pub struct PtraceCollector {
@@ -25,6 +25,7 @@ pub struct PtraceCollector {
     processes: HashMap<libc::pid_t, TracedProcess>,
     path_roots: PathRoots,
     file_snapshots: HashMap<std::path::PathBuf, FileState>,
+    inherited_environment: Vec<String>,
 }
 
 struct TracedProcess {
@@ -45,6 +46,7 @@ impl PtraceCollector {
                 Some(env::temp_dir()),
             ),
             file_snapshots: HashMap::new(),
+            inherited_environment: inherited_environment_names(),
         }
     }
 
@@ -99,6 +101,25 @@ impl PtraceCollector {
             evidence: EvidenceKind::Observed,
         })
         .map_err(sink_error)?;
+        if parent_id.is_none() {
+            for name in &self.inherited_environment {
+                sink.record_environment_variable(EnvironmentVariableRecord {
+                    name: name.clone(),
+                    process: identity,
+                    evidence: EvidenceKind::Derived,
+                })
+                .map_err(sink_error)?;
+                sink.record_event(CollectorEvent {
+                    category: "environment",
+                    operation: "inherited",
+                    target: name.clone(),
+                    process: Some(identity),
+                    occurred_at_ms,
+                    evidence: EvidenceKind::Derived,
+                })
+                .map_err(sink_error)?;
+            }
+        }
         self.processes.insert(
             process_id,
             TracedProcess {
@@ -396,7 +417,7 @@ impl Collector for PtraceCollector {
             processes: CategoryCoverage::complete(),
             filesystem: CategoryCoverage::partial(0),
             network: CategoryCoverage::partial(0),
-            environment: CategoryCoverage::unavailable(),
+            environment: CategoryCoverage::partial(0),
         })
         .map_err(sink_error)?;
         root_status
@@ -508,12 +529,55 @@ fn capture_file_state(path: &std::path::Path) -> FileState {
     }
 }
 
+fn inherited_environment_names() -> Vec<String> {
+    extern "C" {
+        static mut environ: *mut *mut libc::c_char;
+    }
+
+    let mut names = Vec::new();
+    unsafe {
+        // Stop at the separator so no bytes from an environment value are read.
+        let mut entry = environ;
+        while !entry.is_null() && !(*entry).is_null() {
+            let bytes = *entry as *const u8;
+            let mut name = Vec::new();
+            for index in 0..4096 {
+                let byte = *bytes.add(index);
+                if byte == b'=' {
+                    if let Ok(name) = String::from_utf8(name) {
+                        if is_valid_environment_name(&name) {
+                            names.push(name);
+                        }
+                    }
+                    break;
+                }
+                if byte == 0 {
+                    break;
+                }
+                name.push(byte);
+            }
+            entry = entry.add(1);
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 #[cfg(test)]
 mod tests {
-    use super::process_start_time;
+    use super::{inherited_environment_names, process_start_time};
 
     #[test]
     fn reads_process_start_time_from_proc() {
         assert!(process_start_time(std::process::id() as libc::pid_t).is_ok());
+    }
+
+    #[test]
+    fn inherited_environment_contains_names_only() {
+        let names = inherited_environment_names();
+
+        assert!(names.iter().any(|name| name == "PATH"));
+        assert!(names.iter().all(|name| !name.contains('=')));
     }
 }

@@ -110,6 +110,13 @@ pub struct DnsCorrelationRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentVariableRecord {
+    pub name: String,
+    pub process: ProcessIdentity,
+    pub evidence: EvidenceKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectorEvent {
     pub category: &'static str,
     pub operation: &'static str,
@@ -126,6 +133,10 @@ pub trait CollectorSink {
     fn record_process_exit(&mut self, process: ProcessExitRecord) -> Result<(), SinkError>;
     fn record_file_delta(&mut self, delta: FileDeltaRecord) -> Result<(), SinkError>;
     fn record_dns_correlation(&mut self, dns: DnsCorrelationRecord) -> Result<(), SinkError>;
+    fn record_environment_variable(
+        &mut self,
+        environment: EnvironmentVariableRecord,
+    ) -> Result<(), SinkError>;
     fn record_event(&mut self, event: CollectorEvent) -> Result<(), SinkError>;
     fn set_coverage(&mut self, coverage: SessionCoverage) -> Result<(), SinkError>;
 }
