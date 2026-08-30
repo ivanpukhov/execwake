@@ -27,10 +27,18 @@ impl ProcessIdentity {
 pub struct ProcessRecord {
     pub identity: ProcessIdentity,
     pub operating_system_id: u32,
+    pub start_time_ticks: Option<u64>,
     pub parent: Option<ProcessIdentity>,
     pub executable: String,
     pub occurred_at_ms: i64,
     pub evidence: EvidenceKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessExecRecord {
+    pub identity: ProcessIdentity,
+    pub executable: String,
+    pub occurred_at_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +62,7 @@ pub struct CollectorEvent {
 pub trait CollectorSink {
     fn set_backend(&mut self, backend: &'static str) -> Result<(), SinkError>;
     fn record_process(&mut self, process: ProcessRecord) -> Result<(), SinkError>;
+    fn record_process_exec(&mut self, process: ProcessExecRecord) -> Result<(), SinkError>;
     fn record_process_exit(&mut self, process: ProcessExitRecord) -> Result<(), SinkError>;
     fn record_event(&mut self, event: CollectorEvent) -> Result<(), SinkError>;
     fn set_coverage(&mut self, coverage: SessionCoverage) -> Result<(), SinkError>;

@@ -6,8 +6,8 @@ use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    Collector, CollectorEvent, CollectorSink, ProcessExitRecord, ProcessIdentity, ProcessRecord,
-    SinkError,
+    Collector, CollectorEvent, CollectorSink, ProcessExecRecord, ProcessExitRecord,
+    ProcessIdentity, ProcessRecord, SinkError,
 };
 use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage};
 
@@ -54,9 +54,11 @@ impl PtraceCollector {
             .checked_add(1)
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "process identity exhausted"))?;
         let occurred_at_ms = unix_time_ms()?;
+        let start_time_ticks = process_start_time(process_id).ok();
         sink.record_process(ProcessRecord {
             identity,
             operating_system_id: process_id as u32,
+            start_time_ticks,
             parent: parent.as_ref().map(|process| process.identity),
             executable: executable.clone(),
             occurred_at_ms,
@@ -95,6 +97,12 @@ impl PtraceCollector {
             .get_mut(&process_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "exec from unknown process"))?;
         process.executable.clone_from(&executable);
+        sink.record_process_exec(ProcessExecRecord {
+            identity: process.identity,
+            executable: executable.clone(),
+            occurred_at_ms: unix_time_ms()?,
+        })
+        .map_err(sink_error)?;
         sink.record_event(CollectorEvent {
             category: "process",
             operation: "exec",
@@ -318,4 +326,28 @@ fn unix_time_ms() -> io::Result<i64> {
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "system clock is before Unix epoch"))?;
     i64::try_from(duration.as_millis())
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "system time is out of range"))
+}
+
+fn process_start_time(process_id: libc::pid_t) -> io::Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat"))?;
+    let fields = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process stat"))?
+        .1;
+    fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process start time missing"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid process start time"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_start_time;
+
+    #[test]
+    fn reads_process_start_time_from_proc() {
+        assert!(process_start_time(std::process::id() as libc::pid_t).is_ok());
+    }
 }

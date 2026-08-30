@@ -9,7 +9,7 @@ use fs2::FileExt;
 use rusqlite::{params, Connection, OpenFlags};
 
 use crate::collector::{
-    CollectorEvent, CollectorSink, ProcessExitRecord, ProcessRecord, SinkError,
+    CollectorEvent, CollectorSink, ProcessExecRecord, ProcessExitRecord, ProcessRecord, SinkError,
 };
 use crate::session::{CategoryCoverage, SessionCoverage, CURRENT_SCHEMA_VERSION};
 
@@ -264,9 +264,9 @@ impl ActiveSession {
         )?;
         transaction.execute(
             "INSERT INTO process (
-                 process_id, operating_system_id, parent_process_id, executable,
+                 process_id, operating_system_id, start_time_ticks, parent_process_id, executable,
                  started_at_ms, evidence
-             ) VALUES (?1, ?1, NULL, ?2, ?3, 'observed')",
+             ) VALUES (?1, ?1, NULL, NULL, ?2, ?3, 'observed')",
             params![i64::from(process_id), command_name, started_at_ms],
         )?;
         transaction.execute(
@@ -349,17 +349,29 @@ impl CollectorSink for ActiveSession {
         self.connection
             .execute(
                 "INSERT INTO process (
-                     process_id, operating_system_id, parent_process_id, executable,
+                     process_id, operating_system_id, start_time_ticks, parent_process_id, executable,
                      started_at_ms, evidence
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     process_id,
                     i64::from(process.operating_system_id),
+                    process.start_time_ticks,
                     parent_process_id,
                     process.executable,
                     process.occurred_at_ms,
                     process.evidence.as_str(),
                 ],
+            )
+            .map(|_| ())
+            .map_err(|error| Box::new(error) as SinkError)
+    }
+
+    fn record_process_exec(&mut self, process: ProcessExecRecord) -> Result<(), SinkError> {
+        let process_id = database_process_id(process.identity.get())?;
+        self.connection
+            .execute(
+                "UPDATE process SET executable = ?1 WHERE process_id = ?2",
+                params![process.executable, process_id],
             )
             .map(|_| ())
             .map_err(|error| Box::new(error) as SinkError)
@@ -495,6 +507,7 @@ fn initialize_database(
          CREATE TABLE process (
              process_id INTEGER PRIMARY KEY,
              operating_system_id INTEGER NOT NULL,
+             start_time_ticks INTEGER,
              parent_process_id INTEGER REFERENCES process(process_id),
              executable TEXT NOT NULL,
              started_at_ms INTEGER NOT NULL,
@@ -875,6 +888,7 @@ mod tests {
             .record_process(ProcessRecord {
                 identity: process,
                 operating_system_id: 41_000,
+                start_time_ticks: Some(81),
                 parent: None,
                 executable: "fixture".to_owned(),
                 occurred_at_ms: 10,

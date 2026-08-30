@@ -358,6 +358,47 @@ mod tests {
         assert_eq!(signal, i64::from(libc::SIGTERM));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn records_descendants_with_session_local_identities() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let result = run_in_store(
+            vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("(/bin/sh -c 'sleep 0.02 & wait') & wait"),
+            ],
+            &store,
+        )
+        .expect("the process tree should run");
+        let connection =
+            Connection::open(result.session.database()).expect("the database should open");
+        let (processes, identities, children, execs) = connection
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT process_id),
+                        SUM(parent_process_id IS NOT NULL),
+                        (SELECT COUNT(*) FROM event
+                         WHERE category = 'process' AND operation = 'exec')
+                 FROM process",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .expect("process records should exist");
+
+        assert!(processes >= 3);
+        assert_eq!(identities, processes);
+        assert!(children >= 2);
+        assert!(execs >= 2);
+    }
+
     #[cfg(unix)]
     fn exit_command(code: u8) -> Vec<OsString> {
         vec![
