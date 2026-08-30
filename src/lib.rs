@@ -5,5 +5,6 @@ pub mod findings;
 pub mod privacy;
 pub mod report;
 pub mod runner;
+pub mod semantic_diff;
 pub mod session;
 pub mod storage;

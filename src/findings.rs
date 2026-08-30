@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use serde::Serialize;
+
 use crate::collector::ProcessIdentity;
 use crate::privacy::is_valid_environment_name;
 use crate::session::EvidenceKind;
@@ -10,7 +12,8 @@ const CREDENTIAL_ENV_RULE: &str = "EW-ENV-001";
 const PUBLIC_LISTENER_RULE: &str = "EW-NET-001";
 const RULE_VERSION: u32 = 1;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     Low,
     Medium,
@@ -23,6 +26,15 @@ impl Severity {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
         }
     }
 }
