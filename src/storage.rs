@@ -150,6 +150,7 @@ impl SessionStore {
         }
 
         ensure_private_directory(&root)?;
+        let root = fs::canonicalize(root)?;
         Ok(Self { root })
     }
 
@@ -222,6 +223,9 @@ impl SessionStore {
 
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
             let path = entry.path();
             if path.extension().and_then(|extension| extension.to_str()) != Some("lock") {
                 continue;
@@ -535,7 +539,9 @@ fn initialize_database(
 ) -> Result<Connection, StoreError> {
     let mut connection = Connection::open_with_flags(
         paths.database(),
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.execute_batch(
         "PRAGMA journal_mode = DELETE;
@@ -561,7 +567,9 @@ fn initialize_database(
          CREATE TABLE coverage (
              category TEXT PRIMARY KEY,
              state TEXT NOT NULL CHECK (state IN ('complete', 'partial', 'unavailable')),
-             lost_events INTEGER NOT NULL CHECK (lost_events >= 0)
+             lost_events INTEGER NOT NULL CHECK (
+                 lost_events >= 0 AND (lost_events = 0 OR state = 'partial')
+             )
          );
          CREATE TABLE process (
              process_id INTEGER PRIMARY KEY,
@@ -606,7 +614,7 @@ fn initialize_database(
          CREATE TABLE environment_variable (
              name TEXT NOT NULL,
              process_id INTEGER NOT NULL REFERENCES process(process_id),
-             evidence TEXT NOT NULL CHECK (evidence IN ('inferred', 'derived')),
+             evidence TEXT NOT NULL CHECK (evidence IN ('observed', 'inferred', 'derived')),
              PRIMARY KEY (name, process_id)
          );",
     )?;
@@ -662,7 +670,7 @@ fn open_private_lock(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         let file = options.open(path)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         Ok(file)
@@ -682,7 +690,7 @@ fn recover_session(paths: &SessionPaths) -> Result<bool, StoreError> {
         Err(error) => return Err(error.into()),
     }
 
-    if !paths.database().is_file() {
+    if !is_regular_file(paths.database())? {
         FileExt::unlock(&lock_file)?;
         drop(lock_file);
         fs::remove_file(paths.lock())?;
@@ -691,7 +699,9 @@ fn recover_session(paths: &SessionPaths) -> Result<bool, StoreError> {
 
     let mut connection = Connection::open_with_flags(
         paths.database(),
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     let transaction = connection.transaction()?;
     let (state, finalized) = transaction.query_row(
@@ -725,12 +735,28 @@ fn recover_session(paths: &SessionPaths) -> Result<bool, StoreError> {
 }
 
 fn create_finalized_marker(path: &Path) -> io::Result<()> {
-    if path.exists() {
-        return Ok(());
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => return Ok(()),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "finalized marker is not a regular file",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
 
     let marker = create_private_file(path)?;
     marker.sync_all()
+}
+
+fn is_regular_file(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn unix_time_ms() -> Result<i64, StoreError> {
@@ -823,7 +849,9 @@ mod tests {
 
     use rusqlite::Connection;
 
-    use crate::collector::{CollectorEvent, CollectorSink, ProcessIdentity, ProcessRecord};
+    use crate::collector::{
+        CollectorEvent, CollectorSink, EnvironmentVariableRecord, ProcessIdentity, ProcessRecord,
+    };
     use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage};
 
     use super::{SessionId, SessionOutcome, SessionStore};
@@ -887,6 +915,28 @@ mod tests {
         symlink(target, &link).expect("the symlink should be created");
 
         assert!(SessionStore::at(link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_resolves_symlinks_in_parent_directories() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        fs::create_dir(&directory.0).expect("the test directory should be created");
+        let parent = directory.0.join("parent");
+        let link = directory.0.join("parent-link");
+        fs::create_dir(&parent).expect("the parent should be created");
+        symlink(&parent, &link).expect("the parent symlink should be created");
+
+        let store =
+            SessionStore::at(link.join("sessions")).expect("a symlinked parent should be resolved");
+
+        assert_eq!(
+            store.root(),
+            fs::canonicalize(parent.join("sessions"))
+                .expect("the storage directory should be canonical")
+        );
     }
 
     #[test]
@@ -1002,6 +1052,13 @@ mod tests {
             })
             .expect("event should be stored");
         session
+            .record_environment_variable(EnvironmentVariableRecord {
+                name: "PATH".to_owned(),
+                process,
+                evidence: EvidenceKind::Observed,
+            })
+            .expect("observed environment access should be stored");
+        session
             .set_coverage(SessionCoverage {
                 processes: CategoryCoverage::complete(),
                 filesystem: CategoryCoverage::partial(2),
@@ -1039,10 +1096,25 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("the backend should exist");
+        let environment_evidence: String = connection
+            .query_row(
+                "SELECT evidence FROM environment_variable WHERE name = 'PATH'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the environment evidence should exist");
 
         assert_eq!(process_rows, [(1, 41_000, 81), (2, 41_000, 82)]);
         assert_eq!(coverage, ("partial".to_owned(), 2));
         assert_eq!(backend, "test");
+        assert_eq!(environment_evidence, "observed");
+        assert!(connection
+            .execute(
+                "UPDATE coverage SET state = 'complete', lost_events = 1
+                 WHERE category = 'filesystem'",
+                [],
+            )
+            .is_err());
     }
 
     #[cfg(unix)]
@@ -1124,5 +1196,52 @@ mod tests {
 
         assert!(recovered.is_empty());
         assert!(!session.paths().finalized().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_does_not_follow_session_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let target = directory.0.join("target");
+        fs::write(&target, "unchanged").expect("the target should be created");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640))
+            .expect("the target permissions should be set");
+
+        let id = SessionId::parse("0123456789abcdef0123456789abcdef")
+            .expect("the session id should be valid");
+        let paths = store.paths(&id);
+        symlink(&target, paths.database()).expect("the database symlink should be created");
+        fs::write(paths.lock(), "").expect("the lock should be created");
+        symlink(
+            &target,
+            directory.0.join("ffffffffffffffffffffffffffffffff.lock"),
+        )
+        .expect("the lock symlink should be created");
+
+        let recovered = store
+            .recover_interrupted()
+            .expect("recovery should skip session symlinks");
+
+        assert!(recovered.is_empty());
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("the target metadata should exist")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::read_to_string(target).expect("the target should remain readable"),
+            "unchanged"
+        );
+        assert!(!paths.lock().exists());
+        assert!(directory
+            .0
+            .join("ffffffffffffffffffffffffffffffff.lock")
+            .is_symlink());
     }
 }

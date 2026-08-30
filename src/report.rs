@@ -327,7 +327,9 @@ fn validate_session(session: &SessionPaths) -> io::Result<()> {
 
     let connection = Connection::open_with_flags(
         session.database(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(server_error)?;
     let (id, state, finalized) = connection
@@ -419,7 +421,9 @@ struct EventReport {
 fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
     let connection = Connection::open_with_flags(
         database,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     let mut report = connection.query_row(
         "SELECT id, schema_version, mode, state, finalized, command_name,
