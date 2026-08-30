@@ -1,0 +1,9 @@
+[package]
+name = "execwake"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.67"
+license = "MIT"
+description = "Record the observable side effects of a command"
+
+[dependencies]
