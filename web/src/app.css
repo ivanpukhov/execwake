@@ -37,7 +37,9 @@ h2 { font-size: 16px; letter-spacing: -0.01em; }
 
 .process-tree { min-height: 120px; overflow: auto; border-top: 1px solid #e1e6e2; }
 .process-row { display: grid; grid-template-columns: 18px minmax(90px, 1fr) auto auto; gap: 9px; align-items: center; min-height: 36px; padding-left: calc(var(--tree-depth) * 18px); border-bottom: 1px solid #e7ebe8; font-size: 12px; }
-.tree-mark { color: #789080; font-family: ui-monospace, monospace; }
+.tree-mark { position: relative; align-self: stretch; }
+.tree-mark::after { position: absolute; top: 50%; left: 6px; width: 6px; height: 6px; border: 1px solid #789080; border-radius: 50%; background: #f8faf8; content: ''; transform: translateY(-50%); }
+.tree-mark:not(.root)::before { position: absolute; top: 0; left: 0; width: 8px; height: 50%; border-bottom: 1px solid #aab5ae; border-left: 1px solid #aab5ae; content: ''; }
 .process-name { overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .process-id, .process-result { color: #728078; font: 10px ui-monospace, monospace; }
 .process-result { min-width: 54px; text-align: right; }

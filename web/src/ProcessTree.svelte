@@ -69,7 +69,7 @@
         class="process-row"
         style:--tree-depth={row.depth}
       >
-        <span class="tree-mark" aria-hidden="true">{row.depth === 0 ? '●' : '└'}</span>
+        <span class:root={row.depth === 0} class="tree-mark" aria-hidden="true"></span>
         <span class="process-name" title={row.process.executable}>{row.process.executable}</span>
         <span class="process-id">{row.process.processId}</span>
         <span class="process-result">{processResult(row.process)}</span>
