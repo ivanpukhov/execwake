@@ -491,7 +491,175 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn resolves_paths_and_records_mappings_under_load() {
+        let directory = TestDirectory::new();
+        let fixture = directory
+            .0
+            .join(format!("collector-fixture-{}", std::process::id()));
+        fs::create_dir_all(&fixture).expect("the fixture directory should be created");
+        let store =
+            SessionStore::at(directory.0.join("sessions")).expect("storage should be created");
+        let executable = std::env::current_exe().expect("the test executable should be known");
+        let result = run_in_store(
+            vec![
+                executable.into_os_string(),
+                OsString::from("--ignored"),
+                OsString::from("--exact"),
+                OsString::from("runner::tests::filesystem_resolution_fixture_child"),
+                OsString::from("--nocapture"),
+                OsString::from("--test-threads=1"),
+            ],
+            &store,
+        )
+        .expect("the filesystem fixture should run");
+        let connection =
+            Connection::open(result.session.database()).expect("the database should open");
+        let mut statement = connection
+            .prepare(
+                "SELECT operation, target FROM event
+                 WHERE category = 'filesystem' AND
+                       (target LIKE '%cwd-relative.txt' OR
+                        target LIKE '%dirfd-relative.txt' OR
+                        target LIKE '%mapped.txt' OR
+                        target LIKE '%event-flood.txt')",
+            )
+            .expect("the event query should prepare");
+        let events: Vec<(String, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("events should be queried")
+            .collect::<Result<_, _>>()
+            .expect("events should be read");
+
+        for path in ["cwd-relative.txt", "dirfd-relative.txt"] {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.0 == "write" && event.1.ends_with(path)),
+                "missing resolved write for {path}: {events:?}"
+            );
+        }
+        for operation in ["read", "write"] {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.0 == operation && event.1.ends_with("mapped.txt")),
+                "missing mapped {operation}: {events:?}"
+            );
+        }
+        let flood_writes = events
+            .iter()
+            .filter(|event| event.0 == "write" && event.1.ends_with("event-flood.txt"))
+            .count();
+        assert!(flood_writes >= 2_048, "only {flood_writes} flood writes");
+
+        let (process_count, completed_count) = connection
+            .query_row(
+                "SELECT COUNT(*), SUM(ended_at_ms IS NOT NULL) FROM process",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("the process counts should exist");
+        assert!(process_count >= 9);
+        assert_eq!(completed_count, process_count);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn filesystem_resolution_fixture_child() {
+        use std::ffi::CString;
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let parent_id = unsafe { libc::getppid() };
+        let fixture_name = format!("collector-fixture-{parent_id}");
+        let directory_prefix = format!("execwake-runner-{parent_id}-");
+        let fixture = fs::read_dir(std::env::temp_dir())
+            .expect("the temporary directory should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .map_or(false, |name| name.starts_with(&directory_prefix))
+            })
+            .map(|path| path.join(&fixture_name))
+            .find(|path| path.is_dir())
+            .expect("the fixture directory should exist");
+        std::env::set_current_dir(&fixture).expect("the fixture directory should be usable");
+        fs::write("cwd-relative.txt", "cwd\n").expect("the cwd-relative file should be written");
+
+        let fixture_name = CString::new(fixture.as_os_str().as_bytes())
+            .expect("the fixture path should not contain a null byte");
+        let directory_descriptor =
+            unsafe { libc::open(fixture_name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(
+            directory_descriptor >= 0,
+            "the fixture directory should open"
+        );
+        let directory = unsafe { fs::File::from_raw_fd(directory_descriptor) };
+        let relative_name = CString::new("dirfd-relative.txt").expect("the file name is valid");
+        let file_descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                relative_name.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        assert!(file_descriptor >= 0, "the dirfd-relative file should open");
+        let mut relative_file = unsafe { fs::File::from_raw_fd(file_descriptor) };
+        relative_file
+            .write_all(b"dirfd\n")
+            .expect("the dirfd-relative file should be written");
+
+        let mapped_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open("mapped.txt")
+            .expect("the mapped file should open");
+        mapped_file
+            .set_len(4_096)
+            .expect("the mapped file should be sized");
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4_096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                mapped_file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED, "the file should be mapped");
+        unsafe {
+            std::ptr::write(mapping.cast::<u8>(), b'x');
+        }
+        assert_eq!(unsafe { std::ptr::read(mapping.cast::<u8>()) }, b'x');
+        assert_eq!(unsafe { libc::munmap(mapping, 4_096) }, 0);
+
+        let mut flood = fs::File::create("event-flood.txt").expect("the flood file should open");
+        for _ in 0..2_048 {
+            flood
+                .write_all(b"x")
+                .expect("the flood write should succeed");
+        }
+
+        for _ in 0..8 {
+            let status = std::process::Command::new("/bin/true")
+                .status()
+                .expect("the short-lived process should start");
+            assert!(status.success());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn records_socket_operations_without_application_protocol_labels() {
+        let ipv6_available = std::net::UdpSocket::bind("[::1]:0").is_ok();
         let directory = TestDirectory::new();
         let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
         let executable = std::env::current_exe().expect("the test executable should be known");
@@ -528,6 +696,14 @@ mod tests {
                 events.iter().any(|event| event.1.starts_with(target)),
                 "missing {target}: {events:?}"
             );
+        }
+        if ipv6_available {
+            for target in ["tcp [::1]:", "udp [::1]:"] {
+                assert!(
+                    events.iter().any(|event| event.1.starts_with(target)),
+                    "missing {target}: {events:?}"
+                );
+            }
         }
         assert!(events.iter().all(|event| !event.1.contains("http")));
     }

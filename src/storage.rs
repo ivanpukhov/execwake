@@ -957,13 +957,14 @@ mod tests {
     }
 
     #[test]
-    fn collector_records_use_session_process_identities() {
+    fn collector_records_keep_reused_operating_system_ids_distinct() {
         let directory = TestDirectory::new();
         let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
         let mut session = store
             .begin("fixture", 0)
             .expect("a session should be started");
         let process = ProcessIdentity::new(1);
+        let reused_process = ProcessIdentity::new(2);
 
         session
             .set_backend("test")
@@ -979,6 +980,17 @@ mod tests {
                 evidence: EvidenceKind::Observed,
             })
             .expect("process should be stored");
+        session
+            .record_process(ProcessRecord {
+                identity: reused_process,
+                operating_system_id: 41_000,
+                start_time_ticks: Some(82),
+                parent: None,
+                executable: "fixture-again".to_owned(),
+                occurred_at_ms: 12,
+                evidence: EvidenceKind::Observed,
+            })
+            .expect("reused process id should be stored with a new identity");
         session
             .record_event(CollectorEvent {
                 category: "filesystem",
@@ -1003,13 +1015,16 @@ mod tests {
             .expect("the session should be finalized");
 
         let connection = Connection::open(database).expect("the database should open");
-        let process_row = connection
-            .query_row(
-                "SELECT process_id, operating_system_id FROM process",
-                [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        let process_rows: Vec<(i64, i64, i64)> = connection
+            .prepare(
+                "SELECT process_id, operating_system_id, start_time_ticks
+                 FROM process ORDER BY process_id",
             )
-            .expect("the process row should exist");
+            .expect("the process query should prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("the process rows should be queried")
+            .collect::<Result<_, _>>()
+            .expect("the process rows should be read");
         let coverage = connection
             .query_row(
                 "SELECT state, lost_events FROM coverage WHERE category = 'filesystem'",
@@ -1025,7 +1040,7 @@ mod tests {
             )
             .expect("the backend should exist");
 
-        assert_eq!(process_row, (1, 41_000));
+        assert_eq!(process_rows, [(1, 41_000, 81), (2, 41_000, 82)]);
         assert_eq!(coverage, ("partial".to_owned(), 2));
         assert_eq!(backend, "test");
     }
