@@ -1,0 +1,150 @@
+{
+  "compatibility": [
+    {
+      "category": "filesystem",
+      "comparable": true,
+      "issues": [],
+      "before": "complete/0",
+      "after": "complete/0"
+    },
+    {
+      "category": "network",
+      "comparable": true,
+      "issues": [],
+      "before": "complete/0",
+      "after": "complete/0"
+    },
+    {
+      "category": "process",
+      "comparable": true,
+      "issues": [],
+      "before": "complete/0",
+      "after": "complete/0"
+    },
+    {
+      "category": "environment",
+      "comparable": true,
+      "issues": [],
+      "before": "complete/0",
+      "after": "complete/0"
+    }
+  ],
+  "new": [],
+  "removed": [],
+  "changed": [],
+  "unchanged": [
+    {
+      "category": "filesystem",
+      "subject": "$TMP/npm-$PID/$SESSION",
+      "process": "root/npm",
+      "before": {
+        "value": {
+          "operations": [
+            "write"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": []
+        },
+        "evidenceEventIds": [
+          1
+        ]
+      },
+      "after": {
+        "value": {
+          "operations": [
+            "write"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": []
+        },
+        "evidenceEventIds": [
+          1
+        ]
+      }
+    },
+    {
+      "category": "network",
+      "subject": "tcp 127.0.0.1:$EPHEMERAL",
+      "process": "root/npm",
+      "before": {
+        "value": {
+          "operations": [
+            "connect"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": []
+        },
+        "evidenceEventIds": [
+          2
+        ]
+      },
+      "after": {
+        "value": {
+          "operations": [
+            "connect"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": []
+        },
+        "evidenceEventIds": [
+          2
+        ]
+      }
+    },
+    {
+      "category": "process",
+      "subject": "root/npm",
+      "process": "root/npm",
+      "before": {
+        "value": {
+          "operations": [
+            "exit",
+            "spawn"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": [
+            "executable:npm",
+            "exit:0",
+            "target:npm"
+          ]
+        },
+        "evidenceEventIds": [
+          3
+        ]
+      },
+      "after": {
+        "value": {
+          "operations": [
+            "exit",
+            "spawn"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": [
+            "executable:npm",
+            "exit:0",
+            "target:npm"
+          ]
+        },
+        "evidenceEventIds": [
+          3
+        ]
+      }
+    }
+  ],
+  "findings": [],
+  "whatChanged": [
+    "No comparable finding changes."
+  ]
+}

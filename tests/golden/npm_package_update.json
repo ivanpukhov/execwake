@@ -1,0 +1,230 @@
+{
+  "compatibility": [
+    {
+      "category": "filesystem",
+      "comparable": true,
+      "issues": [],
+      "before": "complete/0",
+      "after": "complete/0"
+    },
+    {
+      "category": "network",
+      "comparable": true,
+      "issues": [],
+      "before": "complete/0",
+      "after": "complete/0"
+    },
+    {
+      "category": "process",
+      "comparable": true,
+      "issues": [],
+      "before": "complete/0",
+      "after": "complete/0"
+    },
+    {
+      "category": "environment",
+      "comparable": true,
+      "issues": [],
+      "before": "complete/0",
+      "after": "complete/0"
+    }
+  ],
+  "new": [
+    {
+      "category": "filesystem",
+      "subject": "$HOME/.gitconfig",
+      "process": "root/npm",
+      "before": null,
+      "after": {
+        "value": {
+          "operations": [
+            "read"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": []
+        },
+        "evidenceEventIds": [
+          3
+        ]
+      }
+    },
+    {
+      "category": "network",
+      "subject": "tcp 203.0.113.50:443",
+      "process": "root/npm",
+      "before": null,
+      "after": {
+        "value": {
+          "operations": [
+            "connect"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": []
+        },
+        "evidenceEventIds": [
+          4
+        ]
+      }
+    },
+    {
+      "category": "process",
+      "subject": "root/npm/git",
+      "process": "root/npm/git",
+      "before": null,
+      "after": {
+        "value": {
+          "operations": [
+            "exec",
+            "spawn"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": [
+            "executable:git",
+            "target:git"
+          ]
+        },
+        "evidenceEventIds": [
+          5
+        ]
+      }
+    }
+  ],
+  "removed": [],
+  "changed": [],
+  "unchanged": [
+    {
+      "category": "filesystem",
+      "subject": "$WORKSPACE/package.json",
+      "process": "root/npm",
+      "before": {
+        "value": {
+          "operations": [
+            "read"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": []
+        },
+        "evidenceEventIds": [
+          1
+        ]
+      },
+      "after": {
+        "value": {
+          "operations": [
+            "read"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": []
+        },
+        "evidenceEventIds": [
+          1
+        ]
+      }
+    },
+    {
+      "category": "network",
+      "subject": "tcp 104.16.1.10:443",
+      "process": "root/npm",
+      "before": {
+        "value": {
+          "operations": [
+            "connect"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": []
+        },
+        "evidenceEventIds": [
+          2
+        ]
+      },
+      "after": {
+        "value": {
+          "operations": [
+            "connect"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": []
+        },
+        "evidenceEventIds": [
+          2
+        ]
+      }
+    },
+    {
+      "category": "process",
+      "subject": "root/npm",
+      "process": "root/npm",
+      "before": {
+        "value": {
+          "operations": [
+            "exit",
+            "spawn"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": [
+            "executable:npm",
+            "exit:0",
+            "target:npm"
+          ]
+        },
+        "evidenceEventIds": [
+          3
+        ]
+      },
+      "after": {
+        "value": {
+          "operations": [
+            "exit",
+            "spawn"
+          ],
+          "evidence": [
+            "observed"
+          ],
+          "attributes": [
+            "executable:npm",
+            "exit:0",
+            "target:npm"
+          ]
+        },
+        "evidenceEventIds": [
+          6
+        ]
+      }
+    }
+  ],
+  "findings": [
+    {
+      "status": "NEW",
+      "before": null,
+      "after": {
+        "ruleId": "EW-FS-002",
+        "ruleVersion": 1,
+        "severity": "medium",
+        "process": "root/npm",
+        "subject": "$HOME/.gitconfig",
+        "evidenceEventIds": [
+          3
+        ]
+      }
+    }
+  ],
+  "whatChanged": [
+    "New medium finding: process root/npm accessed private configuration path $HOME/.gitconfig."
+  ]
+}
