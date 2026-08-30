@@ -5,16 +5,10 @@ edition = "2021"
 rust-version = "1.67"
 license = "MIT"
 description = "Record the observable side effects of a command"
-default-run = "execwake"
-
-[features]
-conformance-fixture = []
 
 [dependencies]
 
-[[bin]]
-name = "execwake-conformance"
+[[test]]
+name = "conformance"
 path = "tests/fixtures/conformance.rs"
-required-features = ["conformance-fixture"]
-test = false
-bench = false
+harness = false
