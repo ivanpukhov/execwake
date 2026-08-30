@@ -7,6 +7,7 @@ license = "MIT"
 description = "Record the observable side effects of a command"
 
 [dependencies]
+atty = "=0.2.14"
 axum = { version = "=0.6.20", default-features = false, features = ["http1", "json", "query", "tokio"] }
 fs2 = "=0.4.3"
 getrandom = "0.2.16"

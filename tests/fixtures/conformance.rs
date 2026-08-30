@@ -30,8 +30,11 @@ fn run() -> io::Result<()> {
             let root = required_path(arguments.next())?;
             run_grandchild(&root)
         }
-        Some(root) => run_root(Path::new(root)),
-        None => verify_fixture(),
+        Some(mode) if mode == "--root" => {
+            let root = required_path(arguments.next())?;
+            run_root(&root)
+        }
+        Some(_) | None => verify_fixture(),
     }
 }
 
