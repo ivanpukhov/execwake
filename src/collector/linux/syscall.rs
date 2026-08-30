@@ -1,12 +1,15 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr;
 
 pub struct SyscallState {
     pending: Option<PendingFileOperation>,
+    pending_network: Option<PendingNetworkOperation>,
+    sockets: std::collections::HashMap<i32, SocketInformation>,
 }
 
 pub struct FileEvent {
@@ -17,6 +20,43 @@ pub struct FileEvent {
 pub struct FileObservation {
     pub events: Vec<FileEvent>,
     pub mutation_paths: Vec<PathBuf>,
+    pub network_events: Vec<NetworkEvent>,
+}
+
+pub struct NetworkEvent {
+    pub operation: &'static str,
+    pub transport: &'static str,
+    pub endpoint: SocketAddr,
+}
+
+#[derive(Clone)]
+struct SocketInformation {
+    transport: &'static str,
+    local: Option<SocketAddr>,
+}
+
+enum PendingNetworkOperation {
+    Socket {
+        transport: &'static str,
+    },
+    Bind {
+        descriptor: i32,
+        endpoint: SocketAddr,
+    },
+    Connect {
+        descriptor: i32,
+        endpoint: SocketAddr,
+    },
+    Listen {
+        descriptor: i32,
+    },
+    Close {
+        descriptor: i32,
+    },
+    Duplicate {
+        source: i32,
+        requested: Option<i32>,
+    },
 }
 
 enum PendingFileOperation {
@@ -43,18 +83,28 @@ enum PendingFileOperation {
 }
 
 impl SyscallState {
-    pub const fn root() -> Self {
-        Self { pending: None }
+    pub fn root() -> Self {
+        Self {
+            pending: None,
+            pending_network: None,
+            sockets: std::collections::HashMap::new(),
+        }
     }
 
-    pub const fn child() -> Self {
-        Self { pending: None }
+    pub fn child(parent: &Self) -> Self {
+        Self {
+            pending: None,
+            pending_network: None,
+            sockets: parent.sockets.clone(),
+        }
     }
 
     pub fn observe_stop(&mut self, process_id: libc::pid_t) -> io::Result<FileObservation> {
         match read_syscall_stop(process_id)? {
             SyscallStop::Entry(registers) => {
                 self.pending = decode_file_operation(process_id, &registers).unwrap_or(None);
+                self.pending_network =
+                    decode_network_operation(process_id, &registers).unwrap_or(None);
                 let mutation_paths = self
                     .pending
                     .as_ref()
@@ -63,29 +113,34 @@ impl SyscallState {
                 Ok(FileObservation {
                     events: Vec::new(),
                     mutation_paths,
+                    network_events: Vec::new(),
                 })
             }
             SyscallStop::Exit(result) => {
-                let Some(pending) = self.pending.take() else {
-                    return Ok(FileObservation {
-                        events: Vec::new(),
-                        mutation_paths: Vec::new(),
-                    });
-                };
-                if result < 0 {
-                    return Ok(FileObservation {
-                        events: Vec::new(),
-                        mutation_paths: Vec::new(),
-                    });
-                }
+                let events = self
+                    .pending
+                    .take()
+                    .filter(|_| result >= 0)
+                    .map(|pending| finish_file_operation(pending, result))
+                    .unwrap_or_default();
+                let network_events = self
+                    .pending_network
+                    .take()
+                    .filter(|_| result >= 0)
+                    .map(|pending| {
+                        finish_network_operation(process_id, pending, result, &mut self.sockets)
+                    })
+                    .unwrap_or_default();
                 Ok(FileObservation {
-                    events: finish_file_operation(pending, result),
+                    events,
                     mutation_paths: Vec::new(),
+                    network_events,
                 })
             }
             SyscallStop::Other => Ok(FileObservation {
                 events: Vec::new(),
                 mutation_paths: Vec::new(),
+                network_events: Vec::new(),
             }),
         }
     }
@@ -128,6 +183,231 @@ enum SyscallStop {
     Entry(Registers),
     Exit(i64),
     Other,
+}
+
+fn decode_network_operation(
+    process_id: libc::pid_t,
+    registers: &Registers,
+) -> io::Result<Option<PendingNetworkOperation>> {
+    let number = registers.number;
+    let arguments = registers.arguments;
+    if number == libc::SYS_socket {
+        let socket_type = arguments[1] as i32 & 0xf;
+        let protocol = arguments[2] as i32;
+        let transport = match (socket_type, protocol) {
+            (libc::SOCK_STREAM, 0 | libc::IPPROTO_TCP) => "tcp",
+            (libc::SOCK_DGRAM, 0 | libc::IPPROTO_UDP) => "udp",
+            (libc::SOCK_STREAM, _) => "stream",
+            (libc::SOCK_DGRAM, _) => "datagram",
+            _ => "socket",
+        };
+        return Ok(Some(PendingNetworkOperation::Socket { transport }));
+    }
+    if number == libc::SYS_bind || number == libc::SYS_connect {
+        let Some(endpoint) = read_socket_address(process_id, arguments[1], arguments[2] as usize)?
+        else {
+            return Ok(None);
+        };
+        if number == libc::SYS_bind {
+            return Ok(Some(PendingNetworkOperation::Bind {
+                descriptor: arguments[0] as i32,
+                endpoint,
+            }));
+        }
+        return Ok(Some(PendingNetworkOperation::Connect {
+            descriptor: arguments[0] as i32,
+            endpoint,
+        }));
+    }
+    if number == libc::SYS_listen {
+        return Ok(Some(PendingNetworkOperation::Listen {
+            descriptor: arguments[0] as i32,
+        }));
+    }
+    if number == libc::SYS_close {
+        return Ok(Some(PendingNetworkOperation::Close {
+            descriptor: arguments[0] as i32,
+        }));
+    }
+    if number == libc::SYS_dup || number == libc::SYS_dup3 {
+        let requested = (number == libc::SYS_dup3).then_some(arguments[1] as i32);
+        return Ok(Some(PendingNetworkOperation::Duplicate {
+            source: arguments[0] as i32,
+            requested,
+        }));
+    }
+    #[cfg(target_arch = "x86_64")]
+    if number == libc::SYS_dup2 {
+        return Ok(Some(PendingNetworkOperation::Duplicate {
+            source: arguments[0] as i32,
+            requested: Some(arguments[1] as i32),
+        }));
+    }
+    if number == libc::SYS_fcntl
+        && matches!(arguments[1] as i32, libc::F_DUPFD | libc::F_DUPFD_CLOEXEC)
+    {
+        return Ok(Some(PendingNetworkOperation::Duplicate {
+            source: arguments[0] as i32,
+            requested: None,
+        }));
+    }
+    Ok(None)
+}
+
+fn finish_network_operation(
+    process_id: libc::pid_t,
+    operation: PendingNetworkOperation,
+    result: i64,
+    sockets: &mut std::collections::HashMap<i32, SocketInformation>,
+) -> Vec<NetworkEvent> {
+    match operation {
+        PendingNetworkOperation::Socket { transport } => {
+            sockets.insert(
+                result as i32,
+                SocketInformation {
+                    transport,
+                    local: None,
+                },
+            );
+            Vec::new()
+        }
+        PendingNetworkOperation::Bind {
+            descriptor,
+            endpoint,
+        } => {
+            let Some(socket) = sockets.get_mut(&descriptor) else {
+                return Vec::new();
+            };
+            let endpoint =
+                descriptor_socket_address(process_id, descriptor, false).unwrap_or(endpoint);
+            socket.local = Some(endpoint);
+            vec![NetworkEvent {
+                operation: "bind",
+                transport: socket.transport,
+                endpoint,
+            }]
+        }
+        PendingNetworkOperation::Connect {
+            descriptor,
+            endpoint,
+        } => sockets
+            .get(&descriptor)
+            .map(|socket| {
+                vec![NetworkEvent {
+                    operation: "connect",
+                    transport: socket.transport,
+                    endpoint: descriptor_socket_address(process_id, descriptor, true)
+                        .unwrap_or(endpoint),
+                }]
+            })
+            .unwrap_or_default(),
+        PendingNetworkOperation::Listen { descriptor } => sockets
+            .get(&descriptor)
+            .and_then(|socket| {
+                descriptor_socket_address(process_id, descriptor, false)
+                    .or(socket.local)
+                    .map(|endpoint| NetworkEvent {
+                        operation: "listen",
+                        transport: socket.transport,
+                        endpoint,
+                    })
+            })
+            .into_iter()
+            .collect(),
+        PendingNetworkOperation::Close { descriptor } => {
+            sockets.remove(&descriptor);
+            Vec::new()
+        }
+        PendingNetworkOperation::Duplicate { source, requested } => {
+            if let Some(socket) = sockets.get(&source).cloned() {
+                sockets.insert(requested.unwrap_or(result as i32), socket);
+            }
+            Vec::new()
+        }
+    }
+}
+
+fn descriptor_socket_address(
+    process_id: libc::pid_t,
+    descriptor: i32,
+    peer: bool,
+) -> Option<SocketAddr> {
+    let process_descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, process_id, 0) } as i32;
+    if process_descriptor < 0 {
+        return None;
+    }
+    let local_descriptor =
+        unsafe { libc::syscall(libc::SYS_pidfd_getfd, process_descriptor, descriptor, 0) } as i32;
+    unsafe {
+        libc::close(process_descriptor);
+    }
+    if local_descriptor < 0 {
+        return None;
+    }
+
+    let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let result = unsafe {
+        if peer {
+            libc::getpeername(
+                local_descriptor,
+                storage.as_mut_ptr() as *mut libc::sockaddr,
+                &mut length,
+            )
+        } else {
+            libc::getsockname(
+                local_descriptor,
+                storage.as_mut_ptr() as *mut libc::sockaddr,
+                &mut length,
+            )
+        }
+    };
+    unsafe {
+        libc::close(local_descriptor);
+    }
+    if result != 0 {
+        return None;
+    }
+    let bytes =
+        unsafe { std::slice::from_raw_parts(storage.as_ptr() as *const u8, length as usize) };
+    parse_socket_address(bytes)
+}
+
+fn read_socket_address(
+    process_id: libc::pid_t,
+    address: u64,
+    length: usize,
+) -> io::Result<Option<SocketAddr>> {
+    if address == 0 || length < 2 {
+        return Ok(None);
+    }
+    let bytes = read_memory(process_id, address, length.min(128))?;
+    Ok(parse_socket_address(&bytes))
+}
+
+fn parse_socket_address(bytes: &[u8]) -> Option<SocketAddr> {
+    if bytes.len() < 2 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as i32;
+    if family == libc::AF_INET && bytes.len() >= 8 {
+        let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+        let address = Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
+        return Some(SocketAddr::V4(SocketAddrV4::new(address, port)));
+    }
+    if family == libc::AF_INET6 && bytes.len() >= 28 {
+        let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+        let mut address = [0_u8; 16];
+        address.copy_from_slice(&bytes[8..24]);
+        let scope = u32::from_ne_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+        return Some(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::from(address),
+            port,
+            0,
+            scope,
+        )));
+    }
+    None
 }
 
 fn decode_file_operation(
@@ -492,6 +772,17 @@ fn read_unsigned(process_id: libc::pid_t, address: u64) -> io::Result<u64> {
     Ok(peek_word(process_id, address)? as u64)
 }
 
+fn read_memory(process_id: libc::pid_t, address: u64, length: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(length);
+    let word_size = std::mem::size_of::<libc::c_long>();
+    while bytes.len() < length {
+        let word = peek_word(process_id, address + bytes.len() as u64)?;
+        let remaining = length - bytes.len();
+        bytes.extend_from_slice(&word.to_ne_bytes()[..remaining.min(word_size)]);
+    }
+    Ok(bytes)
+}
+
 fn peek_word(process_id: libc::pid_t, address: u64) -> io::Result<libc::c_long> {
     unsafe {
         *libc::__errno_location() = 0;
@@ -551,4 +842,28 @@ fn native_u64(bytes: &[u8], offset: usize) -> u64 {
     let mut value = [0_u8; 8];
     value.copy_from_slice(&bytes[offset..offset + 8]);
     u64::from_ne_bytes(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv6Addr, SocketAddr};
+
+    use super::parse_socket_address;
+
+    #[test]
+    fn parses_ipv6_socket_addresses() {
+        let mut bytes = [0_u8; 28];
+        bytes[..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
+        bytes[2..4].copy_from_slice(&7319_u16.to_be_bytes());
+        bytes[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+
+        assert_eq!(
+            parse_socket_address(&bytes),
+            Some(
+                "[::1]:7319"
+                    .parse::<SocketAddr>()
+                    .expect("the expected address should parse")
+            )
+        );
+    }
 }

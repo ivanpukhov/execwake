@@ -58,6 +58,11 @@ impl PtraceCollector {
             return Ok(());
         }
 
+        let inherited_syscalls = parent_id.and_then(|id| {
+            self.processes
+                .get(&id)
+                .map(|process| SyscallState::child(&process.syscalls))
+        });
         let parent = parent_id.and_then(|id| {
             self.processes
                 .get(&id)
@@ -98,11 +103,7 @@ impl PtraceCollector {
             TracedProcess {
                 identity,
                 executable,
-                syscalls: if parent.is_some() {
-                    SyscallState::child()
-                } else {
-                    SyscallState::root()
-                },
+                syscalls: inherited_syscalls.unwrap_or_else(SyscallState::root),
             },
         );
         Ok(())
@@ -198,6 +199,17 @@ impl PtraceCollector {
                 category: "filesystem",
                 operation: event.operation,
                 target,
+                process: Some(identity),
+                occurred_at_ms: unix_time_ms()?,
+                evidence: EvidenceKind::Observed,
+            })
+            .map_err(sink_error)?;
+        }
+        for event in observation.network_events {
+            sink.record_event(CollectorEvent {
+                category: "network",
+                operation: event.operation,
+                target: format!("{} {}", event.transport, event.endpoint),
                 process: Some(identity),
                 occurred_at_ms: unix_time_ms()?,
                 evidence: EvidenceKind::Observed,
@@ -360,7 +372,7 @@ impl Collector for PtraceCollector {
         sink.set_coverage(SessionCoverage {
             processes: CategoryCoverage::complete(),
             filesystem: CategoryCoverage::partial(0),
-            network: CategoryCoverage::unavailable(),
+            network: CategoryCoverage::partial(0),
             environment: CategoryCoverage::unavailable(),
         })
         .map_err(sink_error)?;

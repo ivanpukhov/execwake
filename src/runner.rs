@@ -462,6 +462,96 @@ mod tests {
         assert_eq!(transient, ("absent".to_owned(), "absent".to_owned()));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn records_socket_operations_without_application_protocol_labels() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let executable = std::env::current_exe().expect("the test executable should be known");
+        let result = run_in_store(
+            vec![
+                executable.into_os_string(),
+                OsString::from("--exact"),
+                OsString::from("runner::tests::network_fixture_child"),
+                OsString::from("--nocapture"),
+                OsString::from("--test-threads=1"),
+            ],
+            &store,
+        )
+        .expect("the network fixture should run");
+        let connection =
+            Connection::open(result.session.database()).expect("the database should open");
+        let mut statement = connection
+            .prepare("SELECT operation, target FROM event WHERE category = 'network'")
+            .expect("the event query should prepare");
+        let events: Vec<(String, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("events should be queried")
+            .collect::<Result<_, _>>()
+            .expect("events should be read");
+
+        for operation in ["bind", "listen", "connect"] {
+            assert!(
+                events.iter().any(|event| event.0 == operation),
+                "missing {operation}: {events:?}"
+            );
+        }
+        for target in ["tcp 127.0.0.1:", "udp 127.0.0.1:"] {
+            assert!(
+                events.iter().any(|event| event.1.starts_with(target)),
+                "missing {target}: {events:?}"
+            );
+        }
+        assert!(events.iter().all(|event| !event.1.contains("http")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_fixture_child() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream, UdpSocket};
+
+        for bind_address in ["127.0.0.1:0", "[::1]:0"] {
+            let Ok(listener) = TcpListener::bind(bind_address) else {
+                continue;
+            };
+            let address = listener
+                .local_addr()
+                .expect("the listener address should exist");
+            let client = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).expect("the client should connect");
+                stream.write_all(b"x").expect("the client should write");
+            });
+            let (mut stream, _) = listener.accept().expect("the listener should accept");
+            let mut byte = [0_u8; 1];
+            stream
+                .read_exact(&mut byte)
+                .expect("the listener should read");
+            client.join().expect("the client should finish");
+        }
+
+        for (receiver_address, sender_address) in
+            [("127.0.0.1:0", "127.0.0.1:0"), ("[::1]:0", "[::1]:0")]
+        {
+            let Ok(receiver) = UdpSocket::bind(receiver_address) else {
+                continue;
+            };
+            let sender = UdpSocket::bind(sender_address).expect("the sender should bind");
+            sender
+                .connect(
+                    receiver
+                        .local_addr()
+                        .expect("the receiver address should exist"),
+                )
+                .expect("the sender should connect");
+            sender.send(b"x").expect("the datagram should send");
+            let mut byte = [0_u8; 1];
+            receiver
+                .recv(&mut byte)
+                .expect("the datagram should arrive");
+        }
+    }
+
     #[cfg(unix)]
     fn exit_command(code: u8) -> Vec<OsString> {
         vec![
