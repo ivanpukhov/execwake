@@ -149,13 +149,7 @@ impl SessionStore {
     pub fn new_session_paths(&self) -> io::Result<SessionPaths> {
         for _ in 0..8 {
             let id = SessionId::generate()?;
-            let base = self.root.join(id.as_str());
-            let paths = SessionPaths {
-                id,
-                database: base.with_extension("sqlite3"),
-                lock: base.with_extension("lock"),
-                finalized: base.with_extension("finalized"),
-            };
+            let paths = self.paths(&id);
 
             if !paths.database.exists() && !paths.lock.exists() && !paths.finalized.exists() {
                 return Ok(paths);
@@ -166,6 +160,16 @@ impl SessionStore {
             io::ErrorKind::AlreadyExists,
             "could not allocate a unique session id",
         ))
+    }
+
+    pub fn paths(&self, id: &SessionId) -> SessionPaths {
+        let base = self.root.join(id.as_str());
+        SessionPaths {
+            id: id.clone(),
+            database: base.with_extension("sqlite3"),
+            lock: base.with_extension("lock"),
+            finalized: base.with_extension("finalized"),
+        }
     }
 
     pub fn begin(
@@ -201,6 +205,32 @@ impl SessionStore {
             }
         }
     }
+
+    pub fn recover_interrupted(&self) -> Result<Vec<SessionPaths>, StoreError> {
+        let mut recovered = Vec::new();
+
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("lock") {
+                continue;
+            }
+
+            let Some(id) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(SessionId::parse)
+            else {
+                continue;
+            };
+            let paths = self.paths(&id);
+            if recover_session(&paths)? {
+                recovered.push(paths);
+            }
+        }
+
+        Ok(recovered)
+    }
 }
 
 pub struct ActiveSession {
@@ -230,8 +260,7 @@ impl ActiveSession {
         }
         transaction.commit()?;
 
-        let marker = create_private_file(self.paths.finalized())?;
-        marker.sync_all()?;
+        create_finalized_marker(self.paths.finalized())?;
         self.finalized = true;
         let lock_file = self
             .lock_file
@@ -333,6 +362,84 @@ fn create_private_file(path: &Path) -> io::Result<File> {
     }
 
     options.open(path)
+}
+
+fn open_private_lock(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        let file = options.open(path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    {
+        options.open(path)
+    }
+}
+
+fn recover_session(paths: &SessionPaths) -> Result<bool, StoreError> {
+    let lock_file = open_private_lock(paths.lock())?;
+    match FileExt::try_lock_exclusive(&lock_file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+
+    if !paths.database().is_file() {
+        FileExt::unlock(&lock_file)?;
+        drop(lock_file);
+        fs::remove_file(paths.lock())?;
+        return Ok(false);
+    }
+
+    let mut connection = Connection::open_with_flags(
+        paths.database(),
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let transaction = connection.transaction()?;
+    let (state, finalized) = transaction.query_row(
+        "SELECT state, finalized FROM session WHERE singleton = 1",
+        [],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+
+    let interrupted = state == "running" && finalized == 0;
+    if interrupted {
+        transaction.execute(
+            "UPDATE session
+             SET state = 'interrupted', finalized = 1, ended_at_ms = ?1,
+                 exit_code = NULL, termination_signal = NULL,
+                 interruption = 'runner exited before finalization'
+             WHERE singleton = 1",
+            [unix_time_ms()?],
+        )?;
+    }
+    transaction.commit()?;
+
+    if finalized == 1 || interrupted {
+        create_finalized_marker(paths.finalized())?;
+    }
+
+    FileExt::unlock(&lock_file)?;
+    drop(lock_file);
+    fs::remove_file(paths.lock())?;
+
+    Ok(interrupted)
+}
+
+fn create_finalized_marker(path: &Path) -> io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+
+    let marker = create_private_file(path)?;
+    marker.sync_all()
 }
 
 fn unix_time_ms() -> Result<i64, StoreError> {
@@ -535,5 +642,66 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn orphaned_running_sessions_are_recovered() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin("sleep", 1)
+            .expect("a session should be started");
+        let database = session.paths().database().to_owned();
+        let marker = session.paths().finalized().to_owned();
+        drop(session);
+
+        let recovered = store
+            .recover_interrupted()
+            .expect("the orphaned session should be recovered");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].database(), database);
+        assert!(marker.exists());
+        assert!(!recovered[0].lock().exists());
+
+        let connection = Connection::open(database).expect("the database should open");
+        let row = connection
+            .query_row(
+                "SELECT state, finalized, interruption FROM session WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .expect("the session row should exist");
+
+        assert_eq!(
+            row,
+            (
+                "interrupted".to_owned(),
+                1,
+                "runner exited before finalization".to_owned(),
+            )
+        );
+    }
+
+    #[test]
+    fn active_sessions_are_not_recovered() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin("sleep", 1)
+            .expect("a session should be started");
+
+        let recovered = store
+            .recover_interrupted()
+            .expect("recovery should inspect the store");
+
+        assert!(recovered.is_empty());
+        assert!(!session.paths().finalized().exists());
     }
 }
