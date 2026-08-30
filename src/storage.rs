@@ -12,7 +12,9 @@ use crate::collector::{
     CollectorEvent, CollectorSink, DnsCorrelationRecord, EnvironmentVariableRecord,
     FileDeltaRecord, ProcessExecRecord, ProcessExitRecord, ProcessRecord, SinkError,
 };
-use crate::session::{CategoryCoverage, SessionCoverage, CURRENT_SCHEMA_VERSION};
+use crate::findings::{evaluate, EvidenceReference, FindingEvent};
+use crate::privacy::CURRENT_PRIVACY_PROFILE;
+use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage, CURRENT_SCHEMA_VERSION};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -308,6 +310,7 @@ impl ActiveSession {
                )",
             [ended_at_ms],
         )?;
+        persist_findings(&transaction)?;
         let updated = transaction.execute(
             "UPDATE session
              SET state = 'finalized', finalized = 1, ended_at_ms = ?1,
@@ -560,6 +563,7 @@ fn initialize_database(
              ended_at_ms INTEGER,
              runner_pid INTEGER NOT NULL,
              collector_backend TEXT,
+             privacy_profile TEXT NOT NULL,
              exit_code INTEGER,
              termination_signal INTEGER,
              interruption TEXT
@@ -616,6 +620,20 @@ fn initialize_database(
              process_id INTEGER NOT NULL REFERENCES process(process_id),
              evidence TEXT NOT NULL CHECK (evidence IN ('observed', 'inferred', 'derived')),
              PRIMARY KEY (name, process_id)
+         );
+         CREATE TABLE finding (
+             finding_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             rule_id TEXT NOT NULL,
+             rule_version INTEGER NOT NULL CHECK (rule_version > 0),
+             severity TEXT NOT NULL CHECK (severity IN ('low', 'medium', 'high')),
+             process_id INTEGER NOT NULL REFERENCES process(process_id),
+             subject TEXT NOT NULL,
+             UNIQUE (rule_id, rule_version, process_id, subject)
+         );
+         CREATE TABLE finding_evidence (
+             finding_id INTEGER NOT NULL REFERENCES finding(finding_id) ON DELETE CASCADE,
+             event_id INTEGER NOT NULL REFERENCES event(event_id),
+             PRIMARY KEY (finding_id, event_id)
          );",
     )?;
 
@@ -623,8 +641,8 @@ fn initialize_database(
     transaction.execute(
         "INSERT INTO session (
              singleton, id, schema_version, mode, state, finalized,
-             command_name, argument_count, started_at_ms, runner_pid
-         ) VALUES (1, ?1, ?2, 'observe', 'running', 0, ?3, ?4, ?5, ?6)",
+             command_name, argument_count, started_at_ms, runner_pid, privacy_profile
+         ) VALUES (1, ?1, ?2, 'observe', 'running', 0, ?3, ?4, ?5, ?6, ?7)",
         params![
             paths.id().as_str(),
             i64::from(CURRENT_SCHEMA_VERSION),
@@ -632,6 +650,7 @@ fn initialize_database(
             argument_count,
             unix_time_ms()?,
             i64::from(std::process::id()),
+            CURRENT_PRIVACY_PROFILE,
         ],
     )?;
     for (category, state) in [
@@ -648,6 +667,89 @@ fn initialize_database(
     transaction.commit()?;
 
     Ok(connection)
+}
+
+fn persist_findings(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let mut statement = transaction.prepare(
+        "SELECT event_id, category, operation, target, process_id, evidence
+         FROM event ORDER BY event_id",
+    )?;
+    let events = statement
+        .query_map([], |row| {
+            let evidence: String = row.get(5)?;
+            Ok(FindingEvent {
+                event_id: row.get(0)?,
+                category: row.get(1)?,
+                operation: row.get(2)?,
+                target: row.get(3)?,
+                process: optional_process_identity(row.get(4)?)?,
+                evidence: parse_evidence_kind(&evidence, 5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    for finding in evaluate(events) {
+        transaction.execute(
+            "INSERT INTO finding (
+                 rule_id, rule_version, severity, process_id, subject
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                finding.rule_id,
+                i64::from(finding.rule_version),
+                finding.severity.as_str(),
+                database_process_id(finding.process.get())
+                    .map_err(|error| { rusqlite::Error::ToSqlConversionFailure(error) })?,
+                finding.subject,
+            ],
+        )?;
+        let finding_id = transaction.last_insert_rowid();
+        for reference in finding.evidence {
+            let EvidenceReference::Event(event_id) = reference;
+            transaction.execute(
+                "INSERT INTO finding_evidence (finding_id, event_id) VALUES (?1, ?2)",
+                params![finding_id, event_id],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn optional_process_identity(
+    value: Option<i64>,
+) -> rusqlite::Result<Option<crate::collector::ProcessIdentity>> {
+    value
+        .map(|value| {
+            u64::try_from(value)
+                .map(crate::collector::ProcessIdentity::new)
+                .map_err(|_| {
+                    invalid_database_value(
+                        4,
+                        rusqlite::types::Type::Integer,
+                        "process identity is out of range",
+                    )
+                })
+        })
+        .transpose()
+}
+
+fn parse_evidence_kind(value: &str, column: usize) -> rusqlite::Result<EvidenceKind> {
+    EvidenceKind::parse(value).ok_or_else(|| {
+        invalid_database_value(column, rusqlite::types::Type::Text, "invalid evidence kind")
+    })
+}
+
+fn invalid_database_value(
+    column: usize,
+    data_type: rusqlite::types::Type,
+    message: &'static str,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        data_type,
+        Box::new(io::Error::new(io::ErrorKind::InvalidData, message)),
+    )
 }
 
 fn create_private_file(path: &Path) -> io::Result<File> {
@@ -712,6 +814,7 @@ fn recover_session(paths: &SessionPaths) -> Result<bool, StoreError> {
 
     let interrupted = state == "running" && finalized == 0;
     if interrupted {
+        persist_findings(&transaction)?;
         transaction.execute(
             "UPDATE session
              SET state = 'interrupted', finalized = 1, ended_at_ms = ?1,
@@ -1115,6 +1218,99 @@ mod tests {
                 [],
             )
             .is_err());
+    }
+
+    #[test]
+    fn finalized_findings_link_to_raw_event_evidence() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let mut session = store
+            .begin("fixture", 0)
+            .expect("a session should be started");
+        let process = ProcessIdentity::new(1);
+        session
+            .record_process(ProcessRecord {
+                identity: process,
+                operating_system_id: 72,
+                start_time_ticks: Some(90),
+                parent: None,
+                executable: "fixture".to_owned(),
+                occurred_at_ms: 10,
+                evidence: EvidenceKind::Observed,
+            })
+            .expect("the process should be stored");
+        for (operation, occurred_at_ms) in [("open", 11), ("read", 12)] {
+            session
+                .record_event(CollectorEvent {
+                    category: "filesystem",
+                    operation,
+                    target: "$HOME/.ssh/id_ed25519".to_owned(),
+                    process: Some(process),
+                    occurred_at_ms,
+                    evidence: EvidenceKind::Observed,
+                })
+                .expect("the evidence event should be stored");
+        }
+        let database = session.paths().database().to_owned();
+        session
+            .finalize(SessionOutcome::exited(0))
+            .expect("the session should finalize");
+
+        let connection = Connection::open(database).expect("the database should open");
+        let finding = connection
+            .query_row(
+                "SELECT rule_id, rule_version, severity, process_id, subject
+                 FROM finding",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .expect("the finding should exist");
+        let evidence: Vec<(i64, String)> = connection
+            .prepare(
+                "SELECT event.event_id, event.target
+                 FROM finding_evidence
+                 JOIN event USING (event_id)
+                 ORDER BY event.event_id",
+            )
+            .expect("the evidence query should prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("the evidence should be queried")
+            .collect::<Result<_, _>>()
+            .expect("the evidence should be read");
+        let privacy_profile: String = connection
+            .query_row(
+                "SELECT privacy_profile FROM session WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the privacy profile should exist");
+
+        assert_eq!(
+            finding,
+            (
+                "EW-FS-001".to_owned(),
+                1,
+                "high".to_owned(),
+                1,
+                "$HOME/.ssh/id_ed25519".to_owned(),
+            )
+        );
+        assert_eq!(
+            evidence,
+            [
+                (1, "$HOME/.ssh/id_ed25519".to_owned()),
+                (2, "$HOME/.ssh/id_ed25519".to_owned()),
+            ]
+        );
+        assert_eq!(privacy_profile, "paths-v1");
     }
 
     #[cfg(unix)]

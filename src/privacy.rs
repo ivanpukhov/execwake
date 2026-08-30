@@ -1,6 +1,8 @@
 use std::net::Ipv6Addr;
 use std::path::{Component, Path, PathBuf};
 
+pub const CURRENT_PRIVACY_PROFILE: &str = "paths-v1";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathRoots {
     home: Option<PathBuf>,

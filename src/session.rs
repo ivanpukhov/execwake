@@ -1,6 +1,6 @@
 use crate::privacy::is_valid_environment_name;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionMode {
@@ -20,6 +20,15 @@ impl EvidenceKind {
             Self::Observed => "observed",
             Self::Inferred => "inferred",
             Self::Derived => "derived",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "observed" => Some(Self::Observed),
+            "inferred" => Some(Self::Inferred),
+            "derived" => Some(Self::Derived),
+            _ => None,
         }
     }
 }
