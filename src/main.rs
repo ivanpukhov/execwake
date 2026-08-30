@@ -27,7 +27,7 @@ fn main() {
         Command::Run(args) => match execwake::runner::run(args.command) {
             Ok(result) => {
                 eprintln!("Session: {}", result.session.database().display());
-                process::exit(result.status.code().unwrap_or(1));
+                execwake::runner::exit_with_status(result.status);
             }
             Err(error) => {
                 eprintln!("error: {error}");
