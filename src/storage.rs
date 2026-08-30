@@ -61,6 +61,13 @@ impl SessionOutcome {
             termination_signal: Some(signal),
         }
     }
+
+    pub const fn without_status() -> Self {
+        Self {
+            exit_code: None,
+            termination_signal: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -245,9 +252,46 @@ impl ActiveSession {
         &self.paths
     }
 
+    pub fn record_root_process(&mut self, process_id: u32) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        let (command_name, started_at_ms) = transaction.query_row(
+            "SELECT command_name, started_at_ms FROM session WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        transaction.execute(
+            "INSERT INTO process (
+                 process_id, parent_process_id, executable, started_at_ms, evidence
+             ) VALUES (?1, NULL, ?2, ?3, 'observed')",
+            params![i64::from(process_id), command_name, started_at_ms],
+        )?;
+        transaction.execute(
+            "INSERT INTO event (
+                 category, operation, target, process_id, occurred_at_ms, evidence
+             ) VALUES ('process', 'start', ?1, ?2, ?3, 'observed')",
+            params![command_name, i64::from(process_id), started_at_ms],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn finalize(mut self, outcome: SessionOutcome) -> Result<SessionPaths, StoreError> {
         let ended_at_ms = unix_time_ms()?;
         let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE process
+             SET ended_at_ms = ?1, exit_code = ?2, termination_signal = ?3
+             WHERE parent_process_id IS NULL",
+            params![ended_at_ms, outcome.exit_code, outcome.termination_signal],
+        )?;
+        transaction.execute(
+            "INSERT INTO event (
+                 category, operation, target, process_id, occurred_at_ms, evidence
+             )
+             SELECT 'process', 'exit', executable, process_id, ?1, 'observed'
+             FROM process WHERE parent_process_id IS NULL",
+            [ended_at_ms],
+        )?;
         let updated = transaction.execute(
             "UPDATE session
              SET state = 'finalized', finalized = 1, ended_at_ms = ?1,
@@ -317,6 +361,25 @@ fn initialize_database(
              category TEXT PRIMARY KEY,
              state TEXT NOT NULL CHECK (state IN ('complete', 'partial', 'unavailable')),
              lost_events INTEGER NOT NULL CHECK (lost_events >= 0)
+         );
+         CREATE TABLE process (
+             process_id INTEGER PRIMARY KEY,
+             parent_process_id INTEGER REFERENCES process(process_id),
+             executable TEXT NOT NULL,
+             started_at_ms INTEGER NOT NULL,
+             ended_at_ms INTEGER,
+             exit_code INTEGER,
+             termination_signal INTEGER,
+             evidence TEXT NOT NULL CHECK (evidence IN ('observed', 'inferred', 'derived'))
+         );
+         CREATE TABLE event (
+             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             category TEXT NOT NULL,
+             operation TEXT NOT NULL,
+             target TEXT NOT NULL,
+             process_id INTEGER REFERENCES process(process_id),
+             occurred_at_ms INTEGER NOT NULL,
+             evidence TEXT NOT NULL CHECK (evidence IN ('observed', 'inferred', 'derived'))
          );",
     )?;
 
