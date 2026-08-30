@@ -3,7 +3,7 @@
   import ProcessTree from './ProcessTree.svelte';
   import Timeline from './Timeline.svelte';
   import VirtualEventTable from './VirtualEventTable.svelte';
-  import { durationMs, loadReport, type SessionReport } from './report';
+  import { durationMs, loadReport, type CoverageReport, type SessionReport } from './report';
 
   let report: SessionReport | null = null;
   let error = '';
@@ -20,6 +20,11 @@
     if (value === null) return 'Running';
     if (value < 1000) return `${value} ms`;
     return `${(value / 1000).toFixed(2)} s`;
+  }
+
+  function coverageStatus(coverage: CoverageReport): string {
+    if (coverage.lostEvents === 0) return coverage.state;
+    return `${coverage.state} · ${coverage.lostEvents} lost`;
   }
 </script>
 
@@ -57,7 +62,7 @@
         {#each report.coverage as coverage}
           <div class="coverage-row">
             <span>{coverage.category}</span>
-            <strong class:unavailable={coverage.state === 'unavailable'}>{coverage.state}</strong>
+            <strong class:unavailable={coverage.state === 'unavailable'}>{coverageStatus(coverage)}</strong>
           </div>
         {/each}
       </div>

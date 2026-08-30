@@ -56,11 +56,13 @@
     context.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
     context.textBaseline = 'middle';
 
-    const observedEnd = Math.max(
-      endedAtMs ?? startedAtMs,
-      ...processes.map((process) => process.endedAtMs ?? process.startedAtMs),
-      ...events.map((event) => event.occurredAtMs)
-    );
+    let observedEnd = endedAtMs ?? startedAtMs;
+    for (const process of processes) {
+      observedEnd = Math.max(observedEnd, process.endedAtMs ?? process.startedAtMs);
+    }
+    for (const event of events) {
+      observedEnd = Math.max(observedEnd, event.occurredAtMs);
+    }
     const duration = Math.max(1, observedEnd - startedAtMs);
     const plotWidth = Math.max(1, width - labelWidth - rightPadding);
     const xFor = (timestamp: number) =>
@@ -71,14 +73,17 @@
     context.lineWidth = 1;
     for (let tick = 0; tick <= 4; tick += 1) {
       const x = labelWidth + (plotWidth * tick) / 4;
+      const label = elapsedLabel((duration * tick) / 4);
       context.beginPath();
       context.moveTo(x + 0.5, axisHeight - 4);
       context.lineTo(x + 0.5, cssHeight - 6);
       context.stroke();
-      context.fillText(elapsedLabel((duration * tick) / 4), x + 4, 11);
+      context.textAlign = tick === 0 ? 'left' : tick === 4 ? 'right' : 'center';
+      context.fillText(label, tick === 0 ? x + 4 : tick === 4 ? x - 2 : x, 11);
     }
 
     const processRows = new Map<number, number>();
+    context.textAlign = 'left';
     processes.forEach((process, index) => {
       processRows.set(process.processId, index);
       const y = axisHeight + index * rowHeight + rowHeight / 2;
@@ -92,9 +97,13 @@
       context.fillRect(start, y - 4, Math.max(2, end - start), 8);
     });
 
+    const markers = new Set<string>();
     for (const event of events) {
       const row = event.processId === null ? 0 : (processRows.get(event.processId) ?? 0);
       const x = xFor(event.occurredAtMs);
+      const marker = `${row}:${Math.round(x)}:${event.category}`;
+      if (markers.has(marker)) continue;
+      markers.add(marker);
       const y = axisHeight + row * rowHeight + rowHeight / 2;
       context.fillStyle = eventColors[event.category] ?? '#7b8580';
       context.fillRect(x - 1, y - 8, 2, 16);

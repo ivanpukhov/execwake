@@ -30,22 +30,31 @@
 
     const rows: ProcessRow[] = [];
     const visited = new Set<number>();
-    const visit = (process: ProcessReport, depth: number) => {
-      if (visited.has(process.processId)) return;
-      visited.add(process.processId);
-      rows.push({ process, depth });
-      for (const child of children.get(process.processId) ?? []) visit(child, depth + 1);
+    const append = (root: ProcessReport) => {
+      const pending: ProcessRow[] = [{ process: root, depth: 0 }];
+      while (pending.length > 0) {
+        const row = pending.pop();
+        if (!row || visited.has(row.process.processId)) continue;
+        visited.add(row.process.processId);
+        rows.push(row);
+
+        const descendants = children.get(row.process.processId) ?? [];
+        for (let index = descendants.length - 1; index >= 0; index -= 1) {
+          pending.push({ process: descendants[index], depth: row.depth + 1 });
+        }
+      }
     };
 
-    for (const root of roots) visit(root, 0);
-    for (const process of [...input].sort(order)) visit(process, 0);
+    for (const root of roots) append(root);
+    for (const process of [...input].sort(order)) append(process);
     return rows;
   }
 
   function processResult(process: ProcessReport): string {
+    if (process.endedAtMs === null) return 'incomplete';
     if (process.terminationSignal !== null) return `signal ${process.terminationSignal}`;
     if (process.exitCode !== null) return `exit ${process.exitCode}`;
-    return 'running';
+    return 'unknown';
   }
 
   $: rows = flatten(processes);

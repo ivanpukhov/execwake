@@ -79,11 +79,11 @@
   bind:this={viewport}
   role="grid"
   aria-label="Session events"
-  aria-rowcount={filtered.length}
+  aria-rowcount={filtered.length + 1}
   tabindex="0"
   on:scroll={(event) => (scrollTop = event.currentTarget.scrollTop)}
 >
-  <div class="event-table-head" role="row">
+  <div class="event-table-head" role="row" aria-rowindex="1">
     <span role="columnheader">Time</span>
     <span role="columnheader">Category</span>
     <span role="columnheader">Operation</span>
@@ -99,7 +99,7 @@
         <div
           class="event-row"
           role="row"
-          aria-rowindex={firstRow + index + 1}
+          aria-rowindex={firstRow + index + 2}
           style:transform={`translateY(${(firstRow + index) * rowHeight}px)`}
         >
           <span role="gridcell" class="event-time">{elapsed(event.occurredAtMs)}</span>
