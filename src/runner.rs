@@ -325,7 +325,8 @@ mod tests {
             )
             .expect("the session row should exist");
 
-        assert_eq!(row, ("finalized".to_owned(), 7, 1, 2));
+        assert_eq!((row.0, row.1, row.2), ("finalized".to_owned(), 7, 1));
+        assert!(row.3 >= 2);
     }
 
     #[cfg(unix)]
@@ -397,6 +398,57 @@ mod tests {
         assert_eq!(identities, processes);
         assert!(children >= 2);
         assert!(execs >= 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn records_successful_filesystem_operations() {
+        use std::collections::HashSet;
+
+        let directory = TestDirectory::new();
+        fs::create_dir_all(&directory.0).expect("the test directory should be created");
+        let work = directory.0.join("trace-work");
+        fs::create_dir(&work).expect("the trace directory should be created");
+        let store =
+            SessionStore::at(directory.0.join("sessions")).expect("storage should be created");
+        let result = run_in_store(
+            vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(
+                    "cd \"$1\" && printf data > trace-created && cat trace-created >/dev/null \
+                     && : > trace-created && mv trace-created trace-renamed \
+                     && ln trace-renamed trace-linked && ln -s trace-renamed trace-symlink \
+                     && rm trace-linked trace-symlink trace-renamed",
+                ),
+                OsString::from("fixture"),
+                work.into_os_string(),
+            ],
+            &store,
+        )
+        .expect("the filesystem fixture should run");
+        let connection =
+            Connection::open(result.session.database()).expect("the database should open");
+        let mut statement = connection
+            .prepare(
+                "SELECT DISTINCT operation FROM event
+                 WHERE category = 'filesystem' AND target LIKE '%trace-%'",
+            )
+            .expect("the event query should prepare");
+        let operations: HashSet<String> = statement
+            .query_map([], |row| row.get(0))
+            .expect("events should be queried")
+            .collect::<Result<_, _>>()
+            .expect("events should be read");
+
+        for operation in [
+            "create", "write", "read", "truncate", "rename", "link", "symlink", "unlink",
+        ] {
+            assert!(
+                operations.contains(operation),
+                "missing {operation}: {operations:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

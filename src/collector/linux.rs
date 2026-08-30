@@ -1,26 +1,33 @@
 use std::collections::HashMap;
+use std::env;
 use std::io;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus};
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod syscall;
+
+use syscall::SyscallState;
+
 use super::{
     Collector, CollectorEvent, CollectorSink, ProcessExecRecord, ProcessExitRecord,
     ProcessIdentity, ProcessRecord, SinkError,
 };
+use crate::privacy::PathRoots;
 use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage};
 
 pub struct PtraceCollector {
     root_executable: String,
     next_identity: u64,
     processes: HashMap<libc::pid_t, TracedProcess>,
+    path_roots: PathRoots,
 }
 
-#[derive(Clone)]
 struct TracedProcess {
     identity: ProcessIdentity,
     executable: String,
+    syscalls: SyscallState,
 }
 
 impl PtraceCollector {
@@ -29,6 +36,11 @@ impl PtraceCollector {
             root_executable,
             next_identity: 1,
             processes: HashMap::new(),
+            path_roots: PathRoots::new(
+                env::var_os("HOME").map(Into::into),
+                env::current_dir().ok(),
+                Some(env::temp_dir()),
+            ),
         }
     }
 
@@ -43,10 +55,14 @@ impl PtraceCollector {
             return Ok(());
         }
 
-        let parent = parent_id.and_then(|id| self.processes.get(&id).cloned());
+        let parent = parent_id.and_then(|id| {
+            self.processes
+                .get(&id)
+                .map(|process| (process.identity, process.executable.clone()))
+        });
         let executable = parent
             .as_ref()
-            .map(|process| process.executable.clone())
+            .map(|(_, executable)| executable.clone())
             .unwrap_or_else(|| self.root_executable.clone());
         let identity = ProcessIdentity::new(self.next_identity);
         self.next_identity = self
@@ -59,7 +75,7 @@ impl PtraceCollector {
             identity,
             operating_system_id: process_id as u32,
             start_time_ticks,
-            parent: parent.as_ref().map(|process| process.identity),
+            parent: parent.as_ref().map(|(identity, _)| *identity),
             executable: executable.clone(),
             occurred_at_ms,
             evidence: EvidenceKind::Observed,
@@ -79,6 +95,11 @@ impl PtraceCollector {
             TracedProcess {
                 identity,
                 executable,
+                syscalls: if parent.is_some() {
+                    SyscallState::child()
+                } else {
+                    SyscallState::root()
+                },
             },
         );
         Ok(())
@@ -145,6 +166,37 @@ impl PtraceCollector {
             evidence: EvidenceKind::Observed,
         })
         .map_err(sink_error)
+    }
+
+    fn record_syscall(
+        &mut self,
+        process_id: libc::pid_t,
+        sink: &mut dyn CollectorSink,
+    ) -> io::Result<()> {
+        let process = self
+            .processes
+            .get_mut(&process_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "syscall from unknown process"))?;
+        let identity = process.identity;
+        let events = process.syscalls.observe_stop(process_id)?;
+        for event in events {
+            let target = event
+                .paths
+                .iter()
+                .map(|path| self.path_roots.normalize(path))
+                .collect::<Vec<_>>()
+                .join(" → ");
+            sink.record_event(CollectorEvent {
+                category: "filesystem",
+                operation: event.operation,
+                target,
+                process: Some(identity),
+                occurred_at_ms: unix_time_ms()?,
+                evidence: EvidenceKind::Observed,
+            })
+            .map_err(sink_error)?;
+        }
+        Ok(())
     }
 }
 
@@ -248,6 +300,9 @@ impl Collector for PtraceCollector {
                 }
                 libc::PTRACE_EVENT_EXIT => resume_syscall(process_id, 0)?,
                 0 => {
+                    if stop_signal == (libc::SIGTRAP | 0x80) {
+                        self.record_syscall(process_id, sink)?;
+                    }
                     let signal = if stop_signal == libc::SIGSTOP
                         || stop_signal == libc::SIGTRAP
                         || stop_signal == (libc::SIGTRAP | 0x80)
@@ -264,7 +319,7 @@ impl Collector for PtraceCollector {
 
         sink.set_coverage(SessionCoverage {
             processes: CategoryCoverage::complete(),
-            filesystem: CategoryCoverage::unavailable(),
+            filesystem: CategoryCoverage::partial(0),
             network: CategoryCoverage::unavailable(),
             environment: CategoryCoverage::unavailable(),
         })
