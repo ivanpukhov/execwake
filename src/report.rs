@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, COOKIE, HOST, LOCATION, ORIGIN,
-    REFERRER_POLICY, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
+    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST, LOCATION,
+    ORIGIN, REFERRER_POLICY, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
@@ -21,7 +21,9 @@ use crate::storage::SessionPaths;
 
 const BODY_LIMIT: usize = 16 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const REPORT_SHELL: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>ExecWake</title></head><body><main><h1>ExecWake</h1><p>Report loading.</p></main></body></html>";
+const REPORT_SHELL: &str = include_str!("report/assets/index.html");
+const REPORT_JAVASCRIPT: &[u8] = include_bytes!("report/assets/assets/app.js");
+const REPORT_STYLES: &[u8] = include_bytes!("report/assets/assets/app.css");
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 
 #[derive(Clone)]
@@ -108,6 +110,8 @@ impl ReportServer {
         let protected = Router::new()
             .route("/session/:id", get(index))
             .route("/api/session/:id", get(session_api))
+            .route("/assets/app.js", get(app_javascript))
+            .route("/assets/app.css", get(app_styles))
             .route_layer(middleware::from_fn_with_state(
                 self.state.clone(),
                 require_token,
@@ -172,6 +176,18 @@ async fn index(State(state): State<AppState>, Path(id): Path<String>) -> Respons
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
+}
+
+async fn app_javascript() -> Response {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        REPORT_JAVASCRIPT,
+    )
+        .into_response()
+}
+
+async fn app_styles() -> Response {
+    ([(CONTENT_TYPE, "text/css; charset=utf-8")], REPORT_STYLES).into_response()
 }
 
 async fn session_api(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -528,6 +544,16 @@ mod tests {
         .await;
         assert!(report.starts_with("HTTP/1.1 200 OK"));
         assert!(report.contains("\"commandName\":\"printf\""));
+
+        let asset = request(
+            address,
+            &format!(
+                "GET /assets/app.js HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(asset.starts_with("HTTP/1.1 200 OK"));
+        assert!(asset.contains("content-type: text/javascript; charset=utf-8"));
 
         let rejected_origin = request(
             address,
