@@ -10,7 +10,7 @@ pub use linux::LinuxCollector;
 
 pub type SinkError = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProcessIdentity(u64);
 
 impl ProcessIdentity {
