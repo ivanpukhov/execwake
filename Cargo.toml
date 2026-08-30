@@ -7,6 +7,7 @@ license = "MIT"
 description = "Record the observable side effects of a command"
 
 [dependencies]
+getrandom = "0.2.16"
 
 [[test]]
 name = "conformance"
