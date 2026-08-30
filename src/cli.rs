@@ -188,6 +188,30 @@ mod tests {
     }
 
     #[test]
+    fn preserves_shell_metacharacters_as_individual_arguments() {
+        let result =
+            Cli::parse_from(["execwake", "run", "--", "printf", "two words", "$HOME", ";"])
+                .expect("run arguments should parse");
+
+        let ParseResult::Command(cli) = result else {
+            panic!("expected command");
+        };
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(
+            args.command,
+            [
+                OsStr::new("printf"),
+                OsStr::new("two words"),
+                OsStr::new("$HOME"),
+                OsStr::new(";"),
+            ]
+        );
+    }
+
+    #[test]
     fn parses_diff_session_paths() {
         let result = Cli::parse_from(["execwake", "diff", "before.sqlite3", "after.sqlite3"])
             .expect("diff arguments should parse");

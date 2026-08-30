@@ -1,3 +1,5 @@
+use crate::privacy::is_valid_environment_name;
+
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10,6 +12,29 @@ pub enum EvidenceKind {
     Observed,
     Inferred,
     Derived,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentRead {
+    name: String,
+    evidence: EvidenceKind,
+}
+
+impl EnvironmentRead {
+    pub fn new(name: &str, evidence: EvidenceKind) -> Option<Self> {
+        is_valid_environment_name(name).then(|| Self {
+            name: name.to_owned(),
+            evidence,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn evidence(&self) -> EvidenceKind {
+        self.evidence
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,9 +127,19 @@ impl SessionManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        CategoryCoverage, CoverageState, SessionCoverage, SessionManifest, SessionMode,
-        CURRENT_SCHEMA_VERSION,
+        CategoryCoverage, CoverageState, EnvironmentRead, EvidenceKind, SessionCoverage,
+        SessionManifest, SessionMode, CURRENT_SCHEMA_VERSION,
     };
+
+    #[test]
+    fn environment_reads_store_only_valid_names() {
+        let read = EnvironmentRead::new("GITHUB_TOKEN", EvidenceKind::Observed)
+            .expect("a variable name should be accepted");
+
+        assert_eq!(read.name(), "GITHUB_TOKEN");
+        assert_eq!(read.evidence(), EvidenceKind::Observed);
+        assert!(EnvironmentRead::new("GITHUB_TOKEN=secret", EvidenceKind::Observed).is_none());
+    }
 
     #[test]
     fn new_sessions_are_explicitly_observe_only() {
