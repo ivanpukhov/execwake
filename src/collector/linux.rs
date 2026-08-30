@@ -7,7 +7,10 @@ use std::process::{Child, Command, ExitStatus};
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod ebpf;
 mod syscall;
+
+pub use ebpf::LinuxCollector;
 
 use syscall::SyscallState;
 

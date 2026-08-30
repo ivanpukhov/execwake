@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 #[cfg(target_os = "linux")]
-use crate::collector::{Collector, PtraceCollector};
+use crate::collector::{Collector, LinuxCollector};
 use crate::storage::{SessionOutcome, SessionPaths, SessionStore, StoreError};
 
 #[derive(Debug)]
@@ -69,7 +69,7 @@ fn run_in_store(argv: Vec<OsString>, store: &SessionStore) -> Result<RunResult, 
         .stderr(Stdio::inherit());
 
     #[cfg(target_os = "linux")]
-    let mut collector = PtraceCollector::new(command_name);
+    let mut collector = LinuxCollector::new(command_name);
     #[cfg(target_os = "linux")]
     if let Err(source) = collector.prepare(&mut command) {
         forwarder.stop();
@@ -327,6 +327,18 @@ mod tests {
 
         assert_eq!((row.0, row.1, row.2), ("finalized".to_owned(), 7, 1));
         assert!(row.3 >= 2);
+
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("EXECWAKE_REQUIRE_EBPF").is_some() {
+            let backend: String = connection
+                .query_row(
+                    "SELECT collector_backend FROM session WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the collector backend should be stored");
+            assert_eq!(backend, "ebpf");
+        }
     }
 
     #[cfg(unix)]

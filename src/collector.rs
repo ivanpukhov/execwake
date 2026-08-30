@@ -6,7 +6,7 @@ use crate::session::{EvidenceKind, SessionCoverage};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::PtraceCollector;
+pub use linux::LinuxCollector;
 
 pub type SinkError = Box<dyn std::error::Error + Send + Sync>;
 
