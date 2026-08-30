@@ -39,6 +39,7 @@ pub struct DnsEvent {
 struct SocketInformation {
     transport: &'static str,
     local: Option<SocketAddr>,
+    peer: Option<SocketAddr>,
     dns_queries: std::collections::HashMap<u16, String>,
 }
 
@@ -68,11 +69,13 @@ enum PendingNetworkOperation {
         descriptor: i32,
         buffer: u64,
         length: usize,
+        endpoint: Option<SocketAddr>,
     },
     Receive {
         descriptor: i32,
         buffer: u64,
         length: usize,
+        endpoint: Option<(u64, u64)>,
     },
 }
 
@@ -86,7 +89,7 @@ enum PendingFileOperation {
     Open {
         path: PathBuf,
         flags: i32,
-        existed: bool,
+        existed: Option<bool>,
     },
     One {
         operation: &'static str,
@@ -122,6 +125,11 @@ impl SyscallState {
         }
     }
 
+    pub fn after_exec(&mut self) {
+        self.pending = None;
+        self.pending_network = None;
+    }
+
     pub fn observe_stop(&mut self, process_id: libc::pid_t) -> io::Result<FileObservation> {
         match read_syscall_stop(process_id)? {
             SyscallStop::Entry(registers) => {
@@ -150,7 +158,7 @@ impl SyscallState {
                 let network = self
                     .pending_network
                     .take()
-                    .filter(|_| result >= 0)
+                    .filter(|pending| pending.completed(result))
                     .map(|pending| {
                         finish_network_operation(process_id, pending, result, &mut self.sockets)
                     })
@@ -186,10 +194,15 @@ impl PendingFileOperation {
                 requires_data: _,
             } if matches!(*operation, "write" | "truncate" | "unlink") => vec![path.clone()],
             Self::Two {
-                operation: _,
+                operation: "rename",
                 first,
                 second,
             } => vec![first.clone(), second.clone()],
+            Self::Two {
+                operation: "link" | "symlink",
+                first: _,
+                second,
+            } => vec![second.clone()],
             Self::Mapping {
                 path,
                 read: _,
@@ -197,6 +210,13 @@ impl PendingFileOperation {
             } => vec![path.clone()],
             _ => Vec::new(),
         }
+    }
+}
+
+impl PendingNetworkOperation {
+    fn completed(&self, result: i64) -> bool {
+        result >= 0
+            || matches!(self, Self::Connect { .. }) && result == -i64::from(libc::EINPROGRESS)
     }
 }
 
@@ -282,10 +302,16 @@ fn decode_network_operation(
     if sockets.contains_key(&descriptor)
         && (number == libc::SYS_sendto || number == libc::SYS_write)
     {
+        let endpoint = if number == libc::SYS_sendto {
+            read_socket_address(process_id, arguments[4], arguments[5] as usize)?
+        } else {
+            None
+        };
         return Ok(Some(PendingNetworkOperation::Send {
             descriptor,
             buffer: arguments[1],
             length: arguments[2] as usize,
+            endpoint,
         }));
     }
     if sockets.contains_key(&descriptor)
@@ -295,6 +321,7 @@ fn decode_network_operation(
             descriptor,
             buffer: arguments[1],
             length: arguments[2] as usize,
+            endpoint: (number == libc::SYS_recvfrom).then_some((arguments[4], arguments[5])),
         }));
     }
     Ok(None)
@@ -313,6 +340,7 @@ fn finish_network_operation(
                 SocketInformation {
                     transport,
                     local: None,
+                    peer: None,
                     dns_queries: std::collections::HashMap::new(),
                 },
             );
@@ -341,15 +369,19 @@ fn finish_network_operation(
             descriptor,
             endpoint,
         } => sockets
-            .get(&descriptor)
-            .map_or_else(NetworkObservation::default, |socket| NetworkObservation {
-                events: vec![NetworkEvent {
-                    operation: "connect",
-                    transport: socket.transport,
-                    endpoint: descriptor_socket_address(process_id, descriptor, true)
-                        .unwrap_or(endpoint),
-                }],
-                dns_events: Vec::new(),
+            .get_mut(&descriptor)
+            .map_or_else(NetworkObservation::default, |socket| {
+                let endpoint =
+                    descriptor_socket_address(process_id, descriptor, true).unwrap_or(endpoint);
+                socket.peer = Some(endpoint);
+                NetworkObservation {
+                    events: vec![NetworkEvent {
+                        operation: "connect",
+                        transport: socket.transport,
+                        endpoint,
+                    }],
+                    dns_events: Vec::new(),
+                }
             }),
         PendingNetworkOperation::Listen { descriptor } => NetworkObservation {
             events: sockets
@@ -381,7 +413,9 @@ fn finish_network_operation(
             descriptor,
             buffer,
             length,
+            endpoint,
         } => {
+            let mut events = Vec::new();
             if let Some(socket) = sockets.get_mut(&descriptor) {
                 let length = usize::try_from(result).unwrap_or(0).min(length).min(65_537);
                 if let Ok(bytes) = read_memory(process_id, buffer, length) {
@@ -389,13 +423,26 @@ fn finish_network_operation(
                         socket.dns_queries.insert(transaction, hostname);
                     }
                 }
+                if socket.transport == "udp" {
+                    if let Some(endpoint) = endpoint.or(socket.peer) {
+                        events.push(NetworkEvent {
+                            operation: "send",
+                            transport: socket.transport,
+                            endpoint,
+                        });
+                    }
+                }
             }
-            NetworkObservation::default()
+            NetworkObservation {
+                events,
+                dns_events: Vec::new(),
+            }
         }
         PendingNetworkOperation::Receive {
             descriptor,
             buffer,
             length,
+            endpoint,
         } => {
             let Some(socket) = sockets.get_mut(&descriptor) else {
                 return NetworkObservation::default();
@@ -405,12 +452,43 @@ fn finish_network_operation(
                 .ok()
                 .map(|bytes| parse_dns_response(&bytes, &mut socket.dns_queries))
                 .unwrap_or_default();
-            NetworkObservation {
-                events: Vec::new(),
-                dns_events,
-            }
+            let endpoint = endpoint
+                .and_then(|(address, length)| {
+                    read_socket_length(process_id, length)
+                        .ok()
+                        .and_then(|length| read_socket_address(process_id, address, length).ok())
+                        .flatten()
+                })
+                .or(socket.peer);
+            let events = if socket.transport == "udp" {
+                endpoint
+                    .map(|endpoint| NetworkEvent {
+                        operation: "receive",
+                        transport: socket.transport,
+                        endpoint,
+                    })
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            NetworkObservation { events, dns_events }
         }
     }
+}
+
+fn read_socket_length(process_id: libc::pid_t, address: u64) -> io::Result<usize> {
+    if address == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "null socket length pointer",
+        ));
+    }
+    let bytes = peek_word(process_id, address)?.to_ne_bytes();
+    let mut length = [0_u8; std::mem::size_of::<libc::socklen_t>()];
+    let length_size = length.len();
+    length.copy_from_slice(&bytes[..length_size]);
+    Ok(libc::socklen_t::from_ne_bytes(length) as usize)
 }
 
 fn descriptor_socket_address(
@@ -753,8 +831,8 @@ fn decode_file_operation(
         let link = resolve_path(process_id, arguments[1] as i32, arguments[2])?;
         return Ok(Some(PendingFileOperation::Two {
             operation: "symlink",
-            first: link,
-            second: target,
+            first: target,
+            second: link,
         }));
     }
     if number == libc::SYS_mmap {
@@ -808,8 +886,8 @@ fn decode_legacy_file_operation(
         let link = resolve_path(process_id, libc::AT_FDCWD, arguments[1])?;
         return Ok(Some(PendingFileOperation::Two {
             operation: "symlink",
-            first: link,
-            second: target,
+            first: target,
+            second: link,
         }));
     }
     if number == libc::SYS_rename || number == libc::SYS_link {
@@ -856,7 +934,11 @@ fn open_operation(
     flags: i32,
 ) -> io::Result<Option<PendingFileOperation>> {
     let path = resolve_path(process_id, directory_descriptor, pointer)?;
-    let existed = fs::symlink_metadata(&path).is_ok();
+    let existed = match fs::symlink_metadata(&path) {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    };
     Ok(Some(PendingFileOperation::Open {
         path,
         flags,
@@ -916,7 +998,7 @@ fn finish_file_operation(operation: PendingFileOperation, result: i64) -> Vec<Fi
             existed,
         } => {
             let mut events = Vec::new();
-            if flags & libc::O_CREAT != 0 && !existed {
+            if flags & libc::O_CREAT != 0 && existed == Some(false) {
                 events.push(FileEvent {
                     operation: "create",
                     paths: vec![path.clone()],
@@ -1102,8 +1184,49 @@ fn native_u64(bytes: &[u8], offset: usize) -> u64 {
 mod tests {
     use std::collections::HashMap;
     use std::net::{Ipv6Addr, SocketAddr};
+    use std::path::PathBuf;
 
-    use super::{parse_dns_query, parse_dns_response, parse_socket_address};
+    use super::{
+        finish_file_operation, parse_dns_query, parse_dns_response, parse_socket_address,
+        PendingFileOperation, PendingNetworkOperation,
+    };
+
+    #[test]
+    fn keeps_nonblocking_connect_attempts() {
+        let operation = PendingNetworkOperation::Connect {
+            descriptor: 7,
+            endpoint: "127.0.0.1:7319".parse().expect("the endpoint should parse"),
+        };
+
+        assert!(operation.completed(-i64::from(libc::EINPROGRESS)));
+        assert!(!operation.completed(-i64::from(libc::ECONNREFUSED)));
+    }
+
+    #[test]
+    fn snapshots_only_the_created_symlink() {
+        let operation = PendingFileOperation::Two {
+            operation: "symlink",
+            first: PathBuf::from("target"),
+            second: PathBuf::from("/tmp/link"),
+        };
+
+        assert_eq!(operation.mutation_paths(), [PathBuf::from("/tmp/link")]);
+    }
+
+    #[test]
+    fn does_not_infer_creation_when_prior_state_is_unknown() {
+        let events = finish_file_operation(
+            PendingFileOperation::Open {
+                path: PathBuf::from("/unreadable/file"),
+                flags: libc::O_CREAT,
+                existed: None,
+            },
+            4,
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, "open");
+    }
 
     #[test]
     fn parses_ipv6_socket_addresses() {

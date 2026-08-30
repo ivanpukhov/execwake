@@ -311,7 +311,9 @@ mod tests {
         let row = connection
             .query_row(
                 "SELECT state, exit_code, (SELECT COUNT(*) FROM process),
-                        (SELECT COUNT(*) FROM event)
+                        (SELECT COUNT(*) FROM event),
+                        (SELECT COUNT(*) FROM event
+                         WHERE category = 'process' AND operation = 'exec')
                  FROM session WHERE singleton = 1",
                 [],
                 |row| {
@@ -320,6 +322,7 @@ mod tests {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
@@ -327,6 +330,8 @@ mod tests {
 
         assert_eq!((row.0, row.1, row.2), ("finalized".to_owned(), 7, 1));
         assert!(row.3 >= 2);
+        #[cfg(target_os = "linux")]
+        assert!(row.4 >= 1);
 
         #[cfg(target_os = "linux")]
         if std::env::var_os("EXECWAKE_REQUIRE_EBPF").is_some() {
@@ -369,6 +374,26 @@ mod tests {
             )
             .expect("the signal should be stored");
         assert_eq!(signal, i64::from(libc::SIGTERM));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserves_a_tracee_sigtrap() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let result = run_in_store(
+            vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("kill -TRAP $$"),
+            ],
+            &store,
+        )
+        .expect("the command should run");
+
+        assert_eq!(result.status.signal(), Some(libc::SIGTRAP));
     }
 
     #[cfg(target_os = "linux")]
@@ -425,6 +450,65 @@ mod tests {
             .expect("the environment columns should be read");
         assert!(environment_count > 0);
         assert_eq!(environment_columns, ["name", "process_id", "evidence"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn follows_exec_from_a_non_leader_thread() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let executable = std::env::current_exe().expect("the test executable should be known");
+        let result = run_in_store(
+            vec![
+                executable.into_os_string(),
+                OsString::from("--ignored"),
+                OsString::from("--exact"),
+                OsString::from("runner::tests::thread_exec_fixture_child"),
+                OsString::from("--nocapture"),
+                OsString::from("--test-threads=1"),
+            ],
+            &store,
+        )
+        .expect("the threaded exec fixture should run");
+        assert!(result.status.success());
+
+        let connection =
+            Connection::open(result.session.database()).expect("the database should open");
+        let (processes, completed, execs) = connection
+            .query_row(
+                "SELECT COUNT(*), SUM(ended_at_ms IS NOT NULL),
+                        (SELECT COUNT(*) FROM event
+                         WHERE category = 'process' AND operation = 'exec')
+                 FROM process",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("the process records should exist");
+        assert!(processes >= 2);
+        assert_eq!(completed, processes);
+        assert!(execs >= 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn thread_exec_fixture_child() {
+        let thread = std::thread::spawn(|| {
+            let path = std::ffi::CString::new("/bin/true").expect("the path should be valid");
+            let argument = std::ffi::CString::new("true").expect("the argument should be valid");
+            let arguments = [argument.as_ptr(), std::ptr::null()];
+            unsafe {
+                libc::execv(path.as_ptr(), arguments.as_ptr());
+            }
+            panic!("thread exec failed: {}", std::io::Error::last_os_error());
+        });
+        thread.join().expect("the exec thread should not panic");
     }
 
     #[cfg(target_os = "linux")]
@@ -799,6 +883,16 @@ mod tests {
                 "high".to_owned(),
             )
         );
+        let datagram_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE category = 'network' AND operation IN ('send', 'receive')
+                   AND target LIKE 'udp 127.0.0.1:%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the UDP event count should exist");
+        assert!(datagram_events >= 2);
     }
 
     #[cfg(target_os = "linux")]
@@ -823,14 +917,11 @@ mod tests {
         });
         let client = UdpSocket::bind("127.0.0.1:0").expect("the DNS client should bind");
         client
-            .connect(server_address)
-            .expect("the DNS client should connect");
-        client
-            .send(&dns_fixture_query())
+            .send_to(&dns_fixture_query(), server_address)
             .expect("the DNS client should send a query");
         let mut response = [0_u8; 512];
         client
-            .recv(&mut response)
+            .recv_from(&mut response)
             .expect("the DNS client should receive a response");
         server_thread.join().expect("the DNS server should finish");
     }

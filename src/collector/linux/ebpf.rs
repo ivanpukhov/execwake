@@ -24,7 +24,6 @@ use crate::collector::{Collector, CollectorSink};
 use crate::session::{CategoryCoverage, SessionCoverage};
 
 static CGROUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const BPF_OBJECT: &[u8] = include_bytes!("../../../bpf/collector.bpf.o");
 
 pub enum LinuxCollector {
     Ebpf(EbpfCollector),
@@ -38,7 +37,7 @@ impl LinuxCollector {
             Err(_error) => {
                 #[cfg(test)]
                 if std::env::var_os("EXECWAKE_REQUIRE_EBPF").is_some() {
-                    panic!("eBPF collector is required for this test: {_error}");
+                    panic!("eBPF collector is required for this test: {_error:?}");
                 }
                 Self::Ptrace(PtraceCollector::new(root_executable))
             }
@@ -216,7 +215,8 @@ struct EbpfProbe {
 
 impl EbpfProbe {
     fn load(cgroup_id: u64) -> io::Result<Self> {
-        let mut bpf = Bpf::load(BPF_OBJECT).map_err(other_error)?;
+        let mut bpf = Bpf::load(aya::include_bytes_aligned!("../../../bpf/collector.bpf.o"))
+            .map_err(other_error)?;
         let mut target =
             Array::<_, u64>::try_from(bpf.map_mut("TARGET_CGROUP").map_err(other_error)?)
                 .map_err(other_error)?;

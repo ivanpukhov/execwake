@@ -27,7 +27,7 @@ struct bpf_map_def SEC("maps") EVENTS = {
     .type = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
     .key_size = sizeof(__u32),
     .value_size = sizeof(__u32),
-    .max_entries = 128,
+    .max_entries = 0,
 };
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
