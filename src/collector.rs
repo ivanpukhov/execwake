@@ -3,6 +3,11 @@ use std::process::{Child, Command, ExitStatus};
 
 use crate::session::{EvidenceKind, SessionCoverage};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::PtraceCollector;
+
 pub type SinkError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -57,7 +62,11 @@ pub trait CollectorSink {
 pub trait Collector {
     fn backend_name(&self) -> &'static str;
     fn prepare(&mut self, command: &mut Command) -> io::Result<()>;
-    fn collect(&mut self, child: Child, sink: &mut dyn CollectorSink) -> io::Result<ExitStatus>;
+    fn collect(
+        &mut self,
+        child: &mut Child,
+        sink: &mut dyn CollectorSink,
+    ) -> io::Result<ExitStatus>;
 }
 
 #[cfg(test)]

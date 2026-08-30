@@ -293,7 +293,14 @@ impl ActiveSession {
                  category, operation, target, process_id, occurred_at_ms, evidence
              )
              SELECT 'process', 'exit', executable, process_id, ?1, 'observed'
-             FROM process WHERE parent_process_id IS NULL",
+             FROM process
+             WHERE parent_process_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM event
+                   WHERE event.category = 'process'
+                     AND event.operation = 'exit'
+                     AND event.process_id = process.process_id
+               )",
             [ended_at_ms],
         )?;
         let updated = transaction.execute(

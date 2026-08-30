@@ -4,6 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
+#[cfg(target_os = "linux")]
+use crate::collector::{Collector, PtraceCollector};
 use crate::storage::{SessionOutcome, SessionPaths, SessionStore, StoreError};
 
 #[derive(Debug)]
@@ -66,6 +68,19 @@ fn run_in_store(argv: Vec<OsString>, store: &SessionStore) -> Result<RunResult, 
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
+    #[cfg(target_os = "linux")]
+    let mut collector = PtraceCollector::new(command_name);
+    #[cfg(target_os = "linux")]
+    if let Err(source) = collector.prepare(&mut command) {
+        forwarder.stop();
+        let session_path = session.paths().database().to_owned();
+        session.finalize(SessionOutcome::without_status())?;
+        return Err(RunError::Command {
+            source,
+            session: session_path,
+        });
+    }
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(source) => {
@@ -79,6 +94,8 @@ fn run_in_store(argv: Vec<OsString>, store: &SessionStore) -> Result<RunResult, 
         }
     };
     forwarder.set_child(child.id());
+
+    #[cfg(not(target_os = "linux"))]
     if let Err(error) = session.record_root_process(child.id()) {
         let _ = child.kill();
         let _ = child.wait();
@@ -87,7 +104,12 @@ fn run_in_store(argv: Vec<OsString>, store: &SessionStore) -> Result<RunResult, 
         return Err(error.into());
     }
 
-    let status = match child.wait() {
+    #[cfg(target_os = "linux")]
+    let status_result = collector.collect(&mut child, &mut session);
+    #[cfg(not(target_os = "linux"))]
+    let status_result = child.wait();
+
+    let status = match status_result {
         Ok(status) => status,
         Err(source) => {
             forwarder.stop();
