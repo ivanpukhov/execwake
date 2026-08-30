@@ -3,6 +3,8 @@ use std::process::{Child, Command, ExitStatus};
 
 use crate::session::{EvidenceKind, SessionCoverage};
 
+pub type SinkError = Box<dyn std::error::Error + Send + Sync>;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ProcessIdentity(u64);
 
@@ -26,6 +28,14 @@ pub struct ProcessRecord {
     pub evidence: EvidenceKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessExitRecord {
+    pub identity: ProcessIdentity,
+    pub occurred_at_ms: i64,
+    pub exit_code: Option<i32>,
+    pub termination_signal: Option<i32>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectorEvent {
     pub category: &'static str,
@@ -37,9 +47,11 @@ pub struct CollectorEvent {
 }
 
 pub trait CollectorSink {
-    fn record_process(&mut self, process: ProcessRecord) -> io::Result<()>;
-    fn record_event(&mut self, event: CollectorEvent) -> io::Result<()>;
-    fn set_coverage(&mut self, coverage: SessionCoverage) -> io::Result<()>;
+    fn set_backend(&mut self, backend: &'static str) -> Result<(), SinkError>;
+    fn record_process(&mut self, process: ProcessRecord) -> Result<(), SinkError>;
+    fn record_process_exit(&mut self, process: ProcessExitRecord) -> Result<(), SinkError>;
+    fn record_event(&mut self, event: CollectorEvent) -> Result<(), SinkError>;
+    fn set_coverage(&mut self, coverage: SessionCoverage) -> Result<(), SinkError>;
 }
 
 pub trait Collector {

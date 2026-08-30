@@ -8,7 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fs2::FileExt;
 use rusqlite::{params, Connection, OpenFlags};
 
-use crate::session::CURRENT_SCHEMA_VERSION;
+use crate::collector::{
+    CollectorEvent, CollectorSink, ProcessExitRecord, ProcessRecord, SinkError,
+};
+use crate::session::{CategoryCoverage, SessionCoverage, CURRENT_SCHEMA_VERSION};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -261,8 +264,9 @@ impl ActiveSession {
         )?;
         transaction.execute(
             "INSERT INTO process (
-                 process_id, parent_process_id, executable, started_at_ms, evidence
-             ) VALUES (?1, NULL, ?2, ?3, 'observed')",
+                 process_id, operating_system_id, parent_process_id, executable,
+                 started_at_ms, evidence
+             ) VALUES (?1, ?1, NULL, ?2, ?3, 'observed')",
             params![i64::from(process_id), command_name, started_at_ms],
         )?;
         transaction.execute(
@@ -318,6 +322,124 @@ impl ActiveSession {
     }
 }
 
+impl CollectorSink for ActiveSession {
+    fn set_backend(&mut self, backend: &'static str) -> Result<(), SinkError> {
+        self.connection
+            .execute(
+                "UPDATE session SET collector_backend = ?1 WHERE singleton = 1",
+                [backend],
+            )
+            .map(|_| ())
+            .map_err(|error| Box::new(error) as SinkError)
+    }
+
+    fn record_process(&mut self, process: ProcessRecord) -> Result<(), SinkError> {
+        let process_id = database_process_id(process.identity.get())?;
+        let parent_process_id = process
+            .parent
+            .map(|identity| database_process_id(identity.get()))
+            .transpose()?;
+        self.connection
+            .execute(
+                "INSERT INTO process (
+                     process_id, operating_system_id, parent_process_id, executable,
+                     started_at_ms, evidence
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    process_id,
+                    i64::from(process.operating_system_id),
+                    parent_process_id,
+                    process.executable,
+                    process.occurred_at_ms,
+                    process.evidence.as_str(),
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| Box::new(error) as SinkError)
+    }
+
+    fn record_process_exit(&mut self, process: ProcessExitRecord) -> Result<(), SinkError> {
+        let process_id = database_process_id(process.identity.get())?;
+        self.connection
+            .execute(
+                "UPDATE process
+                 SET ended_at_ms = ?1, exit_code = ?2, termination_signal = ?3
+                 WHERE process_id = ?4",
+                params![
+                    process.occurred_at_ms,
+                    process.exit_code,
+                    process.termination_signal,
+                    process_id,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| Box::new(error) as SinkError)
+    }
+
+    fn record_event(&mut self, event: CollectorEvent) -> Result<(), SinkError> {
+        let process_id = event
+            .process
+            .map(|identity| database_process_id(identity.get()))
+            .transpose()?;
+        self.connection
+            .execute(
+                "INSERT INTO event (
+                     category, operation, target, process_id, occurred_at_ms, evidence
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event.category,
+                    event.operation,
+                    event.target,
+                    process_id,
+                    event.occurred_at_ms,
+                    event.evidence.as_str(),
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| Box::new(error) as SinkError)
+    }
+
+    fn set_coverage(&mut self, coverage: SessionCoverage) -> Result<(), SinkError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| Box::new(error) as SinkError)?;
+        for (category, category_coverage) in [
+            ("processes", coverage.processes),
+            ("filesystem", coverage.filesystem),
+            ("network", coverage.network),
+            ("environment", coverage.environment),
+        ] {
+            update_coverage(&transaction, category, category_coverage)
+                .map_err(|error| Box::new(error) as SinkError)?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| Box::new(error) as SinkError)
+    }
+}
+
+fn database_process_id(identity: u64) -> Result<i64, SinkError> {
+    i64::try_from(identity).map_err(|_| {
+        Box::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process identity is out of range",
+        )) as SinkError
+    })
+}
+
+fn update_coverage(
+    transaction: &rusqlite::Transaction<'_>,
+    category: &str,
+    coverage: CategoryCoverage,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "UPDATE coverage SET state = ?1, lost_events = ?2 WHERE category = ?3",
+        params![coverage.state().as_str(), coverage.lost_events(), category],
+    )?;
+    Ok(())
+}
+
 impl Drop for ActiveSession {
     fn drop(&mut self) {
         if !self.finalized {
@@ -353,6 +475,7 @@ fn initialize_database(
              started_at_ms INTEGER NOT NULL,
              ended_at_ms INTEGER,
              runner_pid INTEGER NOT NULL,
+             collector_backend TEXT,
              exit_code INTEGER,
              termination_signal INTEGER,
              interruption TEXT
@@ -364,6 +487,7 @@ fn initialize_database(
          );
          CREATE TABLE process (
              process_id INTEGER PRIMARY KEY,
+             operating_system_id INTEGER NOT NULL,
              parent_process_id INTEGER REFERENCES process(process_id),
              executable TEXT NOT NULL,
              started_at_ms INTEGER NOT NULL,
@@ -595,6 +719,9 @@ mod tests {
 
     use rusqlite::Connection;
 
+    use crate::collector::{CollectorEvent, CollectorSink, ProcessIdentity, ProcessRecord};
+    use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage};
+
     use super::{SessionId, SessionOutcome, SessionStore};
 
     struct TestDirectory(PathBuf);
@@ -723,6 +850,79 @@ mod tests {
             .expect("the session row should exist");
 
         assert_eq!(row, ("finalized".to_owned(), 1, "printf".to_owned(), 2, 7));
+    }
+
+    #[test]
+    fn collector_records_use_session_process_identities() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let mut session = store
+            .begin("fixture", 0)
+            .expect("a session should be started");
+        let process = ProcessIdentity::new(1);
+
+        session
+            .set_backend("test")
+            .expect("backend should be stored");
+        session
+            .record_process(ProcessRecord {
+                identity: process,
+                operating_system_id: 41_000,
+                parent: None,
+                executable: "fixture".to_owned(),
+                occurred_at_ms: 10,
+                evidence: EvidenceKind::Observed,
+            })
+            .expect("process should be stored");
+        session
+            .record_event(CollectorEvent {
+                category: "filesystem",
+                operation: "read",
+                target: "/tmp/input".to_owned(),
+                process: Some(process),
+                occurred_at_ms: 11,
+                evidence: EvidenceKind::Observed,
+            })
+            .expect("event should be stored");
+        session
+            .set_coverage(SessionCoverage {
+                processes: CategoryCoverage::complete(),
+                filesystem: CategoryCoverage::partial(2),
+                network: CategoryCoverage::unavailable(),
+                environment: CategoryCoverage::unavailable(),
+            })
+            .expect("coverage should be stored");
+        let database = session.paths().database().to_owned();
+        session
+            .finalize(SessionOutcome::exited(0))
+            .expect("the session should be finalized");
+
+        let connection = Connection::open(database).expect("the database should open");
+        let process_row = connection
+            .query_row(
+                "SELECT process_id, operating_system_id FROM process",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("the process row should exist");
+        let coverage = connection
+            .query_row(
+                "SELECT state, lost_events FROM coverage WHERE category = 'filesystem'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("the coverage row should exist");
+        let backend: String = connection
+            .query_row(
+                "SELECT collector_backend FROM session WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the backend should exist");
+
+        assert_eq!(process_row, (1, 41_000));
+        assert_eq!(coverage, ("partial".to_owned(), 2));
+        assert_eq!(backend, "test");
     }
 
     #[cfg(unix)]

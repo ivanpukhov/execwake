@@ -1,6 +1,6 @@
 use crate::privacy::is_valid_environment_name;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionMode {
@@ -12,6 +12,16 @@ pub enum EvidenceKind {
     Observed,
     Inferred,
     Derived,
+}
+
+impl EvidenceKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Inferred => "inferred",
+            Self::Derived => "derived",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,6 +52,16 @@ pub enum CoverageState {
     Complete,
     Partial,
     Unavailable,
+}
+
+impl CoverageState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
