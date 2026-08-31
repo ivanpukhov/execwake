@@ -42,46 +42,69 @@ pub(crate) enum NodeEnrichmentFact {
 }
 
 pub(crate) struct NodeEnrichmentCapture {
-    event_file: File,
+    event_file: Option<File>,
     event_path: PathBuf,
     preload_path: PathBuf,
 }
 
 impl NodeEnrichmentCapture {
     pub fn install(command: &mut Command, session: &SessionPaths) -> io::Result<Self> {
-        let event_path = session.database().with_extension("node-events");
-        let preload_path = session.database().with_extension("node-preload.cjs");
-        let event_file = create_private_file(&event_path, true)?;
-        let preload_result = (|| {
+        Self::install_with_node_options(command, session, env::var_os("NODE_OPTIONS"))
+    }
+
+    fn install_with_node_options(
+        command: &mut Command,
+        session: &SessionPaths,
+        existing_node_options: Option<OsString>,
+    ) -> io::Result<Self> {
+        let [event_path, preload_path] = auxiliary_paths(session);
+        let mut event_created = false;
+        let mut preload_created = false;
+        let result = (|| {
+            let event_file = create_private_file(&event_path, true)?;
+            event_created = true;
             let mut preload = create_private_file(&preload_path, false)?;
+            preload_created = true;
             preload.write_all(PRELOAD_SOURCE)?;
-            preload.sync_all()
+            preload.sync_all()?;
+
+            let preload = preload_path.to_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Node preload path is not valid UTF-8",
+                )
+            })?;
+            let node_options = append_node_options(existing_node_options, preload)?;
+            command
+                .env("NODE_OPTIONS", node_options)
+                .env(CONTROL_EVENT_FILE, &event_path);
+
+            Ok(Self {
+                event_file: Some(event_file),
+                event_path: event_path.clone(),
+                preload_path: preload_path.clone(),
+            })
         })();
-        if let Err(error) = preload_result {
-            let _ = fs::remove_file(&event_path);
-            return Err(error);
+        if result.is_err() {
+            if preload_created {
+                let _ = fs::remove_file(&preload_path);
+            }
+            if event_created {
+                let _ = fs::remove_file(&event_path);
+            }
         }
+        result
+    }
 
-        let preload = preload_path.to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Node preload path is not valid UTF-8",
-            )
-        })?;
-        let node_options = append_node_options(env::var_os("NODE_OPTIONS"), preload)?;
-        command
-            .env("NODE_OPTIONS", node_options)
-            .env(CONTROL_EVENT_FILE, &event_path);
-
-        Ok(Self {
-            event_file,
-            event_path,
-            preload_path,
-        })
+    #[cfg(target_os = "linux")]
+    pub(crate) fn internal_paths(&self) -> [&Path; 2] {
+        [&self.event_path, &self.preload_path]
     }
 
     pub fn finish(mut self, session: &mut ActiveSession) {
-        let (records, mut lost_events) = match self.read_records() {
+        let capture = self.read_records();
+        drop(self.event_file.take());
+        let (records, mut lost_events) = match capture {
             Ok(result) => result,
             Err(_) => {
                 session.record_node_enrichment_loss(1);
@@ -98,9 +121,12 @@ impl NodeEnrichmentCapture {
     }
 
     fn read_records(&mut self) -> io::Result<(Vec<NodeEnrichmentRecord>, u64)> {
-        self.event_file.rewind()?;
+        let event_file = self.event_file.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "Node event file is already closed")
+        })?;
+        event_file.rewind()?;
         let mut bytes = Vec::new();
-        Read::by_ref(&mut self.event_file)
+        Read::by_ref(event_file)
             .take(MAX_CAPTURE_BYTES + 1)
             .read_to_end(&mut bytes)?;
 
@@ -115,7 +141,14 @@ impl NodeEnrichmentCapture {
         }
 
         let mut records = Vec::new();
-        for line in bytes[..complete_length].split(|byte| *byte == b'\n') {
+        for (processed_segments, line) in bytes[..complete_length]
+            .split(|byte| *byte == b'\n')
+            .enumerate()
+        {
+            if processed_segments >= MAX_CAPTURE_EVENTS + 2 {
+                lost_events = lost_events.saturating_add(1);
+                break;
+            }
             if line.is_empty() {
                 continue;
             }
@@ -125,9 +158,10 @@ impl NodeEnrichmentCapture {
             }
             match serde_json::from_slice::<WireEvent>(line)
                 .ok()
-                .and_then(WireEvent::into_record)
+                .and_then(WireEvent::into_capture)
             {
-                Some(record) => records.push(record),
+                Some(WireCapture::Record(record)) => records.push(record),
+                Some(WireCapture::Lost(count)) => lost_events = lost_events.saturating_add(count),
                 None => lost_events = lost_events.saturating_add(1),
             }
         }
@@ -137,6 +171,7 @@ impl NodeEnrichmentCapture {
 
 impl Drop for NodeEnrichmentCapture {
     fn drop(&mut self) {
+        drop(self.event_file.take());
         let _ = fs::remove_file(&self.event_path);
         let _ = fs::remove_file(&self.preload_path);
     }
@@ -161,10 +196,22 @@ enum WireEvent {
         monotonic_ns: String,
         name: String,
     },
+    Loss {
+        version: u8,
+        pid: u32,
+        #[serde(rename = "monotonicNs")]
+        monotonic_ns: String,
+        count: u64,
+    },
+}
+
+enum WireCapture {
+    Record(NodeEnrichmentRecord),
+    Lost(u64),
 }
 
 impl WireEvent {
-    fn into_record(self) -> Option<NodeEnrichmentRecord> {
+    fn into_capture(self) -> Option<WireCapture> {
         match self {
             Self::Http {
                 version,
@@ -175,6 +222,7 @@ impl WireEvent {
                 path,
             } if version == PROTOCOL_VERSION => {
                 NodeEnrichmentRecord::http(pid, monotonic_ns.parse().ok()?, &method, &host, &path)
+                    .map(WireCapture::Record)
             }
             Self::Environment {
                 version,
@@ -183,10 +231,33 @@ impl WireEvent {
                 name,
             } if version == PROTOCOL_VERSION => {
                 NodeEnrichmentRecord::environment(pid, monotonic_ns.parse().ok()?, &name)
+                    .map(WireCapture::Record)
             }
-            Self::Http { .. } | Self::Environment { .. } => None,
+            Self::Loss {
+                version,
+                pid,
+                monotonic_ns,
+                count,
+            } if version == PROTOCOL_VERSION && pid > 0 && count > 0 => {
+                monotonic_ns.parse::<u64>().ok()?;
+                Some(WireCapture::Lost(count.min(MAX_CAPTURE_EVENTS as u64)))
+            }
+            Self::Http { .. } | Self::Environment { .. } | Self::Loss { .. } => None,
         }
     }
+}
+
+pub(crate) fn cleanup_session_files(session: &SessionPaths) {
+    for path in auxiliary_paths(session) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn auxiliary_paths(session: &SessionPaths) -> [PathBuf; 2] {
+    [
+        session.database().with_extension("node-events"),
+        session.database().with_extension("node-preload.cjs"),
+    ]
 }
 
 fn create_private_file(path: &Path, read: bool) -> io::Result<File> {
@@ -268,12 +339,16 @@ fn clean_method(method: &str) -> Option<String> {
 fn clean_host_and_path(host: &str, path: &str) -> Option<(String, String)> {
     if host.is_empty()
         || host.len() > MAX_HOST_BYTES
-        || host.contains('@')
+        || host.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '\\' | '/' | '@' | '?' | '#')
+        })
+        || !path.starts_with('/')
         || path.len() > MAX_PATH_BYTES
     {
         return None;
     }
-    let path = if path.starts_with('/') { path } else { "/" };
     let sanitized = sanitize_http_url(&format!("https://{host}{path}"))?;
     let remainder = sanitized.strip_prefix("https://")?;
     let boundary = remainder.find('/').unwrap_or(remainder.len());
@@ -287,7 +362,20 @@ fn clean_host_and_path(host: &str, path: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NodeEnrichmentFact, NodeEnrichmentRecord, WireEvent};
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::session::SessionMode;
+    use crate::storage::SessionStore;
+
+    use super::{
+        append_node_options, NodeEnrichmentCapture, NodeEnrichmentFact, NodeEnrichmentRecord,
+        WireCapture, WireEvent, CONTROL_EVENT_FILE, MAX_CAPTURE_BYTES, MAX_CAPTURE_EVENTS,
+        PRELOAD_SOURCE,
+    };
 
     #[test]
     fn removes_url_secrets_before_creating_http_evidence() {
@@ -325,15 +413,173 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ambiguous_http_parts_instead_of_inventing_a_target() {
+        assert!(NodeEnrichmentRecord::http(7, 11, "GET", "example.test/other", "/path").is_none());
+        assert!(NodeEnrichmentRecord::http(7, 11, "GET", "example.test", "relative").is_none());
+    }
+
+    #[test]
     fn parses_the_bounded_wire_format() {
         let event: WireEvent = serde_json::from_slice(
             br#"{"version":1,"pid":77,"monotonicNs":"101","kind":"environment","name":"HOME"}"#,
         )
         .expect("the wire event should parse");
 
+        let Some(WireCapture::Record(record)) = event.into_capture() else {
+            panic!("expected a captured record");
+        };
         assert_eq!(
-            event.into_record(),
-            NodeEnrichmentRecord::environment(77, 101, "HOME")
+            record,
+            NodeEnrichmentRecord::environment(77, 101, "HOME").unwrap()
         );
+    }
+
+    #[test]
+    fn parses_runtime_loss_markers() {
+        let event: WireEvent = serde_json::from_slice(
+            br#"{"version":1,"pid":77,"monotonicNs":"101","kind":"loss","count":3}"#,
+        )
+        .expect("the loss marker should parse");
+
+        assert!(matches!(event.into_capture(), Some(WireCapture::Lost(3))));
+
+        let event: WireEvent = serde_json::from_slice(
+            br#"{"version":1,"pid":77,"monotonicNs":"101","kind":"loss","count":18446744073709551615}"#,
+        )
+        .expect("the bounded loss marker should parse");
+        assert!(matches!(
+            event.into_capture(),
+            Some(WireCapture::Lost(count)) if count == MAX_CAPTURE_EVENTS as u64
+        ));
+    }
+
+    #[test]
+    fn preload_bounds_the_event_file_and_reports_overload() {
+        if Command::new("node")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_or(true, |status| !status.success())
+        {
+            return;
+        }
+
+        let directory = TestDirectory::new();
+        let event_path = directory.0.join("events.jsonl");
+        let preload_path = directory.0.join("preload.cjs");
+        fs::write(&event_path, []).expect("the event file should be created");
+        fs::write(&preload_path, PRELOAD_SOURCE).expect("the preload should be written");
+        let node_options = append_node_options(
+            None,
+            preload_path
+                .to_str()
+                .expect("the test preload path should be UTF-8"),
+        )
+        .expect("NODE_OPTIONS should be constructed");
+        let status = Command::new("node")
+            .env("NODE_OPTIONS", node_options)
+            .env(CONTROL_EVENT_FILE, &event_path)
+            .args([
+                "-e",
+                "const suffix = 'x'.repeat(900); for (let i = 0; i < 30000; i += 1) void process.env[`EXECWAKE_FILL_${i}_${suffix}`];",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("the Node fixture should start");
+        assert!(status.success());
+
+        let bytes = fs::read(&event_path).expect("the event stream should be readable");
+        assert!(bytes.len() as u64 <= MAX_CAPTURE_BYTES);
+        assert!(bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_slice::<WireEvent>(line).ok())
+            .any(|event| matches!(event.into_capture(), Some(WireCapture::Lost(_)))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removes_only_auxiliary_files_created_by_a_failed_install() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin_in_mode("node", 0, SessionMode::Instrumented)
+            .expect("an instrumented session should start");
+        let event_path = session.paths().database().with_extension("node-events");
+        let preload_path = session
+            .paths()
+            .database()
+            .with_extension("node-preload.cjs");
+        let mut command = Command::new("node");
+
+        let result = NodeEnrichmentCapture::install_with_node_options(
+            &mut command,
+            session.paths(),
+            Some(OsString::from_vec(vec![0xff])),
+        );
+
+        assert!(result.is_err());
+        assert!(!event_path.exists());
+        assert!(!preload_path.exists());
+
+        fs::write(&event_path, "existing").expect("the existing file should be created");
+        let result =
+            NodeEnrichmentCapture::install_with_node_options(&mut command, session.paths(), None);
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(event_path).expect("the existing file should remain"),
+            "existing"
+        );
+    }
+
+    #[test]
+    fn finish_closes_and_removes_auxiliary_files() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let mut session = store
+            .begin_in_mode("node", 0, SessionMode::Instrumented)
+            .expect("an instrumented session should start");
+        let event_path = session.paths().database().with_extension("node-events");
+        let preload_path = session
+            .paths()
+            .database()
+            .with_extension("node-preload.cjs");
+        let mut command = Command::new("node");
+        let capture =
+            NodeEnrichmentCapture::install_with_node_options(&mut command, session.paths(), None)
+                .expect("the capture should install");
+
+        capture.finish(&mut session);
+
+        assert!(!event_path.exists());
+        assert!(!preload_path.exists());
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "execwake-node-capture-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("the test directory should be created");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 }

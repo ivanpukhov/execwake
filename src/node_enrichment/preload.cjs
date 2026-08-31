@@ -16,21 +16,55 @@ if (eventPath) {
   }
 
   if (descriptor !== undefined) {
+    const maxEvents = 50_000;
+    const maxEventBytes = 4 * 1024;
+    const maxEventFileBytes = 16 * 1024 * 1024;
+    let disabled = false;
+    let emittedEvents = 0;
     let emitting = false;
 
+    function eventBuffer(event) {
+      return Buffer.from(`${JSON.stringify({
+        version: 1,
+        pid: process.pid,
+        monotonicNs: process.hrtime.bigint().toString(),
+        ...event,
+      })}\n`);
+    }
+
+    function write(buffer, maximumSize) {
+      if (buffer.length > maxEventBytes) return false;
+      const currentSize = fs.fstatSync(descriptor).size;
+      if (currentSize + buffer.length > maximumSize) return false;
+      return fs.writeSync(descriptor, buffer, 0, buffer.length) === buffer.length;
+    }
+
+    function stopWithLoss() {
+      if (disabled) return;
+      disabled = true;
+      try {
+        write(eventBuffer({ kind: 'loss', count: 1 }), maxEventFileBytes);
+      } catch {
+        // The reader also treats a truncated or oversized stream as lost evidence.
+      }
+    }
+
     function emit(event) {
-      if (emitting) return;
+      if (disabled || emitting) return;
       emitting = true;
       try {
-        const line = `${JSON.stringify({
-          version: 1,
-          pid: process.pid,
-          monotonicNs: process.hrtime.bigint().toString(),
-          ...event,
-        })}\n`;
-        if (Buffer.byteLength(line) <= 4096) fs.writeSync(descriptor, line);
+        if (emittedEvents >= maxEvents) {
+          stopWithLoss();
+          return;
+        }
+        const buffer = eventBuffer(event);
+        if (!write(buffer, maxEventFileBytes - maxEventBytes)) {
+          stopWithLoss();
+          return;
+        }
+        emittedEvents += 1;
       } catch {
-        // Enrichment must not change the traced program's error path.
+        stopWithLoss();
       } finally {
         emitting = false;
       }
@@ -49,7 +83,7 @@ if (eventPath) {
     }
 
     function cleanPath(value) {
-      if (typeof value !== 'string' || !value.startsWith('/')) return '/';
+      if (typeof value !== 'string' || !value.startsWith('/')) return undefined;
       const boundary = value.search(/[?#]/);
       const path = boundary === -1 ? value : value.slice(0, boundary);
       if (path.length > 2048 || /[\u0000-\u001f\u007f\\]/.test(path)) return undefined;
@@ -63,17 +97,30 @@ if (eventPath) {
       if (method && host && path) emit({ kind: 'http', method, host, path });
     }
 
-    diagnostics.channel('http.client.request.start').subscribe(({ request }) => {
-      emitHttp(request.method, request.host, request.path);
+    function subscribe(name, callback) {
+      try {
+        diagnostics.channel(name).subscribe((message) => {
+          try {
+            callback(message);
+          } catch {
+            // Malformed channel messages are ignored without affecting the publisher.
+          }
+        });
+      } catch {
+        // The traced program continues if a diagnostics channel is unavailable.
+      }
+    }
+
+    subscribe('http.client.request.start', (message) => {
+      const request = message && message.request;
+      if (request) emitHttp(request.method, request.host, request.path);
     });
 
-    diagnostics.channel('undici:request:create').subscribe(({ request }) => {
-      try {
-        const origin = new URL(String(request.origin));
-        emitHttp(request.method, origin.host, request.path);
-      } catch {
-        // Invalid runtime metadata is omitted rather than approximated.
-      }
+    subscribe('undici:request:create', (message) => {
+      const request = message && message.request;
+      if (!request) return;
+      const origin = new URL(String(request.origin));
+      emitHttp(request.method, origin.host, request.path);
     });
 
     const seenEnvironmentNames = new Set();
@@ -86,6 +133,7 @@ if (eventPath) {
             property.length <= 1024 &&
             !property.includes('=') &&
             !/[\u0000-\u001f\u007f]/.test(property) &&
+            !disabled &&
             !seenEnvironmentNames.has(property)
           ) {
             seenEnvironmentNames.add(property);

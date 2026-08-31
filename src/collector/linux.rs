@@ -3,9 +3,10 @@ use std::env;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::ptr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod ebpf;
 mod syscall;
@@ -30,6 +31,7 @@ pub struct PtraceCollector {
     path_roots: PathRoots,
     file_snapshots: HashMap<std::path::PathBuf, FileState>,
     inherited_environment: Vec<String>,
+    ignored_paths: Vec<PathBuf>,
 }
 
 struct TracedProcess {
@@ -51,7 +53,21 @@ impl PtraceCollector {
             ),
             file_snapshots: HashMap::new(),
             inherited_environment: inherited_environment_names(),
+            ignored_paths: Vec::new(),
         }
+    }
+
+    fn ignore_paths(&mut self, paths: &[&Path]) {
+        self.ignored_paths
+            .extend(paths.iter().map(|path| path.to_path_buf()));
+    }
+
+    fn is_ignored_path(&self, path: &Path) -> bool {
+        self.ignored_paths.iter().any(|ignored| ignored == path)
+    }
+
+    fn is_internal_event(&self, paths: &[PathBuf]) -> bool {
+        !paths.is_empty() && paths.iter().all(|path| self.is_ignored_path(path))
     }
 
     fn register_process(
@@ -251,10 +267,12 @@ impl PtraceCollector {
         process_id: libc::pid_t,
         sink: &mut dyn CollectorSink,
     ) -> io::Result<()> {
-        let process = self
-            .processes
-            .get_mut(&process_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "syscall from unknown process"))?;
+        let Some(process) = self.processes.get_mut(&process_id) else {
+            for category in ["processes", "filesystem", "network", "environment"] {
+                sink.record_lost_events(category, 1).map_err(sink_error)?;
+            }
+            return Ok(());
+        };
         let identity = process.identity;
         let observation = process.syscalls.observe_stop(process_id)?;
         if observation.lost_network_events > 0 {
@@ -262,12 +280,18 @@ impl PtraceCollector {
                 .map_err(sink_error)?;
         }
         for path in observation.mutation_paths {
+            if self.is_ignored_path(&path) {
+                continue;
+            }
             if !remember_file_snapshot(&mut self.file_snapshots, path, MAX_FILE_SNAPSHOTS) {
                 sink.record_lost_events("filesystem", 1)
                     .map_err(sink_error)?;
             }
         }
         for event in observation.events {
+            if self.is_internal_event(&event.paths) {
+                continue;
+            }
             let target = event
                 .paths
                 .iter()
@@ -357,15 +381,39 @@ impl PtraceCollector {
             unsafe {
                 libc::kill(*process_id, libc::SIGKILL);
             }
-            let _ = ptrace_call(
-                libc::PTRACE_KILL,
-                *process_id,
-                ptr::null_mut(),
-                ptr::null_mut(),
-            );
         }
-        for process_id in process_ids {
-            reap_killed_tracee(process_id);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !self.processes.is_empty() && Instant::now() < deadline {
+            let mut wait_status = 0;
+            let result = unsafe {
+                libc::waitpid(
+                    -1,
+                    &mut wait_status,
+                    libc::__WALL | libc::__WNOTHREAD | libc::WNOHANG,
+                )
+            };
+            if result > 0 {
+                if libc::WIFEXITED(wait_status) || libc::WIFSIGNALED(wait_status) {
+                    self.processes.remove(&result);
+                } else if libc::WIFSTOPPED(wait_status) {
+                    let _ = ptrace_call(
+                        libc::PTRACE_CONT,
+                        result,
+                        ptr::null_mut(),
+                        libc::SIGKILL as usize as *mut libc::c_void,
+                    );
+                }
+                continue;
+            }
+            if result == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                break;
+            }
         }
         self.processes.clear();
     }
@@ -397,12 +445,12 @@ impl PtraceCollector {
                 "root process could not be tracked",
             ));
         }
+        // Final wait statuses retain exit facts without early-exit stops for every thread.
         let options = libc::PTRACE_O_TRACESYSGOOD
             | libc::PTRACE_O_TRACEFORK
             | libc::PTRACE_O_TRACEVFORK
             | libc::PTRACE_O_TRACECLONE
             | libc::PTRACE_O_TRACEEXEC
-            | libc::PTRACE_O_TRACEEXIT
             | libc::PTRACE_O_EXITKILL;
         ptrace_call(
             libc::PTRACE_SETOPTIONS,
@@ -447,7 +495,6 @@ impl PtraceCollector {
                     self.record_exec(process_id, former_process_id, sink)?;
                     resume_syscall(process_id, 0)?;
                 }
-                libc::PTRACE_EVENT_EXIT => resume_syscall(process_id, 0)?,
                 0 => {
                     if stop_signal == (libc::SIGTRAP | 0x80) {
                         self.record_syscall(process_id, sink)?;
@@ -525,9 +572,20 @@ fn event_message(process_id: libc::pid_t) -> io::Result<libc::c_ulong> {
 }
 
 fn reap_killed_tracee(process_id: libc::pid_t) {
-    loop {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
         let mut wait_status = 0;
-        let result = unsafe { libc::waitpid(process_id, &mut wait_status, libc::__WALL) };
+        let result = unsafe {
+            libc::waitpid(
+                process_id,
+                &mut wait_status,
+                libc::__WALL | libc::__WNOTHREAD | libc::WNOHANG,
+            )
+        };
+        if result == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
         if result < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -538,12 +596,14 @@ fn reap_killed_tracee(process_id: libc::pid_t) {
         if libc::WIFEXITED(wait_status) || libc::WIFSIGNALED(wait_status) {
             return;
         }
-        let _ = ptrace_call(
-            libc::PTRACE_CONT,
-            process_id,
-            ptr::null_mut(),
-            libc::SIGKILL as usize as *mut libc::c_void,
-        );
+        if libc::WIFSTOPPED(wait_status) {
+            let _ = ptrace_call(
+                libc::PTRACE_CONT,
+                process_id,
+                ptr::null_mut(),
+                libc::SIGKILL as usize as *mut libc::c_void,
+            );
+        }
     }
 }
 
@@ -570,7 +630,8 @@ fn detach_new_tracee(process_id: libc::pid_t) -> io::Result<()> {
 
 fn wait_for(process_id: libc::pid_t, wait_status: &mut libc::c_int) -> io::Result<libc::pid_t> {
     loop {
-        let result = unsafe { libc::waitpid(process_id, wait_status, libc::__WALL) };
+        let result =
+            unsafe { libc::waitpid(process_id, wait_status, libc::__WALL | libc::__WNOTHREAD) };
         if result >= 0 {
             return Ok(result);
         }
@@ -726,7 +787,7 @@ fn inherited_environment_names() -> Vec<String> {
 mod tests {
     use std::collections::HashMap;
     use std::io;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use crate::collector::{
@@ -846,5 +907,21 @@ mod tests {
             1,
         ));
         assert_eq!(snapshots.len(), 1);
+    }
+
+    #[test]
+    fn hides_only_events_wholly_inside_collector_files() {
+        let mut collector = PtraceCollector::new("fixture".to_owned());
+        collector.ignore_paths(&[Path::new("/state/events"), Path::new("/state/preload")]);
+
+        assert!(collector.is_internal_event(&[PathBuf::from("/state/events")]));
+        assert!(collector.is_internal_event(&[
+            PathBuf::from("/state/events"),
+            PathBuf::from("/state/preload"),
+        ]));
+        assert!(!collector.is_internal_event(&[
+            PathBuf::from("/state/events"),
+            PathBuf::from("/project/output"),
+        ]));
     }
 }

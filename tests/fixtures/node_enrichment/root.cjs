@@ -1,6 +1,7 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
+const diagnostics = require('node:diagnostics_channel');
 const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
@@ -11,6 +12,8 @@ if (!String(process.env.NODE_OPTIONS).includes('--no-warnings')) {
   throw new Error('existing NODE_OPTIONS were not preserved');
 }
 void process.env.EXECWAKE_NODE_PARENT_PROBE;
+diagnostics.channel('http.client.request.start').publish(null);
+diagnostics.channel('undici:request:create').publish({});
 
 function listen(server) {
   return new Promise((resolve, reject) => {

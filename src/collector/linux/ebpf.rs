@@ -44,6 +44,13 @@ impl LinuxCollector {
             }
         }
     }
+
+    pub fn ignore_paths(&mut self, paths: &[&Path]) {
+        match self {
+            Self::Ebpf(collector) => collector.ptrace.ignore_paths(paths),
+            Self::Ptrace(collector) => collector.ignore_paths(paths),
+        }
+    }
 }
 
 impl Collector for LinuxCollector {

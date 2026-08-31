@@ -219,10 +219,23 @@ fn records_bounded_node_runtime_evidence_across_supported_module_paths() {
             |row| row.get(0),
         )
         .expect("kernel socket events should be queried");
+    let internal_file_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM event
+             WHERE category = 'filesystem'
+               AND (instr(target, '.node-events') > 0
+                    OR instr(target, '.node-preload.cjs') > 0)",
+            [],
+            |row| row.get(0),
+        )
+        .expect("internal filesystem events should be queried");
     assert_eq!(application_protocol_events, 0);
+    assert_eq!(internal_file_events, 0);
     assert!(kernel_socket_events > 0);
     drop(connection);
 
+    assert!(!database.with_extension("node-events").exists());
+    assert!(!database.with_extension("node-preload.cjs").exists());
     let bytes = fs::read(database).expect("the finalized session should be readable");
     for forbidden in FORBIDDEN_PAYLOADS {
         assert!(

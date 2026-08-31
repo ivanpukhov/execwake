@@ -104,6 +104,10 @@ fn run_in_store_with_options(
     #[cfg(target_os = "linux")]
     let mut collector = LinuxCollector::new(command_name);
     #[cfg(target_os = "linux")]
+    if let Some(capture) = node_capture.as_ref() {
+        collector.ignore_paths(&capture.internal_paths());
+    }
+    #[cfg(target_os = "linux")]
     if let Err(source) = collector.prepare(&mut command) {
         forwarder.stop();
         let session_path = session.paths().database().to_owned();
@@ -380,6 +384,41 @@ mod tests {
                 )
                 .expect("the collector backend should be stored");
             assert_eq!(backend, "ebpf");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn keeps_concurrent_traces_on_their_own_threads() {
+        use std::sync::{Arc, Barrier};
+
+        const TRACE_COUNT: usize = 4;
+        let barrier = Arc::new(Barrier::new(TRACE_COUNT));
+        let threads: Vec<_> = (0..TRACE_COUNT)
+            .map(|index| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let directory = TestDirectory::new();
+                    let store =
+                        SessionStore::at(directory.0.clone()).expect("storage should be created");
+                    let exit_code = 20 + index as u8;
+                    barrier.wait();
+                    let result = run_in_store(
+                        vec![
+                            OsString::from("/bin/sh"),
+                            OsString::from("-c"),
+                            OsString::from(format!("sleep 0.05; exit {exit_code}")),
+                        ],
+                        &store,
+                    )
+                    .expect("the concurrent command should run");
+                    assert_eq!(result.status.code(), Some(i32::from(exit_code)));
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().expect("the trace thread should finish");
         }
     }
 

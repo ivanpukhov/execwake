@@ -14,7 +14,9 @@ use crate::collector::{
 };
 use crate::findings::{evaluate, EvidenceReference, FindingEvent};
 use crate::limits::{CaptureLimits, SQLITE_CACHE_KIB};
-use crate::node_enrichment::{NodeEnrichmentFact, NodeEnrichmentRecord, NODE_ENRICHMENT_EVIDENCE};
+use crate::node_enrichment::{
+    cleanup_session_files, NodeEnrichmentFact, NodeEnrichmentRecord, NODE_ENRICHMENT_EVIDENCE,
+};
 use crate::privacy::CURRENT_PRIVACY_PROFILE;
 use crate::session::{
     CategoryCoverage, EvidenceKind, SessionCoverage, SessionMode, CURRENT_SCHEMA_VERSION,
@@ -1128,6 +1130,7 @@ fn recover_session(paths: &SessionPaths) -> Result<bool, StoreError> {
     }
 
     if !is_regular_file(paths.database())? {
+        cleanup_session_files(paths);
         FileExt::unlock(&lock_file)?;
         drop(lock_file);
         fs::remove_file(paths.lock())?;
@@ -1151,6 +1154,12 @@ fn recover_session(paths: &SessionPaths) -> Result<bool, StoreError> {
     if interrupted {
         persist_findings(&transaction)?;
         transaction.execute(
+            "UPDATE coverage
+             SET state = 'partial', lost_events = lost_events + 1
+             WHERE category = 'node_enrichment'",
+            [],
+        )?;
+        transaction.execute(
             "UPDATE session
              SET state = 'interrupted', finalized = 1, ended_at_ms = ?1,
                  exit_code = NULL, termination_signal = NULL,
@@ -1164,6 +1173,7 @@ fn recover_session(paths: &SessionPaths) -> Result<bool, StoreError> {
     if finalized == 1 || interrupted {
         create_finalized_marker(paths.finalized())?;
     }
+    cleanup_session_files(paths);
 
     FileExt::unlock(&lock_file)?;
     drop(lock_file);
@@ -2009,6 +2019,39 @@ mod tests {
                 "runner exited before finalization".to_owned(),
             )
         );
+    }
+
+    #[test]
+    fn interrupted_instrumented_sessions_drop_auxiliary_files_and_record_loss() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin_in_mode("node", 0, SessionMode::Instrumented)
+            .expect("an instrumented session should be started");
+        let database = session.paths().database().to_owned();
+        let event_path = database.with_extension("node-events");
+        let preload_path = database.with_extension("node-preload.cjs");
+        fs::write(&event_path, "partial event stream").expect("the event file should be created");
+        fs::write(&preload_path, "preload").expect("the preload file should be created");
+        drop(session);
+
+        let recovered = store
+            .recover_interrupted()
+            .expect("the instrumented session should be recovered");
+
+        assert_eq!(recovered.len(), 1);
+        assert!(!event_path.exists());
+        assert!(!preload_path.exists());
+        let connection = Connection::open(database).expect("the database should open");
+        let coverage: (String, i64) = connection
+            .query_row(
+                "SELECT state, lost_events FROM coverage
+                 WHERE category = 'node_enrichment'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the enrichment coverage should be readable");
+        assert_eq!(coverage, ("partial".to_owned(), 1));
     }
 
     #[test]
