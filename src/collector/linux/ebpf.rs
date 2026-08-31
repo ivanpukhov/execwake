@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+mod protocol;
+
 use aya::maps::perf::PerfEventArrayBuffer;
 use aya::maps::{Array, MapRefMut, PerfEventArray};
 use aya::programs::RawTracePoint;
@@ -308,6 +310,9 @@ fn drain_buffers(
             Ok(events) => {
                 lost.fetch_add(events.lost as u64, Ordering::Relaxed);
                 for event in output.iter_mut().take(events.read) {
+                    if protocol::decode(event).is_err() {
+                        lost.fetch_add(1, Ordering::Relaxed);
+                    }
                     event.clear();
                 }
             }

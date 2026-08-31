@@ -1,7 +1,6 @@
 #define SEC(name) __attribute__((section(name), used))
 
-typedef unsigned int __u32;
-typedef unsigned long long __u64;
+#include "protocol.h"
 
 enum {
     BPF_MAP_TYPE_ARRAY = 2,
@@ -44,8 +43,15 @@ int observe_sys_enter(void *context) {
         return 0;
 
     __u64 process = bpf_get_current_pid_tgid();
-    bpf_perf_event_output(context, &EVENTS, 0xffffffffULL, &process,
-                          sizeof(process));
+    struct execwake_event_header event = {
+        .version = EXECWAKE_PROTOCOL_VERSION,
+        .kind = EXECWAKE_EVENT_HEARTBEAT,
+        .size = sizeof(struct execwake_event_header),
+        .tgid = process >> 32,
+        .tid = (__u32)process,
+    };
+    bpf_perf_event_output(context, &EVENTS, 0xffffffffULL, &event,
+                          sizeof(event));
     return 0;
 }
 
