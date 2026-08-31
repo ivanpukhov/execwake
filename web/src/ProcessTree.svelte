@@ -2,6 +2,7 @@
   import type { ProcessReport } from './report';
 
   export let processes: ProcessReport[];
+  export let total: number;
 
   interface ProcessRow {
     process: ProcessReport;
@@ -63,6 +64,9 @@
 {#if rows.length === 0}
   <p class="empty-state">No process events.</p>
 {:else}
+  {#if total > processes.length}
+    <p class="truncation-note">Showing {processes.length} of {total} processes.</p>
+  {/if}
   <div class="process-tree" aria-label="Process hierarchy">
     {#each rows as row (row.process.processId)}
       <div

@@ -17,6 +17,7 @@
   let report: SessionReport | null = null;
   let diff: SemanticDiff | null = null;
   let error = '';
+  const timelineProcessLimit = 128;
   const isDiff = window.location.pathname === '/diff';
 
   onMount(async () => {
@@ -63,14 +64,14 @@
 
     <section class="metrics" aria-label="Session summary">
       <article><span>Duration</span><strong>{formatDuration(durationMs(report))}</strong></article>
-      <article><span>Processes</span><strong>{report.processes.length}</strong></article>
+      <article><span>Processes</span><strong>{report.processCount}</strong></article>
       <article><span>Events</span><strong>{report.eventCount}</strong></article>
-      <article><span>Findings</span><strong>{report.findings.length}</strong></article>
+      <article><span>Findings</span><strong>{report.findingCount}</strong></article>
     </section>
 
     <section class="panel">
       <div class="panel-heading"><div><p class="eyebrow">Findings</p><h2>Deterministic rules</h2></div></div>
-      <Findings findings={report.findings} />
+      <Findings findings={report.findings} total={report.findingCount} />
     </section>
 
     <section class="panel">
@@ -90,12 +91,15 @@
     <div class="content-grid">
       <section class="panel">
         <div class="panel-heading"><h2>Process tree</h2></div>
-        <ProcessTree processes={report.processes} />
+        <ProcessTree processes={report.processes} total={report.processCount} />
       </section>
       <section class="panel">
         <div class="panel-heading"><h2>Timeline</h2></div>
+        {#if report.processCount > timelineProcessLimit}
+          <p class="truncation-note">Timeline shows the first {timelineProcessLimit} of {report.processCount} processes.</p>
+        {/if}
         <Timeline
-          processes={report.processes}
+          processes={report.processes.slice(0, timelineProcessLimit)}
           events={report.timelineEvents}
           startedAtMs={report.startedAtMs}
           endedAtMs={report.endedAtMs}

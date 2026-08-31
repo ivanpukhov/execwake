@@ -8,6 +8,9 @@ pub(crate) const MAX_IMPORTED_FINDINGS: usize = 100_000;
 pub(crate) const MAX_DISPLAY_TEXT_BYTES: usize = 16 * 1024;
 pub(crate) const REPORT_EVENT_PAGE_SIZE: usize = 500;
 pub(crate) const REPORT_TIMELINE_EVENT_LIMIT: usize = 5_000;
+pub(crate) const REPORT_PROCESS_LIMIT: usize = 2_048;
+pub(crate) const REPORT_FINDING_LIMIT: usize = 1_024;
+pub(crate) const REPORT_FINDING_EVIDENCE_LIMIT: usize = 128;
 
 #[cfg(target_os = "linux")]
 pub(crate) const MAX_LIVE_PROCESSES: usize = 1_024;

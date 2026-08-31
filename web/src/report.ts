@@ -33,6 +33,7 @@ export interface FindingReport {
   processId: number;
   subject: string;
   evidenceEventIds: number[];
+  evidenceTruncated: boolean;
 }
 
 export interface SessionReport {
@@ -49,9 +50,11 @@ export interface SessionReport {
   terminationSignal: number | null;
   interruption: string | null;
   coverage: CoverageReport[];
+  processCount: number;
   processes: ProcessReport[];
   eventCount: number;
   timelineEvents: EventReport[];
+  findingCount: number;
   findings: FindingReport[];
 }
 

@@ -33,6 +33,7 @@ h2 { font-size: 16px; letter-spacing: -0.01em; }
 .coverage-row strong { color: #34513e; font: 700 10px ui-monospace, monospace; text-transform: uppercase; }
 .coverage-row strong.unavailable { color: #7c6550; }
 .empty-state { padding: 24px 0; color: #78857c; font-size: 13px; }
+.truncation-note { margin: 0 0 12px; color: #78857c; font-size: 12px; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 .finding-list { display: grid; gap: 8px; }

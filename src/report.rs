@@ -464,9 +464,11 @@ struct SessionReport {
     termination_signal: Option<i64>,
     interruption: Option<String>,
     coverage: Vec<CoverageReport>,
+    process_count: i64,
     processes: Vec<ProcessReport>,
     event_count: i64,
     timeline_events: Vec<EventReport>,
+    finding_count: i64,
     findings: Vec<FindingReport>,
 }
 
@@ -530,6 +532,7 @@ struct FindingReport {
     process_id: i64,
     subject: String,
     evidence_event_ids: Vec<i64>,
+    evidence_truncated: bool,
 }
 
 fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
@@ -563,18 +566,22 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
                     .get::<_, Option<String>>(11)?
                     .map(|value| sanitize(&value)),
                 coverage: Vec::new(),
+                process_count: 0,
                 processes: Vec::new(),
                 event_count: 0,
                 timeline_events: Vec::new(),
+                finding_count: 0,
                 findings: Vec::new(),
             })
         },
     )?;
 
     report.coverage = query_coverage(&connection)?;
+    report.process_count = query_count(&connection, "process")?;
     report.processes = query_processes(&connection)?;
     report.event_count = query_event_count(&connection)?;
     report.timeline_events = query_timeline_events(&connection, report.event_count)?;
+    report.finding_count = query_count(&connection, "finding")?;
     report.findings = query_findings(&connection)?;
     Ok(report)
 }
@@ -595,11 +602,12 @@ fn query_coverage(connection: &Connection) -> rusqlite::Result<Vec<CoverageRepor
 }
 
 fn query_processes(connection: &Connection) -> rusqlite::Result<Vec<ProcessReport>> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT process_id, parent_process_id, executable, started_at_ms,
                 ended_at_ms, exit_code, termination_signal, evidence
-         FROM process ORDER BY started_at_ms, process_id",
-    )?;
+         FROM process ORDER BY started_at_ms, process_id LIMIT {}",
+        crate::limits::REPORT_PROCESS_LIMIT
+    ))?;
     let rows = statement
         .query_map([], |row| {
             Ok(ProcessReport {
@@ -618,7 +626,13 @@ fn query_processes(connection: &Connection) -> rusqlite::Result<Vec<ProcessRepor
 }
 
 fn query_event_count(connection: &Connection) -> rusqlite::Result<i64> {
-    connection.query_row("SELECT COUNT(*) FROM event", [], |row| row.get(0))
+    query_count(connection, "event")
+}
+
+fn query_count(connection: &Connection, table: &str) -> rusqlite::Result<i64> {
+    connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
 }
 
 fn query_timeline_events(
@@ -723,12 +737,14 @@ fn event_report_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRepor
 }
 
 fn query_findings(connection: &Connection) -> rusqlite::Result<Vec<FindingReport>> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT finding_id, rule_id, rule_version, severity, process_id, subject
          FROM finding
          ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
-                  rule_id, rule_version, process_id, subject",
-    )?;
+                  rule_id, rule_version, process_id, subject
+         LIMIT {}",
+        crate::limits::REPORT_FINDING_LIMIT
+    ))?;
     let rows = statement
         .query_map([], |row| {
             Ok(FindingReport {
@@ -739,6 +755,7 @@ fn query_findings(connection: &Connection) -> rusqlite::Result<Vec<FindingReport
                 process_id: row.get(4)?,
                 subject: sanitize(&row.get::<_, String>(5)?),
                 evidence_event_ids: Vec::new(),
+                evidence_truncated: false,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -746,13 +763,18 @@ fn query_findings(connection: &Connection) -> rusqlite::Result<Vec<FindingReport
 
     rows.into_iter()
         .map(|mut finding| {
-            let mut evidence_statement = connection.prepare(
+            let mut evidence_statement = connection.prepare(&format!(
                 "SELECT event_id FROM finding_evidence
-                 WHERE finding_id = ?1 ORDER BY event_id",
-            )?;
-            finding.evidence_event_ids = evidence_statement
+                 WHERE finding_id = ?1 ORDER BY event_id LIMIT {}",
+                crate::limits::REPORT_FINDING_EVIDENCE_LIMIT + 1
+            ))?;
+            let mut evidence_event_ids = evidence_statement
                 .query_map([finding.finding_id], |row| row.get(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            finding.evidence_truncated =
+                evidence_event_ids.len() > crate::limits::REPORT_FINDING_EVIDENCE_LIMIT;
+            evidence_event_ids.truncate(crate::limits::REPORT_FINDING_EVIDENCE_LIMIT);
+            finding.evidence_event_ids = evidence_event_ids;
             Ok(finding)
         })
         .collect()
@@ -1081,6 +1103,113 @@ mod tests {
         let report = load_report(session.database().to_owned()).expect("the report should load");
         assert_eq!(report.event_count, 1_200);
         assert_eq!(report.timeline_events.len(), 1_200);
+    }
+
+    #[test]
+    fn bounds_processes_findings_and_evidence_in_the_report_payload() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin("fixture", 0)
+            .expect("a session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the session should finalize");
+        let mut connection = rusqlite::Connection::open(session.database())
+            .expect("the session database should open");
+        let transaction = connection
+            .transaction()
+            .expect("a report fixture transaction should start");
+        {
+            let mut process_statement = transaction
+                .prepare(
+                    "INSERT INTO process (
+                         process_id, operating_system_id, parent_process_id, executable,
+                         started_at_ms, evidence
+                     ) VALUES (?1, ?1, NULL, 'fixture', ?1, 'observed')",
+                )
+                .expect("the process insert should prepare");
+            for process_id in 1..=crate::limits::REPORT_PROCESS_LIMIT + 1 {
+                let process_id = i64::try_from(process_id).expect("the process id should fit");
+                process_statement
+                    .execute([process_id])
+                    .expect("the process should be inserted");
+            }
+        }
+        {
+            let mut event_statement = transaction
+                .prepare(
+                    "INSERT INTO event (
+                         category, operation, target, process_id, occurred_at_ms, evidence
+                     ) VALUES ('filesystem', 'read', '/tmp/input', 1, ?1, 'observed')",
+                )
+                .expect("the event insert should prepare");
+            for occurred_at_ms in 1..=crate::limits::REPORT_FINDING_EVIDENCE_LIMIT + 1 {
+                event_statement
+                    .execute([i64::try_from(occurred_at_ms).expect("the timestamp should fit")])
+                    .expect("the event should be inserted");
+            }
+        }
+        {
+            let mut finding_statement = transaction
+                .prepare(
+                    "INSERT INTO finding (
+                         rule_id, rule_version, severity, process_id, subject
+                     ) VALUES ('EW-FS-001', 1, 'high', 1, ?1)",
+                )
+                .expect("the finding insert should prepare");
+            let mut evidence_statement = transaction
+                .prepare("INSERT INTO finding_evidence (finding_id, event_id) VALUES (?1, ?2)")
+                .expect("the evidence insert should prepare");
+            for index in 0..=crate::limits::REPORT_FINDING_LIMIT {
+                finding_statement
+                    .execute([format!("subject-{index:05}")])
+                    .expect("the finding should be inserted");
+                let finding_id = transaction.last_insert_rowid();
+                if index == 0 {
+                    for event_id in 1..=crate::limits::REPORT_FINDING_EVIDENCE_LIMIT + 1 {
+                        evidence_statement
+                            .execute(rusqlite::params![
+                                finding_id,
+                                i64::try_from(event_id).expect("the event id should fit")
+                            ])
+                            .expect("the finding evidence should be inserted");
+                    }
+                } else {
+                    evidence_statement
+                        .execute(rusqlite::params![finding_id, 1_i64])
+                        .expect("the finding evidence should be inserted");
+                }
+            }
+        }
+        transaction
+            .commit()
+            .expect("the report fixture should commit");
+        drop(connection);
+
+        let report = load_report(session.database().to_owned()).expect("the report should load");
+        let first_finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.subject == "subject-00000")
+            .expect("the first finding should be present");
+
+        assert_eq!(
+            report.process_count,
+            i64::try_from(crate::limits::REPORT_PROCESS_LIMIT + 1)
+                .expect("the process count should fit")
+        );
+        assert_eq!(report.processes.len(), crate::limits::REPORT_PROCESS_LIMIT);
+        assert_eq!(
+            report.finding_count,
+            i64::try_from(crate::limits::REPORT_FINDING_LIMIT + 1)
+                .expect("the finding count should fit")
+        );
+        assert_eq!(report.findings.len(), crate::limits::REPORT_FINDING_LIMIT);
+        assert_eq!(
+            first_finding.evidence_event_ids.len(),
+            crate::limits::REPORT_FINDING_EVIDENCE_LIMIT
+        );
+        assert!(first_finding.evidence_truncated);
     }
 
     async fn request(address: std::net::SocketAddr, request: &str) -> String {

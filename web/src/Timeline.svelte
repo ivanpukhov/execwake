@@ -99,6 +99,7 @@
 
     const markers = new Set<string>();
     for (const event of events) {
+      if (event.processId !== null && !processRows.has(event.processId)) continue;
       const row = event.processId === null ? 0 : (processRows.get(event.processId) ?? 0);
       const x = xFor(event.occurredAtMs);
       const marker = `${row}:${Math.round(x)}:${event.category}`;
