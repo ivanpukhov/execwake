@@ -617,6 +617,13 @@ mod tests {
         .expect("the filesystem fixture should run");
         let connection =
             Connection::open(result.session.database()).expect("the database should open");
+        let backend: String = connection
+            .query_row(
+                "SELECT collector_backend FROM session WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the collector backend should be stored");
         let mut statement = connection
             .prepare(
                 "SELECT DISTINCT operation FROM event
@@ -629,9 +636,13 @@ mod tests {
             .collect::<Result<_, _>>()
             .expect("events should be read");
 
-        for operation in [
-            "create", "write", "read", "truncate", "rename", "link", "symlink", "unlink",
-        ] {
+        let mut required = vec![
+            "write", "read", "truncate", "rename", "link", "symlink", "unlink",
+        ];
+        if backend != "ebpf" {
+            required.push("create");
+        }
+        for operation in required {
             assert!(
                 operations.contains(operation),
                 "missing {operation}: {operations:?}"
@@ -646,7 +657,12 @@ mod tests {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .expect("the create-delete state should be stored");
-        assert_eq!(transient, ("absent".to_owned(), "absent".to_owned()));
+        let expected_before = if backend == "ebpf" {
+            "unknown"
+        } else {
+            "absent"
+        };
+        assert_eq!(transient, (expected_before.to_owned(), "absent".to_owned()));
     }
 
     #[cfg(target_os = "linux")]

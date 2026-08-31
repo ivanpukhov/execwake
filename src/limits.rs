@@ -20,11 +20,13 @@ pub(crate) const MAX_FILE_SNAPSHOTS: usize = 100_000;
 #[cfg(target_os = "linux")]
 pub(crate) const MAX_SOCKETS_PER_PROCESS: usize = 512;
 #[cfg(target_os = "linux")]
+pub(crate) const MAX_TRACKED_DESCRIPTORS_PER_PROCESS: usize = 4_096;
+#[cfg(target_os = "linux")]
 pub(crate) const MAX_DNS_QUERIES_PER_SOCKET: usize = 256;
 #[cfg(target_os = "linux")]
-pub(crate) const EBPF_BUFFER_PAGES: usize = 64;
+pub(crate) const EBPF_BUFFER_PAGES: usize = 128;
 #[cfg(target_os = "linux")]
-pub(crate) const EBPF_READ_BATCH: usize = 64;
+pub(crate) const EBPF_READ_BATCH: usize = 256;
 #[cfg(target_os = "linux")]
 pub(crate) const MAX_EBPF_QUEUED_EVENTS: usize = 250_000;
 

@@ -593,7 +593,7 @@ fn read_socket_address(
     Ok(parse_socket_address(&bytes))
 }
 
-fn parse_socket_address(bytes: &[u8]) -> Option<SocketAddr> {
+pub(super) fn parse_socket_address(bytes: &[u8]) -> Option<SocketAddr> {
     if bytes.len() < 2 {
         return None;
     }
@@ -618,7 +618,7 @@ fn parse_socket_address(bytes: &[u8]) -> Option<SocketAddr> {
     None
 }
 
-fn parse_dns_query(bytes: &[u8]) -> Option<(u16, String)> {
+pub(super) fn parse_dns_query(bytes: &[u8]) -> Option<(u16, String)> {
     let message = dns_message(bytes)?;
     if message.len() < 12 || u16::from_be_bytes([message[2], message[3]]) & 0x8000 != 0 {
         return None;
@@ -633,7 +633,7 @@ fn parse_dns_query(bytes: &[u8]) -> Option<(u16, String)> {
     Some((u16::from_be_bytes([message[0], message[1]]), hostname))
 }
 
-fn parse_dns_response(
+pub(super) fn parse_dns_response(
     bytes: &[u8],
     queries: &mut std::collections::HashMap<u16, String>,
 ) -> Vec<DnsEvent> {

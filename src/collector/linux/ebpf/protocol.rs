@@ -67,6 +67,11 @@ pub enum SyscallOperation {
     RemoveDirectory = 38,
     Stat = 39,
     OpenAt2 = 40,
+    Clone = 41,
+    Clone3 = 42,
+    Fork = 43,
+    GetSocketName = 44,
+    GetPeerName = 45,
 }
 
 impl SyscallOperation {
@@ -112,6 +117,11 @@ impl SyscallOperation {
             38 => Some(Self::RemoveDirectory),
             39 => Some(Self::Stat),
             40 => Some(Self::OpenAt2),
+            41 => Some(Self::Clone),
+            42 => Some(Self::Clone3),
+            43 => Some(Self::Fork),
+            44 => Some(Self::GetSocketName),
+            45 => Some(Self::GetPeerName),
             _ => None,
         }
     }

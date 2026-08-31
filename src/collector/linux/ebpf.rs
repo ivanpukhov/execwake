@@ -10,8 +10,8 @@ use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
+mod normalize;
 mod protocol;
 
 use aya::maps::perf::PerfEventArrayBuffer;
@@ -49,7 +49,9 @@ impl LinuxCollector {
 
     pub fn ignore_paths(&mut self, paths: &[&Path]) {
         match self {
-            Self::Ebpf(collector) => collector.ptrace.ignore_paths(paths),
+            Self::Ebpf(collector) => collector
+                .ignored_paths
+                .extend(paths.iter().map(|path| path.to_path_buf())),
             Self::Ptrace(collector) => collector.ignore_paths(paths),
         }
     }
@@ -83,7 +85,9 @@ impl Collector for LinuxCollector {
 }
 
 pub struct EbpfCollector {
-    ptrace: PtraceCollector,
+    root_executable: String,
+    root_cwd: PathBuf,
+    ignored_paths: Vec<PathBuf>,
     scope: CgroupScope,
     probe: EbpfProbe,
 }
@@ -93,7 +97,9 @@ impl EbpfCollector {
         let scope = CgroupScope::create()?;
         let probe = EbpfProbe::load(scope.id())?;
         Ok(Self {
-            ptrace: PtraceCollector::new(root_executable),
+            root_executable,
+            root_cwd: std::env::current_dir()?,
+            ignored_paths: Vec::new(),
             scope,
             probe,
         })
@@ -106,8 +112,7 @@ impl Collector for EbpfCollector {
     }
 
     fn prepare(&mut self, command: &mut Command) -> io::Result<()> {
-        self.scope.configure(command)?;
-        self.ptrace.prepare(command)
+        self.scope.configure(command)
     }
 
     fn collect(
@@ -115,22 +120,46 @@ impl Collector for EbpfCollector {
         child: &mut Child,
         sink: &mut dyn CollectorSink,
     ) -> io::Result<ExitStatus> {
+        let namespace_root_pid = child.id();
+        let kernel_root_pid = self.scope.process_ids()?.into_iter().min();
+        let root_start_time_ticks =
+            super::process_start_time(namespace_root_pid as libc::pid_t).ok();
+        let clock = normalize::CaptureClock::now()?;
         let run = self.probe.start()?;
-        let result = self.ptrace.collect(child, sink);
+        let result = child.wait();
         let output = run.stop()?;
-        let _captured_events = output.events.len();
+        let status = result?;
+        let root_pid = output
+            .events
+            .iter()
+            .filter(|event| event.kind == protocol::EventKind::ProcessExec)
+            .min_by_key(|event| event.monotonic_ns)
+            .map(|event| event.tgid)
+            .or(kernel_root_pid)
+            .unwrap_or(namespace_root_pid);
         sink.set_backend(self.backend_name()).map_err(sink_error)?;
-        if output.lost_events > 0 {
-            sink.set_coverage(coverage_after_loss(output.lost_events))
-                .map_err(sink_error)?;
-        }
-        result
+        sink.set_coverage(ebpf_coverage(output.lost_events))
+            .map_err(sink_error)?;
+        let mut normalizer = normalize::Normalizer::new(
+            root_pid,
+            self.root_executable.clone(),
+            self.root_cwd.clone(),
+            root_start_time_ticks,
+            self.ignored_paths.clone(),
+            clock,
+        );
+        normalizer.replay(output.events, status, sink)?;
+        Ok(status)
     }
 }
 
-const fn coverage_after_loss(lost_events: u64) -> SessionCoverage {
+const fn ebpf_coverage(lost_events: u64) -> SessionCoverage {
     SessionCoverage {
-        processes: CategoryCoverage::partial(lost_events),
+        processes: if lost_events == 0 {
+            CategoryCoverage::complete()
+        } else {
+            CategoryCoverage::partial(lost_events)
+        },
         filesystem: CategoryCoverage::partial(lost_events),
         network: CategoryCoverage::partial(lost_events),
         environment: CategoryCoverage::partial(lost_events),
@@ -210,6 +239,17 @@ impl CgroupScope {
             });
         }
         Ok(())
+    }
+
+    fn process_ids(&self) -> io::Result<Vec<u32>> {
+        fs::read_to_string(self.path.join("cgroup.procs"))?
+            .lines()
+            .map(|line| {
+                line.parse::<u32>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid cgroup process id")
+                })
+            })
+            .collect()
     }
 }
 
@@ -334,6 +374,8 @@ fn syscall_operations() -> Vec<(i64, protocol::SyscallOperation)> {
         (libc::SYS_recvfrom, SyscallOperation::ReceiveFrom),
         (libc::SYS_write, SyscallOperation::Write),
         (libc::SYS_read, SyscallOperation::Read),
+        (libc::SYS_getsockname, SyscallOperation::GetSocketName),
+        (libc::SYS_getpeername, SyscallOperation::GetPeerName),
         (libc::SYS_openat, SyscallOperation::OpenAt),
         (libc::SYS_openat2, SyscallOperation::OpenAt2),
         (libc::SYS_readv, SyscallOperation::ReadVector),
@@ -359,6 +401,8 @@ fn syscall_operations() -> Vec<(i64, protocol::SyscallOperation)> {
         (libc::SYS_statx, SyscallOperation::StatAt),
         (libc::SYS_readlinkat, SyscallOperation::ReadLinkAt),
         (libc::SYS_getdents64, SyscallOperation::ReadDirectory),
+        (libc::SYS_clone, SyscallOperation::Clone),
+        (libc::SYS_clone3, SyscallOperation::Clone3),
     ]);
     #[cfg(target_arch = "x86_64")]
     operations.extend([
@@ -374,6 +418,8 @@ fn syscall_operations() -> Vec<(i64, protocol::SyscallOperation)> {
         (libc::SYS_rmdir, SyscallOperation::RemoveDirectory),
         (libc::SYS_stat, SyscallOperation::Stat),
         (libc::SYS_lstat, SyscallOperation::Stat),
+        (libc::SYS_fork, SyscallOperation::Fork),
+        (libc::SYS_vfork, SyscallOperation::Fork),
     ]);
     operations
 }
@@ -400,7 +446,7 @@ impl ProbeRun {
             let mut lost_events = 0_u64;
             while !thread_stop.load(Ordering::Acquire) {
                 drain_buffers(&mut buffers, &mut output, &mut events, &mut lost_events);
-                thread::sleep(Duration::from_millis(1));
+                thread::yield_now();
             }
             drain_buffers(&mut buffers, &mut output, &mut events, &mut lost_events);
             ProbeOutput {
@@ -477,13 +523,13 @@ mod tests {
     use crate::session::CoverageState;
 
     use super::protocol::{EventKind, SyscallOperation};
-    use super::{coverage_after_loss, CgroupScope, EbpfProbe};
+    use super::{ebpf_coverage, CgroupScope, EbpfProbe};
 
     static TEST_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn buffer_loss_marks_every_category_partial() {
-        let coverage = coverage_after_loss(19);
+        let coverage = ebpf_coverage(19);
 
         for category in [
             coverage.processes,

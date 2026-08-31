@@ -44,6 +44,11 @@ struct raw_syscalls_exit_context {
     __s64 result;
 };
 
+struct execwake_user_iovec {
+    __u64 base;
+    __u64 length;
+};
+
 struct bpf_map_def {
     __u32 type;
     __u32 key_size;
@@ -154,6 +159,23 @@ static ALWAYS_INLINE void capture_payload(struct execwake_event *event,
     }
 }
 
+static ALWAYS_INLINE void capture_vector_payload(struct execwake_event *event,
+                                                  const void *vector,
+                                                  __u64 result) {
+    if (!vector)
+        return;
+    struct execwake_socket_data *data = (void *)event->data;
+    if (bpf_probe_read_user(data->payload, sizeof(struct execwake_user_iovec),
+                            vector) != 0)
+        return;
+    struct execwake_user_iovec *entry = (void *)data->payload;
+    __u64 base = entry->base;
+    __u64 length = entry->length;
+    if (result && result < length)
+        length = result;
+    capture_payload(event, (void *)base, length);
+}
+
 static ALWAYS_INLINE void capture_first_path(struct execwake_event *event,
                                               const void *path) {
     if (!path)
@@ -223,6 +245,12 @@ static ALWAYS_INLINE void capture_enter_data(struct execwake_event *event,
                                 (void *)event->header.arguments[2]) == 0)
             event->header.arguments[2] = flags;
     }
+    if (operation == EXECWAKE_SYSCALL_CLONE_3) {
+        __u64 flags = 0;
+        if (bpf_probe_read_user(&flags, sizeof(flags),
+                                (void *)event->header.arguments[0]) == 0)
+            event->header.arguments[0] = flags;
+    }
     if (operation == EXECWAKE_SYSCALL_BIND ||
         operation == EXECWAKE_SYSCALL_CONNECT) {
         capture_address(event, (void *)event->header.arguments[1],
@@ -235,15 +263,19 @@ static ALWAYS_INLINE void capture_enter_data(struct execwake_event *event,
     } else if (operation == EXECWAKE_SYSCALL_WRITE) {
         capture_payload(event, (void *)event->header.arguments[1],
                         event->header.arguments[2]);
+    } else if (operation == EXECWAKE_SYSCALL_WRITE_VECTOR) {
+        capture_vector_payload(event, (void *)event->header.arguments[1], 0);
     }
     capture_path_data(event, operation);
 }
 
 static ALWAYS_INLINE void capture_exit_data(struct execwake_event *event,
                                              __u32 operation, __s64 result) {
-    if (result <= 0)
+    if (result < 0)
         return;
     if (operation == EXECWAKE_SYSCALL_RECVFROM) {
+        if (result == 0)
+            return;
         __u32 address_length = 0;
         if (event->header.arguments[5] &&
             bpf_probe_read_user(&address_length, sizeof(address_length),
@@ -252,7 +284,9 @@ static ALWAYS_INLINE void capture_exit_data(struct execwake_event *event,
                             address_length);
         }
         capture_payload(event, (void *)event->header.arguments[1], result);
-    } else if (operation == EXECWAKE_SYSCALL_ACCEPT) {
+    } else if (operation == EXECWAKE_SYSCALL_ACCEPT ||
+               operation == EXECWAKE_SYSCALL_GET_SOCKET_NAME ||
+               operation == EXECWAKE_SYSCALL_GET_PEER_NAME) {
         __u32 address_length = 0;
         if (event->header.arguments[2] &&
             bpf_probe_read_user(&address_length, sizeof(address_length),
@@ -261,7 +295,13 @@ static ALWAYS_INLINE void capture_exit_data(struct execwake_event *event,
                             address_length);
         }
     } else if (operation == EXECWAKE_SYSCALL_READ) {
+        if (result == 0)
+            return;
         capture_payload(event, (void *)event->header.arguments[1], result);
+    } else if (operation == EXECWAKE_SYSCALL_READ_VECTOR) {
+        if (result == 0)
+            return;
+        capture_vector_payload(event, (void *)event->header.arguments[1], result);
     }
 }
 
