@@ -29,8 +29,6 @@ mkdir -p "$destination"
 destination=$(CDPATH= cd -- "$destination" && pwd)
 cd "$repository"
 
-cargo build --locked --release --target "$target"
-binary="${CARGO_TARGET_DIR:-target}/$target/release/execwake"
 version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
 if [[ -z "$version" ]]; then
   echo "Could not read the package version." >&2
@@ -44,6 +42,19 @@ if [[ -e "$archive" || -e "$checksum" ]]; then
   exit 2
 fi
 
+source_date_epoch=${SOURCE_DATE_EPOCH:-}
+if [[ -z "$source_date_epoch" ]]; then
+  source_date_epoch=$(git log -1 --format=%ct 2>/dev/null || true)
+fi
+source_date_epoch=${source_date_epoch:-0}
+if [[ ! "$source_date_epoch" =~ ^[0-9]+$ ]]; then
+  echo "SOURCE_DATE_EPOCH must be an unsigned integer." >&2
+  exit 2
+fi
+
+cargo build --locked --release --target "$target"
+binary="${CARGO_TARGET_DIR:-target}/$target/release/execwake"
+
 staging=$(mktemp -d)
 trap 'rm -rf -- "$staging"' EXIT
 mkdir -p "$staging/$package/docs/assets" "$staging/$package/benchmarks"
@@ -53,7 +64,6 @@ install -m 0644 docs/assets/execwake-report.gif docs/assets/execwake-report.jpg 
   "$staging/$package/docs/assets/"
 install -m 0644 benchmarks/RESULTS.md "$staging/$package/benchmarks/"
 
-source_date_epoch=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
 tar --sort=name \
   --mtime="@$source_date_epoch" \
   --owner=0 --group=0 --numeric-owner \
