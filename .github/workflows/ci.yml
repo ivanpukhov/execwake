@@ -53,6 +53,8 @@ jobs:
           mountpoint -q /sys/kernel/debug || sudo mount -t debugfs debugfs /sys/kernel/debug
           sudo mkdir -p /sys/kernel/debug/tracing
           mountpoint -q /sys/kernel/debug/tracing || sudo mount -t tracefs tracefs /sys/kernel/debug/tracing
+      - name: Check Linux collector requirements
+        run: sudo scripts/check-linux-collector.sh
       - name: Test ptrace and eBPF collectors
         run: |
           sudo env \
