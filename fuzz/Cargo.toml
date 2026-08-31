@@ -1,0 +1,28 @@
+[package]
+name = "execwake-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+execwake = { path = ".." }
+libfuzzer-sys = "=0.4.7"
+
+[[bin]]
+name = "display_text"
+path = "fuzz_targets/display_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_file"
+path = "fuzz_targets/session_file.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
