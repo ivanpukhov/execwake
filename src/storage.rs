@@ -13,7 +13,7 @@ use crate::collector::{
     FileDeltaRecord, ProcessExecRecord, ProcessExitRecord, ProcessRecord, SinkError,
 };
 use crate::findings::{evaluate, EvidenceReference, FindingEvent};
-use crate::limits::{CaptureLimits, SQLITE_CACHE_KIB};
+use crate::limits::{CaptureLimits, SQLITE_CACHE_KIB, SQLITE_CAPTURE_BATCH_WRITES};
 use crate::node_enrichment::{
     cleanup_session_files, NodeEnrichmentFact, NodeEnrichmentRecord, NODE_ENRICHMENT_EVIDENCE,
 };
@@ -253,8 +253,11 @@ impl SessionStore {
                 limits,
                 recorded_events: 0,
                 capture_losses: CaptureLosses::default(),
+                capture_batch_losses: CaptureLosses::default(),
                 database_saturated: false,
                 writes_until_size_check: 0,
+                capture_batch_writes: 0,
+                capture_transaction_open: false,
             }),
             Err(error) => {
                 let _ = FileExt::unlock(&lock_file);
@@ -304,8 +307,11 @@ pub struct ActiveSession {
     limits: CaptureLimits,
     recorded_events: u64,
     capture_losses: CaptureLosses,
+    capture_batch_losses: CaptureLosses,
     database_saturated: bool,
     writes_until_size_check: u16,
+    capture_batch_writes: u16,
+    capture_transaction_open: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -340,6 +346,14 @@ impl CaptureLosses {
             || self.network > 0
             || self.environment > 0
             || self.node_enrichment > 0
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.processes = self.processes.saturating_add(other.processes);
+        self.filesystem = self.filesystem.saturating_add(other.filesystem);
+        self.network = self.network.saturating_add(other.network);
+        self.environment = self.environment.saturating_add(other.environment);
+        self.node_enrichment = self.node_enrichment.saturating_add(other.node_enrichment);
     }
 }
 
@@ -398,7 +412,65 @@ impl ActiveSession {
             self.writes_until_size_check = 64;
         }
 
+        self.begin_capture_batch(category)?;
         Ok(true)
+    }
+
+    fn begin_capture_batch(&mut self, category: &str) -> Result<(), SinkError> {
+        if !self.capture_transaction_open {
+            self.connection
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(|error| Box::new(error) as SinkError)?;
+            self.capture_transaction_open = true;
+            self.capture_batch_writes = 0;
+            self.capture_batch_losses = CaptureLosses::default();
+        }
+        self.capture_batch_losses.record(category);
+        Ok(())
+    }
+
+    fn flush_capture_batch(&mut self) -> rusqlite::Result<()> {
+        if !self.capture_transaction_open {
+            return Ok(());
+        }
+
+        let result = self.connection.execute_batch("COMMIT");
+        if result.is_err() {
+            let _ = self.connection.execute_batch("ROLLBACK");
+            self.capture_losses.merge(self.capture_batch_losses);
+        }
+        self.capture_transaction_open = false;
+        self.capture_batch_writes = 0;
+        self.capture_batch_losses = CaptureLosses::default();
+
+        match result {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DiskFull =>
+            {
+                self.database_saturated = true;
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    fn abandon_capture_batch(&mut self) {
+        if self.capture_transaction_open {
+            let _ = self.connection.execute_batch("ROLLBACK");
+            self.capture_losses.merge(self.capture_batch_losses);
+        }
+        self.capture_transaction_open = false;
+        self.capture_batch_writes = 0;
+        self.capture_batch_losses = CaptureLosses::default();
+    }
+
+    fn checkpoint_capture_write(&mut self) -> Result<(), SinkError> {
+        self.capture_batch_writes = self.capture_batch_writes.saturating_add(1);
+        if self.capture_batch_writes >= SQLITE_CAPTURE_BATCH_WRITES {
+            self.flush_capture_batch()
+                .map_err(|error| Box::new(error) as SinkError)?;
+        }
+        Ok(())
     }
 
     fn finish_capture(
@@ -410,27 +482,31 @@ impl ActiveSession {
         match result {
             Ok(0) => {
                 self.capture_losses.record(category);
-                Ok(())
+                self.checkpoint_capture_write()
             }
             Ok(_) => {
                 self.writes_until_size_check = self.writes_until_size_check.saturating_sub(1);
                 if event {
                     self.recorded_events = self.recorded_events.saturating_add(1);
                 }
-                Ok(())
+                self.checkpoint_capture_write()
             }
             Err(rusqlite::Error::SqliteFailure(error, _))
                 if error.code == rusqlite::ErrorCode::DiskFull =>
             {
+                self.abandon_capture_batch();
                 self.database_saturated = true;
-                self.capture_losses.record(category);
                 Ok(())
             }
-            Err(error) => Err(Box::new(error)),
+            Err(error) => {
+                self.abandon_capture_batch();
+                Err(Box::new(error))
+            }
         }
     }
 
     pub fn record_root_process(&mut self, process_id: u32) -> Result<(), StoreError> {
+        self.flush_capture_batch()?;
         let transaction = self.connection.transaction()?;
         let (command_name, started_at_ms) = transaction.query_row(
             "SELECT command_name, started_at_ms FROM session WHERE singleton = 1",
@@ -531,6 +607,7 @@ impl ActiveSession {
     }
 
     pub fn finalize(mut self, outcome: SessionOutcome) -> Result<SessionPaths, StoreError> {
+        self.flush_capture_batch()?;
         let ended_at_ms = unix_time_ms()?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
@@ -586,6 +663,8 @@ impl ActiveSession {
 
 impl CollectorSink for ActiveSession {
     fn set_backend(&mut self, backend: &'static str) -> Result<(), SinkError> {
+        self.flush_capture_batch()
+            .map_err(|error| Box::new(error) as SinkError)?;
         self.connection
             .execute(
                 "UPDATE session SET collector_backend = ?1 WHERE singleton = 1",
@@ -755,6 +834,8 @@ impl CollectorSink for ActiveSession {
     }
 
     fn set_coverage(&mut self, coverage: SessionCoverage) -> Result<(), SinkError> {
+        self.flush_capture_batch()
+            .map_err(|error| Box::new(error) as SinkError)?;
         let transaction = self
             .connection
             .transaction()
@@ -1156,7 +1237,11 @@ fn recover_session(paths: &SessionPaths) -> Result<bool, StoreError> {
         transaction.execute(
             "UPDATE coverage
              SET state = 'partial', lost_events = lost_events + 1
-             WHERE category = 'node_enrichment'",
+             WHERE category != 'node_enrichment'
+                OR EXISTS (
+                    SELECT 1 FROM session
+                    WHERE singleton = 1 AND mode = 'instrumented'
+                )",
             [],
         )?;
         transaction.execute(
@@ -1302,7 +1387,7 @@ mod tests {
         EnvironmentVariableRecord, ProcessExecRecord, ProcessExitRecord, ProcessIdentity,
         ProcessRecord,
     };
-    use crate::limits::CaptureLimits;
+    use crate::limits::{CaptureLimits, SQLITE_CAPTURE_BATCH_WRITES};
     use crate::node_enrichment::NodeEnrichmentRecord;
     use crate::privacy::CURRENT_PRIVACY_PROFILE;
     use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage, SessionMode};
@@ -1510,6 +1595,39 @@ mod tests {
         assert_eq!(event_count, 2);
         assert_eq!(coverage, ("partial".to_owned(), 2));
         assert!(page_count * page_size <= limits.session_bytes as i64);
+    }
+
+    #[test]
+    fn capture_batches_are_checkpointed_while_a_session_is_active() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let mut session = store
+            .begin("fixture", 0)
+            .expect("a session should be started");
+
+        for index in 0..SQLITE_CAPTURE_BATCH_WRITES {
+            session
+                .record_event(CollectorEvent {
+                    category: "filesystem",
+                    operation: "read",
+                    target: format!("path-{index}"),
+                    process: None,
+                    occurred_at_ms: i64::from(index),
+                    evidence: EvidenceKind::Observed,
+                })
+                .expect("the capture batch should be stored");
+        }
+
+        let connection = Connection::open(session.paths().database())
+            .expect("the active database should be readable");
+        let event_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM event", [], |row| row.get(0))
+            .expect("checkpointed events should be counted");
+        assert_eq!(event_count, i64::from(SQLITE_CAPTURE_BATCH_WRITES));
+
+        session
+            .finalize(SessionOutcome::exited(0))
+            .expect("the session should finalize");
     }
 
     #[test]
@@ -2018,6 +2136,25 @@ mod tests {
                 1,
                 "runner exited before finalization".to_owned(),
             )
+        );
+        let coverage: Vec<(String, String, i64)> = connection
+            .prepare(
+                "SELECT category, state, lost_events FROM coverage
+                 ORDER BY category",
+            )
+            .expect("coverage should be readable")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("coverage should be queried")
+            .collect::<Result<_, _>>()
+            .expect("coverage rows should be read");
+        assert_eq!(
+            coverage,
+            [
+                ("environment".to_owned(), "partial".to_owned(), 1),
+                ("filesystem".to_owned(), "partial".to_owned(), 1),
+                ("network".to_owned(), "partial".to_owned(), 1),
+                ("processes".to_owned(), "partial".to_owned(), 1),
+            ]
         );
     }
 
