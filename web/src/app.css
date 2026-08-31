@@ -54,6 +54,7 @@ h2 { font-size: 16px; letter-spacing: -0.01em; }
 .compatibility-grid article.incomparable { border-color: #d7c6ad; background: #fbf7f0; }
 .compatibility-grid strong { font-size: 11px; text-transform: capitalize; }
 .compatibility-grid span { color: #69766e; font-size: 10px; line-height: 1.35; }
+.compatibility-grid small { color: #69766e; font: 10px ui-monospace, monospace; }
 .section-count { color: #69766e; font: 11px ui-monospace, monospace; }
 .diff-section { border-top-width: 3px; }
 .status-new { border-top-color: #3c7251; }

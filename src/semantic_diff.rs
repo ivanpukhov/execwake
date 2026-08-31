@@ -12,7 +12,9 @@ use crate::behavior::{
     BehaviorValue,
 };
 use crate::findings::Severity;
+use crate::privacy::CURRENT_PRIVACY_PROFILE;
 use crate::session::CURRENT_SCHEMA_VERSION;
+use crate::storage::SessionId;
 
 #[derive(Debug)]
 pub enum DiffError {
@@ -135,6 +137,7 @@ pub enum CompatibilityIssue {
     BackendMismatch,
     PrivacyProfileUnavailable,
     PrivacyProfileMismatch,
+    UnsupportedPrivacyProfile,
     CoverageUnavailable,
     CoverageMismatch,
     LostEvents,
@@ -204,12 +207,15 @@ impl SessionSnapshot {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        connection.execute_batch(
+            "PRAGMA query_only = ON;
+             PRAGMA trusted_schema = OFF;
+             PRAGMA foreign_keys = ON;",
+        )?;
 
-        let (id, schema_version, state, finalized, command_name, runner_pid, backend) = connection
+        let (id, schema_version, mode, state, finalized, command_name, runner_pid) = connection
             .query_row(
-                "SELECT id, schema_version, state, finalized, command_name, runner_pid,
-                        collector_backend
+                "SELECT id, schema_version, mode, state, finalized, command_name, runner_pid
                  FROM session WHERE singleton = 1",
                 [],
                 |row| {
@@ -217,13 +223,23 @@ impl SessionSnapshot {
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 },
             )?;
+        if SessionId::parse(&id).is_none() {
+            return Err(DiffError::InvalidSession(
+                "session id is invalid".to_owned(),
+            ));
+        }
+        if mode != "observe" {
+            return Err(DiffError::InvalidSession(
+                "session mode is unsupported".to_owned(),
+            ));
+        }
         if finalized != 1 || !matches!(state.as_str(), "finalized" | "interrupted") {
             return Err(DiffError::InvalidSession(
                 "session comparison requires finalized inputs".to_owned(),
@@ -232,15 +248,8 @@ impl SessionSnapshot {
         let schema_version = u32::try_from(schema_version).map_err(|_| {
             DiffError::InvalidSession("session schema version is out of range".to_owned())
         })?;
-        let privacy_profile = if table_has_column(&connection, "session", "privacy_profile")? {
-            connection.query_row(
-                "SELECT privacy_profile FROM session WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )?
-        } else {
-            None
-        };
+        let backend = optional_session_text(&connection, "collector_backend")?;
+        let privacy_profile = optional_session_text(&connection, "privacy_profile")?;
         let info = SessionInfo {
             id: id.clone(),
             schema_version,
@@ -290,28 +299,57 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> rusql
     Ok(columns.iter().any(|candidate| candidate == column))
 }
 
+fn optional_session_text(
+    connection: &Connection,
+    column: &'static str,
+) -> rusqlite::Result<Option<String>> {
+    if !table_has_column(connection, "session", column)? {
+        return Ok(None);
+    }
+
+    connection.query_row(
+        &format!("SELECT {column} FROM session WHERE singleton = 1"),
+        [],
+        |row| row.get(0),
+    )
+}
+
 fn load_coverage(
     connection: &Connection,
-) -> rusqlite::Result<BTreeMap<BehaviorCategory, CoverageSnapshot>> {
+) -> Result<BTreeMap<BehaviorCategory, CoverageSnapshot>, DiffError> {
     let mut statement = connection
         .prepare("SELECT category, state, lost_events FROM coverage ORDER BY category")?;
     let rows = statement
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                CoverageSnapshot {
-                    state: row.get(1)?,
-                    lost_events: row.get(2)?,
-                },
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|(category, coverage)| {
-            category_from_coverage_name(&category).map(|category| (category, coverage))
-        })
-        .collect())
+    let mut coverage_by_category = BTreeMap::new();
+    for (category, state, lost_events) in rows {
+        let lost_events = u64::try_from(lost_events)
+            .map_err(|_| DiffError::InvalidSession("session coverage is invalid".to_owned()))?;
+        if !matches!(state.as_str(), "complete" | "partial" | "unavailable")
+            || (lost_events > 0 && state != "partial")
+        {
+            return Err(DiffError::InvalidSession(
+                "session coverage is invalid".to_owned(),
+            ));
+        }
+        let Some(category) = category_from_coverage_name(&category) else {
+            continue;
+        };
+        let coverage = CoverageSnapshot { state, lost_events };
+        if coverage_by_category.insert(category, coverage).is_some() {
+            return Err(DiffError::InvalidSession(
+                "session coverage contains duplicate categories".to_owned(),
+            ));
+        }
+    }
+    Ok(coverage_by_category)
 }
 
 fn load_processes(connection: &Connection) -> rusqlite::Result<Vec<BehaviorProcess>> {
@@ -380,6 +418,11 @@ fn load_findings(
 
     let mut findings = Vec::new();
     for (finding_id, rule_id, rule_version, severity, process_id, subject) in rows {
+        if finding_id <= 0 || rule_id.is_empty() {
+            return Err(DiffError::InvalidSession(
+                "finding identity is invalid".to_owned(),
+            ));
+        }
         let Some(process) = process_roles.get(&process_id) else {
             return Err(DiffError::InvalidSession(
                 "finding references an unknown process".to_owned(),
@@ -390,13 +433,33 @@ fn load_findings(
         let rule_version = u32::try_from(rule_version).map_err(|_| {
             DiffError::InvalidSession("finding rule version is out of range".to_owned())
         })?;
+        if rule_version == 0 {
+            return Err(DiffError::InvalidSession(
+                "finding rule version is invalid".to_owned(),
+            ));
+        }
         let mut evidence_statement = connection.prepare(
-            "SELECT event_id FROM finding_evidence
-             WHERE finding_id = ?1 ORDER BY event_id",
+            "SELECT finding_evidence.event_id, event.process_id
+             FROM finding_evidence
+             LEFT JOIN event ON event.event_id = finding_evidence.event_id
+             WHERE finding_evidence.finding_id = ?1
+             ORDER BY finding_evidence.event_id",
         )?;
-        let evidence_event_ids = evidence_statement
-            .query_map([finding_id], |row| row.get(0))?
+        let evidence = evidence_statement
+            .query_map([finding_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        if evidence.is_empty()
+            || evidence.iter().any(|(event_id, event_process)| {
+                *event_id <= 0 || *event_process != Some(process_id)
+            })
+        {
+            return Err(DiffError::InvalidSession(
+                "finding evidence is invalid".to_owned(),
+            ));
+        }
+        let evidence_event_ids = evidence.into_iter().map(|(event_id, _)| event_id).collect();
         findings.push(FindingSnapshot {
             finding_id,
             rule_id,
@@ -437,7 +500,11 @@ fn compare_compatibility(
                 }
             }
             match (&before.info.privacy_profile, &after.info.privacy_profile) {
-                (Some(left), Some(right)) if left == right => {}
+                (Some(left), Some(right)) if left == right => {
+                    if !supported_privacy_profile(left) {
+                        issues.insert(CompatibilityIssue::UnsupportedPrivacyProfile);
+                    }
+                }
                 (Some(_), Some(_)) => {
                     issues.insert(CompatibilityIssue::PrivacyProfileMismatch);
                 }
@@ -473,6 +540,10 @@ fn compare_compatibility(
             }
         })
         .collect()
+}
+
+fn supported_privacy_profile(profile: &str) -> bool {
+    matches!(profile, "paths-v1") || profile == CURRENT_PRIVACY_PROFILE
 }
 
 fn compare_behavior(
@@ -706,16 +777,41 @@ fn category_from_coverage_name(value: &str) -> Option<BehaviorCategory> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use rusqlite::Connection;
 
     use crate::behavior::{
         BehaviorCategory, BehaviorFact, BehaviorKey, BehaviorSet, BehaviorValue,
     };
     use crate::findings::Severity;
+    use crate::privacy::CURRENT_PRIVACY_PROFILE;
+    use crate::storage::{SessionOutcome, SessionStore};
 
     use super::{
-        compare, ChangeStatus, CompatibilityIssue, CoverageSnapshot, FindingSnapshot, SessionInfo,
-        SessionSnapshot,
+        compare, ChangeStatus, CompatibilityIssue, CoverageSnapshot, DiffError, FindingSnapshot,
+        SessionInfo, SessionSnapshot,
     };
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!("execwake-diff-{}-{nonce}", std::process::id())))
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn fact(path: &str, operations: &[&str], event_id: i64) -> BehaviorFact {
         BehaviorFact {
@@ -756,7 +852,7 @@ mod tests {
                 id: "session".to_owned(),
                 schema_version: crate::session::CURRENT_SCHEMA_VERSION,
                 backend: Some(backend.to_owned()),
-                privacy_profile: Some("paths-v1".to_owned()),
+                privacy_profile: Some(CURRENT_PRIVACY_PROFILE.to_owned()),
                 command_name: "npm".to_owned(),
             },
             coverage,
@@ -861,6 +957,172 @@ mod tests {
         assert_eq!(diff.behavior.len(), 1);
         assert_eq!(diff.behavior[0].status, ChangeStatus::Changed);
         assert_eq!(diff.behavior[0].key.subject(), "$HOME/.npmrc");
+    }
+
+    #[test]
+    fn rejects_invalid_persisted_identity_and_coverage() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let invalid_id = store
+            .begin("npm", 0)
+            .expect("the first session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the first session should finalize");
+        let connection =
+            Connection::open(invalid_id.database()).expect("the first session should open");
+        connection
+            .execute("UPDATE session SET id = 'not-a-session-id'", [])
+            .expect("the session id should be changed");
+        drop(connection);
+
+        assert!(matches!(
+            SessionSnapshot::load(invalid_id.database()),
+            Err(DiffError::InvalidSession(_))
+        ));
+
+        let invalid_coverage = store
+            .begin("npm", 0)
+            .expect("the second session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the second session should finalize");
+        let connection =
+            Connection::open(invalid_coverage.database()).expect("the second session should open");
+        connection
+            .execute_batch(
+                "PRAGMA ignore_check_constraints = ON;
+                 UPDATE coverage
+                 SET state = 'complete', lost_events = 2
+                 WHERE category = 'filesystem';",
+            )
+            .expect("the coverage should be changed");
+        drop(connection);
+
+        assert!(matches!(
+            SessionSnapshot::load(invalid_coverage.database()),
+            Err(DiffError::InvalidSession(_))
+        ));
+
+        let negative_loss = store
+            .begin("npm", 0)
+            .expect("the third session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the third session should finalize");
+        let connection =
+            Connection::open(negative_loss.database()).expect("the third session should open");
+        connection
+            .execute_batch(
+                "PRAGMA ignore_check_constraints = ON;
+                 UPDATE coverage
+                 SET state = 'partial', lost_events = -1
+                 WHERE category = 'filesystem';",
+            )
+            .expect("the lost event count should be changed");
+        drop(connection);
+
+        assert!(matches!(
+            SessionSnapshot::load(negative_loss.database()),
+            Err(DiffError::InvalidSession(_))
+        ));
+    }
+
+    #[test]
+    fn loads_older_schema_metadata_without_newer_columns() {
+        let directory = TestDirectory::new();
+        fs::create_dir_all(&directory.0).expect("the test directory should be created");
+        let database = directory.0.join("old.sqlite3");
+        let connection = Connection::open(&database).expect("the old session should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                     singleton INTEGER PRIMARY KEY,
+                     id TEXT NOT NULL,
+                     schema_version INTEGER NOT NULL,
+                     mode TEXT NOT NULL,
+                     state TEXT NOT NULL,
+                     finalized INTEGER NOT NULL,
+                     command_name TEXT NOT NULL,
+                     runner_pid INTEGER NOT NULL
+                 );
+                 CREATE TABLE coverage (
+                     category TEXT PRIMARY KEY,
+                     state TEXT NOT NULL,
+                     lost_events INTEGER NOT NULL
+                 );
+                 INSERT INTO session VALUES (
+                     1, '0123456789abcdef0123456789abcdef', 1, 'observe',
+                     'finalized', 1, 'npm', 100
+                 );
+                 INSERT INTO coverage VALUES
+                     ('processes', 'partial', 0),
+                     ('filesystem', 'unavailable', 0),
+                     ('network', 'unavailable', 0),
+                     ('environment', 'unavailable', 0);",
+            )
+            .expect("the old session should be created");
+        drop(connection);
+
+        let snapshot =
+            SessionSnapshot::load(&database).expect("the old metadata should remain readable");
+
+        assert_eq!(snapshot.info.schema_version, 1);
+        assert_eq!(snapshot.info.backend, None);
+        assert_eq!(snapshot.info.privacy_profile, None);
+        assert!(snapshot.behavior.facts.is_empty());
+        assert!(snapshot.findings.is_empty());
+
+        let diff = compare(snapshot.clone(), snapshot);
+        assert!(diff.compatibility.iter().all(|entry| {
+            !entry.comparable
+                && entry
+                    .issues
+                    .contains(&CompatibilityIssue::UnsupportedSchema)
+        }));
+    }
+
+    #[test]
+    fn rejects_an_unknown_privacy_profile_for_comparison() {
+        let coverage = CoverageSnapshot {
+            state: "complete".to_owned(),
+            lost_events: 0,
+        };
+        let mut before = snapshot("ptrace", coverage.clone(), Vec::new());
+        before.info.privacy_profile = Some("paths-future".to_owned());
+        let mut after = snapshot("ptrace", coverage, Vec::new());
+        after.info.privacy_profile = Some("paths-future".to_owned());
+
+        let diff = compare(before, after);
+
+        assert!(diff.compatibility.iter().all(|entry| {
+            !entry.comparable
+                && entry
+                    .issues
+                    .contains(&CompatibilityIssue::UnsupportedPrivacyProfile)
+        }));
+    }
+
+    #[test]
+    fn privacy_profile_changes_make_categories_incomparable() {
+        let coverage = CoverageSnapshot {
+            state: "complete".to_owned(),
+            lost_events: 0,
+        };
+        let mut before = snapshot(
+            "ptrace",
+            coverage.clone(),
+            vec![fact("$WORKSPACE/only-before", &["read"], 1)],
+        );
+        before.info.privacy_profile = Some("paths-v1".to_owned());
+        let after = snapshot("ptrace", coverage, Vec::new());
+
+        let diff = compare(before, after);
+
+        assert!(diff.behavior.is_empty());
+        assert!(diff.compatibility.iter().all(|entry| {
+            !entry.comparable
+                && entry
+                    .issues
+                    .contains(&CompatibilityIssue::PrivacyProfileMismatch)
+        }));
     }
 
     #[test]

@@ -4,6 +4,7 @@
     BehaviorKey,
     BehaviorSide,
     DiffFinding,
+    DiffCoverage,
     DiffStatus,
     FindingChange,
     SemanticDiff,
@@ -48,6 +49,13 @@
 
   function issueLabel(issue: string): string {
     return issue.replaceAll('_', ' ');
+  }
+
+  function coverageLabel(coverage: DiffCoverage | null): string {
+    if (!coverage) return 'missing';
+    return coverage.lostEvents > 0
+      ? `${coverage.state}, ${coverage.lostEvents} lost`
+      : coverage.state;
   }
 
   function changedFinding(change: FindingChange): DiffFinding {
@@ -104,6 +112,7 @@
       <article class:incomparable={!entry.comparable}>
         <strong>{entry.category}</strong>
         <span>{entry.comparable ? 'comparable' : entry.issues.map(issueLabel).join(', ')}</span>
+        <small>before {coverageLabel(entry.before)} · after {coverageLabel(entry.after)}</small>
       </article>
     {/each}
   </div>

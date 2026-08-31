@@ -1,7 +1,9 @@
 use std::net::Ipv6Addr;
 use std::path::{Component, Path, PathBuf};
 
-pub const CURRENT_PRIVACY_PROFILE: &str = "paths-v1";
+use crate::sensitive_path;
+
+pub const CURRENT_PRIVACY_PROFILE: &str = "paths-v2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathRoots {
@@ -21,6 +23,17 @@ impl PathRoots {
 
     pub fn normalize(&self, path: &Path) -> String {
         let path = normalize_lexically(path);
+
+        if let Some(home_path) = self
+            .home
+            .as_deref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .map(|suffix| render_normalized_path("$HOME", suffix))
+            .filter(|path| sensitive_path::classify(path).is_some())
+        {
+            return home_path;
+        }
+
         let roots = [
             ("$WORKSPACE", self.workspace.as_deref()),
             ("$TMP", self.temp.as_deref()),
@@ -133,11 +146,12 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 }
 
 fn render_normalized_path(label: &str, suffix: &Path) -> String {
-    if suffix.as_os_str().is_empty() {
-        label.to_owned()
-    } else {
-        format!("{label}/{}", suffix.to_string_lossy())
+    let mut rendered = label.to_owned();
+    for component in suffix.components() {
+        rendered.push('/');
+        rendered.push_str(&component.as_os_str().to_string_lossy());
     }
+    rendered
 }
 
 #[cfg(test)]
@@ -161,6 +175,24 @@ mod tests {
         assert_eq!(
             roots.normalize(Path::new("/Users/example/.ssh/config")),
             "$HOME/.ssh/config"
+        );
+    }
+
+    #[test]
+    fn sensitive_home_paths_keep_their_home_identity_inside_a_workspace() {
+        let roots = PathRoots::new(
+            Some(PathBuf::from("/Users/example")),
+            Some(PathBuf::from("/Users/example")),
+            None,
+        );
+
+        assert_eq!(
+            roots.normalize(Path::new("/Users/example/.ssh/id_ed25519")),
+            "$HOME/.ssh/id_ed25519"
+        );
+        assert_eq!(
+            roots.normalize(Path::new("/Users/example/project/package.json")),
+            "$WORKSPACE/project/package.json"
         );
     }
 

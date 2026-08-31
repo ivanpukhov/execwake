@@ -955,6 +955,7 @@ mod tests {
     use crate::collector::{
         CollectorEvent, CollectorSink, EnvironmentVariableRecord, ProcessIdentity, ProcessRecord,
     };
+    use crate::privacy::CURRENT_PRIVACY_PROFILE;
     use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage};
 
     use super::{SessionId, SessionOutcome, SessionStore};
@@ -1310,7 +1311,7 @@ mod tests {
                 (2, "$HOME/.ssh/id_ed25519".to_owned()),
             ]
         );
-        assert_eq!(privacy_profile, "paths-v1");
+        assert_eq!(privacy_profile, CURRENT_PRIVACY_PROFILE);
     }
 
     #[cfg(unix)]

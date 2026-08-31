@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use crate::collector::ProcessIdentity;
 use crate::privacy::is_valid_environment_name;
+use crate::sensitive_path::{classify, SensitivePathClass};
 use crate::session::EvidenceKind;
 
 const CREDENTIAL_PATH_RULE: &str = "EW-FS-001";
@@ -162,39 +163,13 @@ fn record_match(
 }
 
 fn sensitive_path_rule(path: &str) -> Option<(&'static str, Severity)> {
-    if credential_path(path) {
-        Some((CREDENTIAL_PATH_RULE, Severity::High))
-    } else if private_configuration_path(path) {
-        Some((PRIVATE_CONFIG_RULE, Severity::Medium))
-    } else {
-        None
+    match classify(path) {
+        Some(SensitivePathClass::Credential) => Some((CREDENTIAL_PATH_RULE, Severity::High)),
+        Some(SensitivePathClass::PrivateConfiguration) => {
+            Some((PRIVATE_CONFIG_RULE, Severity::Medium))
+        }
+        None => None,
     }
-}
-
-fn credential_path(path: &str) -> bool {
-    matches!(
-        path,
-        "$HOME/.aws/credentials"
-            | "$HOME/.docker/config.json"
-            | "$HOME/.kube/config"
-            | "$HOME/.netrc"
-            | "$HOME/.npmrc"
-            | "$HOME/.config/gh/hosts.yml"
-            | "$HOME/.config/gcloud/credentials.db"
-    ) || path.strip_prefix("$HOME/.ssh/").map_or(false, |name| {
-        name.starts_with("id_") && !name.ends_with(".pub")
-    })
-}
-
-fn private_configuration_path(path: &str) -> bool {
-    matches!(
-        path,
-        "$HOME/.gitconfig"
-            | "$HOME/.ssh"
-            | "$HOME/.ssh/authorized_keys"
-            | "$HOME/.ssh/config"
-            | "$HOME/.ssh/known_hosts"
-    )
 }
 
 fn sensitive_environment_name(name: &str) -> bool {
@@ -216,12 +191,14 @@ fn sensitive_environment_name(name: &str) -> bool {
 }
 
 fn public_listener(target: &str) -> bool {
-    target
-        .split_once(' ')
-        .map_or(false, |(transport, endpoint)| {
-            transport == "tcp"
-                && (endpoint.starts_with("0.0.0.0:") || endpoint.starts_with("[::]:"))
-        })
+    let Some((transport, endpoint)) = target.split_once(' ') else {
+        return false;
+    };
+    let Some((host, port)) = endpoint.rsplit_once(':') else {
+        return false;
+    };
+
+    transport == "tcp" && matches!(host, "0.0.0.0" | "[::]") && port.parse::<u16>().is_ok()
 }
 
 #[cfg(test)]
@@ -284,6 +261,8 @@ mod tests {
         let findings = evaluate([
             event(1, "network", "listen", "tcp 127.0.0.1:7319"),
             event(2, "network", "listen", "tcp 0.0.0.0:8080"),
+            event(3, "network", "listen", "tcp 0.0.0.0:invalid"),
+            event(4, "network", "listen", "tcp 0.0.0.0:80 extra"),
         ]);
 
         assert_eq!(findings.len(), 1);

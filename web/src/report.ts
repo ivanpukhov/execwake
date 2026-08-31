@@ -104,6 +104,7 @@ export type CompatibilityIssue =
   | 'backend_mismatch'
   | 'privacy_profile_unavailable'
   | 'privacy_profile_mismatch'
+  | 'unsupported_privacy_profile'
   | 'coverage_unavailable'
   | 'coverage_mismatch'
   | 'lost_events';

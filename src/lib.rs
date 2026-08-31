@@ -6,5 +6,6 @@ pub mod privacy;
 pub mod report;
 pub mod runner;
 pub mod semantic_diff;
+mod sensitive_path;
 pub mod session;
 pub mod storage;

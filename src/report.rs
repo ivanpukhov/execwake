@@ -55,21 +55,21 @@ struct AppState {
 #[derive(Clone)]
 enum ReportSource {
     Session(SessionPaths),
-    Diff { before: PathBuf, after: PathBuf },
+    Diff(Box<crate::semantic_diff::SemanticDiff>),
 }
 
 impl ReportSource {
     fn route_id(&self) -> &str {
         match self {
             Self::Session(session) => session.id().as_str(),
-            Self::Diff { .. } => "diff",
+            Self::Diff(_) => "diff",
         }
     }
 
     fn location(&self) -> String {
         match self {
             Self::Session(session) => format!("/session/{}", session.id().as_str()),
-            Self::Diff { .. } => "/diff".to_owned(),
+            Self::Diff(_) => "/diff".to_owned(),
         }
     }
 }
@@ -88,8 +88,8 @@ impl ReportServer {
     }
 
     pub fn bind_diff(before: PathBuf, after: PathBuf, idle_timeout: Duration) -> io::Result<Self> {
-        crate::semantic_diff::compare_paths(&before, &after).map_err(server_error)?;
-        Self::bind_source(ReportSource::Diff { before, after }, idle_timeout)
+        let report = crate::semantic_diff::compare_paths(&before, &after).map_err(server_error)?;
+        Self::bind_source(ReportSource::Diff(Box::new(report)), idle_timeout)
     }
 
     fn bind_source(source: ReportSource, idle_timeout: Duration) -> io::Result<Self> {
@@ -210,7 +210,7 @@ async fn index(State(state): State<AppState>, Path(id): Path<String>) -> Respons
 
 async fn diff_index(State(state): State<AppState>) -> Response {
     match state.source.as_ref() {
-        ReportSource::Diff { .. } => Html(REPORT_SHELL).into_response(),
+        ReportSource::Diff(_) => Html(REPORT_SHELL).into_response(),
         ReportSource::Session(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -241,16 +241,11 @@ async fn session_api(State(state): State<AppState>, Path(id): Path<String>) -> R
 }
 
 async fn diff_api(State(state): State<AppState>) -> Response {
-    let (before, after) = match state.source.as_ref() {
-        ReportSource::Diff { before, after } => (before.clone(), after.clone()),
+    let report = match state.source.as_ref() {
+        ReportSource::Diff(report) => report.as_ref().clone(),
         ReportSource::Session(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-    match tokio::task::spawn_blocking(move || crate::semantic_diff::compare_paths(&before, &after))
-        .await
-    {
-        Ok(Ok(report)) => Json(report).into_response(),
-        Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+    Json(report).into_response()
 }
 
 async fn validate_request<B>(
@@ -386,6 +381,7 @@ fn validate_session(session: &SessionPaths) -> io::Result<()> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(server_error)?;
+    configure_read_only_connection(&connection).map_err(server_error)?;
     let (id, state, finalized) = connection
         .query_row(
             "SELECT id, state, finalized FROM session WHERE singleton = 1",
@@ -492,6 +488,7 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    configure_read_only_connection(&connection)?;
     let mut report = connection.query_row(
         "SELECT id, schema_version, mode, state, finalized, command_name,
                 argument_count, started_at_ms, ended_at_ms, exit_code,
@@ -525,6 +522,14 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
     report.events = query_events(&connection)?;
     report.findings = query_findings(&connection)?;
     Ok(report)
+}
+
+fn configure_read_only_connection(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        "PRAGMA query_only = ON;
+         PRAGMA trusted_schema = OFF;
+         PRAGMA foreign_keys = ON;",
+    )
 }
 
 fn query_coverage(connection: &Connection) -> rusqlite::Result<Vec<CoverageReport>> {
@@ -766,6 +771,8 @@ mod tests {
             Duration::from_millis(200),
         )
         .expect("the diff server should bind");
+        fs::remove_file(before.database()).expect("the first session file should be removable");
+        fs::remove_file(after.database()).expect("the second session file should be removable");
         let address = server.address();
         let open_path = server
             .open_url()
