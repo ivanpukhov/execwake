@@ -11,7 +11,7 @@ environment coverage.
 
 ## Status
 
-ExecWake 0.1.0 is a Linux alpha. The collector records:
+ExecWake 0.1.0-rc.1 is a Linux alpha. The collector records:
 
 - process fork, clone, exec, exit, exit code, and terminating signal;
 - file operations and verified final state deltas;
@@ -140,7 +140,7 @@ On Linux, build a versioned archive and SHA-256 file with:
 
 ```sh
 scripts/package-linux.sh
-sha256sum --check dist/execwake-v0.1.0-*-unknown-linux-gnu.tar.gz.sha256
+(cd dist && sha256sum --check *.tar.gz.sha256)
 ```
 
 The packaging script uses the current architecture and refuses to overwrite an
