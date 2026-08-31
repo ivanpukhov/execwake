@@ -39,3 +39,25 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
+
+  collector-conformance:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.67.0
+      - name: Mount tracing filesystems
+        run: |
+          mountpoint -q /sys/kernel/debug || sudo mount -t debugfs debugfs /sys/kernel/debug
+          sudo mkdir -p /sys/kernel/debug/tracing
+          mountpoint -q /sys/kernel/debug/tracing || sudo mount -t tracefs tracefs /sys/kernel/debug/tracing
+      - name: Test ptrace and eBPF collectors
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "HOME=$HOME" \
+            "RUSTUP_HOME=$(rustup show home)" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            scripts/test-linux-collectors.sh
