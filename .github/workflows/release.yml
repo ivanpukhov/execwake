@@ -8,17 +8,64 @@ on:
 
 jobs:
   package:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            image: rust@sha256:80b9716cb59872769d49f5185a346e5f859081b02338e4aaaa04a8cc7fb884ae
+          - platform: linux/arm64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            image: rust@sha256:7e688b767f8cfc5296f5f73ab17982deeaaeb728f0c719ea9bb974544482d71a
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.67.0
-      - run: scripts/package-linux.sh
+      - name: Build Linux package
+        id: package
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+          RUST_IMAGE: ${{ matrix.image }}
+        run: |
+          source_date_epoch=$(git log -1 --format=%ct)
+          version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          archive="dist/execwake-v${version}-${TARGET}.tar.gz"
+          echo "archive=$archive" >>"$GITHUB_OUTPUT"
+          mkdir -p dist
+          docker volume create execwake-release-target >/dev/null
+          docker run --rm \
+            --platform "$PLATFORM" \
+            -e "EXECWAKE_TARGET=$TARGET" \
+            -e "SOURCE_DATE_EPOCH=$source_date_epoch" \
+            -e CARGO_BUILD_JOBS=2 \
+            -e CARGO_TARGET_DIR=/target \
+            -v "$PWD:/work:ro" \
+            -v "$PWD/dist:/work/dist" \
+            -v execwake-release-target:/target \
+            -w /work \
+            "$RUST_IMAGE" \
+            scripts/package-linux.sh
+      - name: Verify Linux package
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+          RUST_IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            --platform "$PLATFORM" \
+            -v "$PWD:/work:ro" \
+            -w /work \
+            "$RUST_IMAGE" \
+            scripts/verify-linux-package.sh \
+            "${{ steps.package.outputs.archive }}" \
+            "$TARGET"
       - uses: actions/upload-artifact@v4
         with:
-          name: execwake-linux-x86_64
+          name: execwake-${{ matrix.target }}
           path: |
-            dist/*.tar.gz
-            dist/*.sha256
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
           if-no-files-found: error
