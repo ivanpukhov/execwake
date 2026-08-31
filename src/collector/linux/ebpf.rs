@@ -125,33 +125,39 @@ impl Collector for EbpfCollector {
         sink: &mut dyn CollectorSink,
     ) -> io::Result<ExitStatus> {
         let namespace_root_pid = child.id();
-        let kernel_root_pid = self.scope.process_ids()?.into_iter().min();
         let root_start_time_ticks =
             super::process_start_time(namespace_root_pid as libc::pid_t).ok();
         let clock = normalize::CaptureClock::now()?;
-        let run = self.probe.start()?;
-        let result = child.wait();
-        let output = self.probe.stop(run)?;
-        let status = result?;
-        let root_pid = output
-            .events
-            .iter()
-            .filter(|event| event.kind == protocol::EventKind::ProcessExec)
-            .min_by_key(|event| event.monotonic_ns)
-            .map(|event| event.tgid)
-            .or(kernel_root_pid)
-            .unwrap_or(namespace_root_pid);
-        sink.set_backend(self.backend_name()).map_err(sink_error)?;
-        sink.set_coverage(ebpf_coverage(output.lost_events))
-            .map_err(sink_error)?;
         let mut normalizer = normalize::Normalizer::new(
-            root_pid,
+            namespace_root_pid,
             self.root_executable.clone(),
             self.root_cwd.clone(),
             root_start_time_ticks,
             self.ignored_paths.clone(),
             clock,
         );
+        let run = match self.probe.start() {
+            Ok(run) => run,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        if let Err(error) = normalizer
+            .start(sink)
+            .and_then(|()| sink.set_backend(self.backend_name()).map_err(sink_error))
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = self.probe.stop(run);
+            return Err(error);
+        }
+        let result = child.wait();
+        let output = self.probe.stop(run)?;
+        let status = result?;
+        sink.set_coverage(ebpf_coverage(output.lost_events))
+            .map_err(sink_error)?;
         normalizer.replay(output.events, status, sink)?;
         Ok(status)
     }
@@ -243,17 +249,6 @@ impl CgroupScope {
             });
         }
         Ok(())
-    }
-
-    fn process_ids(&self) -> io::Result<Vec<u32>> {
-        fs::read_to_string(self.path.join("cgroup.procs"))?
-            .lines()
-            .map(|line| {
-                line.parse::<u32>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid cgroup process id")
-                })
-            })
-            .collect()
     }
 }
 

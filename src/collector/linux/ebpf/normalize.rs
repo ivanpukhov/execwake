@@ -149,7 +149,6 @@ impl Normalizer {
     ) -> io::Result<()> {
         events.sort_by(event_order);
         let clone_plan = plan_clones(&events);
-        self.register_root(sink)?;
 
         for event in &events {
             match event.kind {
@@ -163,6 +162,10 @@ impl Normalizer {
         self.finish_remaining_processes(sink)?;
         self.finish_root(root_status, sink)?;
         self.record_file_states(sink)
+    }
+
+    pub fn start(&mut self, sink: &mut dyn CollectorSink) -> io::Result<()> {
+        self.register_root(sink)
     }
 
     fn register_root(&mut self, sink: &mut dyn CollectorSink) -> io::Result<()> {
@@ -241,23 +244,19 @@ impl Normalizer {
     fn observe_exec(&mut self, event: &Event, sink: &mut dyn CollectorSink) -> io::Result<()> {
         let process_id = event.tgid;
         let former = event.arguments[1] as u32;
+        if !self.processes.contains_key(&process_id)
+            && self.rekey_process(self.root_pid, process_id)
+        {
+            self.root_pid = process_id;
+        }
         if !self.processes.contains_key(&process_id) {
             for alias in [event.arguments[0] as u32, former] {
                 if alias == process_id {
                     continue;
                 }
-                let Some(process) = self.processes.remove(&alias) else {
-                    continue;
-                };
-                self.processes.insert(process_id, process);
-                self.threads.remove(&alias);
-                for owner in self.threads.values_mut() {
-                    if *owner == alias {
-                        *owner = process_id;
-                    }
+                if self.rekey_process(alias, process_id) {
+                    break;
                 }
-                self.threads.insert(process_id, process_id);
-                break;
             }
         }
         if former != process_id {
@@ -1363,6 +1362,21 @@ impl Normalizer {
         let owner = self.threads.get(&parent).copied().unwrap_or(parent);
         self.threads.insert(thread, owner);
         Ok(())
+    }
+
+    fn rekey_process(&mut self, alias: u32, process_id: u32) -> bool {
+        let Some(process) = self.processes.remove(&alias) else {
+            return false;
+        };
+        self.processes.insert(process_id, process);
+        self.threads.remove(&alias);
+        for owner in self.threads.values_mut() {
+            if *owner == alias {
+                *owner = process_id;
+            }
+        }
+        self.threads.insert(process_id, process_id);
+        true
     }
 
     fn register_orphan(
