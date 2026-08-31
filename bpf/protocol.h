@@ -16,9 +16,30 @@ enum execwake_event_kind {
     EXECWAKE_EVENT_SYSCALL = 4,
 };
 
+enum execwake_syscall_operation {
+    EXECWAKE_SYSCALL_SOCKET = 1,
+    EXECWAKE_SYSCALL_BIND = 2,
+    EXECWAKE_SYSCALL_CONNECT = 3,
+    EXECWAKE_SYSCALL_LISTEN = 4,
+    EXECWAKE_SYSCALL_ACCEPT = 5,
+    EXECWAKE_SYSCALL_CLOSE = 6,
+    EXECWAKE_SYSCALL_DUP = 7,
+    EXECWAKE_SYSCALL_FCNTL = 8,
+    EXECWAKE_SYSCALL_SENDTO = 9,
+    EXECWAKE_SYSCALL_RECVFROM = 10,
+    EXECWAKE_SYSCALL_WRITE = 11,
+    EXECWAKE_SYSCALL_READ = 12,
+};
+
 enum {
     EXECWAKE_PROTOCOL_VERSION = 1,
     EXECWAKE_EVENT_DATA_BYTES = 384,
+    EXECWAKE_SOCKET_ADDRESS_BYTES = 128,
+    EXECWAKE_SOCKET_PAYLOAD_BYTES = 248,
+    EXECWAKE_SYSCALL_OPERATION_MASK = 0xffff,
+    EXECWAKE_DATA_HAS_ADDRESS = 1 << 16,
+    EXECWAKE_DATA_HAS_PAYLOAD = 1 << 17,
+    EXECWAKE_DATA_TRUNCATED = 1 << 18,
 };
 
 #define EXECWAKE_RESULT_UNKNOWN (-9223372036854775807LL - 1)
@@ -39,6 +60,13 @@ struct execwake_event_header {
 struct execwake_event {
     struct execwake_event_header header;
     __u8 data[EXECWAKE_EVENT_DATA_BYTES];
+};
+
+struct execwake_socket_data {
+    __u32 address_length;
+    __u32 payload_length;
+    __u8 address[EXECWAKE_SOCKET_ADDRESS_BYTES];
+    __u8 payload[EXECWAKE_SOCKET_PAYLOAD_BYTES];
 };
 
 _Static_assert(sizeof(struct execwake_event_header) == 88,

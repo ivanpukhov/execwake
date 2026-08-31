@@ -15,7 +15,7 @@ use std::time::Duration;
 mod protocol;
 
 use aya::maps::perf::PerfEventArrayBuffer;
-use aya::maps::{Array, MapRefMut, PerfEventArray};
+use aya::maps::{Array, HashMap as BpfHashMap, MapRefMut, PerfEventArray};
 use aya::programs::TracePoint;
 use aya::util::online_cpus;
 use aya::Bpf;
@@ -234,31 +234,36 @@ impl EbpfProbe {
         target.set(0, cgroup_id, 0).map_err(other_error)?;
         drop(target);
 
+        let mut syscall_operations = BpfHashMap::<_, i64, u32>::try_from(
+            bpf.map_mut("SYSCALL_OPERATIONS").map_err(other_error)?,
+        )
+        .map_err(other_error)?;
+        for (number, operation) in network_syscall_operations() {
+            syscall_operations
+                .insert(number, operation as u32, 0)
+                .map_err(other_error)?;
+        }
+        drop(syscall_operations);
+
         for event in [
             "sched_process_fork",
             "sched_process_exec",
             "sched_process_exit",
         ] {
-            let program: &mut TracePoint = bpf
-                .program_mut(event)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "eBPF program is missing")
-                })?
-                .try_into()
-                .map_err(other_error)?;
-            program.load().map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("loading {event} eBPF program: {error}"),
-                )
-            })?;
-            program.attach("sched", event).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("attaching {event} eBPF program: {error}"),
-                )
-            })?;
+            attach_tracepoint(&mut bpf, event, "sched", event)?;
         }
+        attach_tracepoint(
+            &mut bpf,
+            "raw_syscalls_sys_enter",
+            "raw_syscalls",
+            "sys_enter",
+        )?;
+        attach_tracepoint(
+            &mut bpf,
+            "raw_syscalls_sys_exit",
+            "raw_syscalls",
+            "sys_exit",
+        )?;
 
         let mut event_array = PerfEventArray::try_from(bpf.map_mut("EVENTS").map_err(other_error)?)
             .map_err(other_error)?;
@@ -283,6 +288,59 @@ impl EbpfProbe {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "eBPF probe already started"))?;
         Ok(ProbeRun::start(buffers))
     }
+}
+
+fn attach_tracepoint(
+    bpf: &mut Bpf,
+    program_name: &str,
+    category: &str,
+    event: &str,
+) -> io::Result<()> {
+    let program: &mut TracePoint = bpf
+        .program_mut(program_name)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "eBPF program is missing"))?
+        .try_into()
+        .map_err(other_error)?;
+    program.load().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("loading {program_name} eBPF program: {error}"),
+        )
+    })?;
+    program.attach(category, event).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("attaching {program_name} eBPF program: {error}"),
+        )
+    })?;
+    Ok(())
+}
+
+fn network_syscall_operations() -> Vec<(i64, protocol::SyscallOperation)> {
+    use protocol::SyscallOperation;
+
+    let mut operations = Vec::with_capacity(15);
+    operations.extend([
+        (libc::SYS_socket, SyscallOperation::Socket),
+        (libc::SYS_bind, SyscallOperation::Bind),
+        (libc::SYS_connect, SyscallOperation::Connect),
+        (libc::SYS_listen, SyscallOperation::Listen),
+        (libc::SYS_accept4, SyscallOperation::Accept),
+        (libc::SYS_close, SyscallOperation::Close),
+        (libc::SYS_dup, SyscallOperation::Duplicate),
+        (libc::SYS_dup3, SyscallOperation::Duplicate),
+        (libc::SYS_fcntl, SyscallOperation::Fcntl),
+        (libc::SYS_sendto, SyscallOperation::SendTo),
+        (libc::SYS_recvfrom, SyscallOperation::ReceiveFrom),
+        (libc::SYS_write, SyscallOperation::Write),
+        (libc::SYS_read, SyscallOperation::Read),
+    ]);
+    #[cfg(target_arch = "x86_64")]
+    operations.extend([
+        (libc::SYS_accept, SyscallOperation::Accept),
+        (libc::SYS_dup2, SyscallOperation::Duplicate),
+    ]);
+    operations
 }
 
 struct ProbeRun {
@@ -338,7 +396,9 @@ fn drain_buffers(
                 *lost = lost.saturating_add(events.lost as u64);
                 for event in output.iter_mut().take(events.read) {
                     match protocol::decode(event) {
-                        Ok(event) if captured.len() < MAX_EBPF_QUEUED_EVENTS => {
+                        Ok(event)
+                            if valid_event(&event) && captured.len() < MAX_EBPF_QUEUED_EVENTS =>
+                        {
                             captured.push(event);
                         }
                         Ok(_) | Err(_) => {
@@ -355,6 +415,11 @@ fn drain_buffers(
     }
 }
 
+fn valid_event(event: &protocol::Event) -> bool {
+    event.kind != protocol::EventKind::Syscall
+        || event.syscall_operation().is_some() && event.socket_data().is_ok()
+}
+
 fn other_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::new(io::ErrorKind::Other, error)
 }
@@ -365,11 +430,14 @@ fn sink_error(error: crate::collector::SinkError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::net::TcpListener;
     use std::process::Command;
+    use std::thread;
 
     use crate::session::CoverageState;
 
-    use super::protocol::EventKind;
+    use super::protocol::{EventKind, SyscallOperation};
     use super::{coverage_after_loss, CgroupScope, EbpfProbe};
 
     #[test]
@@ -418,5 +486,60 @@ mod tests {
                 output.events
             );
         }
+    }
+
+    #[test]
+    fn captures_network_syscalls_and_payloads() {
+        if std::env::var_os("EXECWAKE_REQUIRE_EBPF").is_none() {
+            return;
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("the listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("the listener should have an address")
+            .port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the connection should arrive");
+            let mut payload = [0_u8; 4];
+            stream
+                .read_exact(&mut payload)
+                .expect("the payload should arrive");
+            assert_eq!(&payload, b"ping");
+        });
+
+        let scope = CgroupScope::create().expect("the test cgroup should be available");
+        let mut probe = EbpfProbe::load(scope.id()).expect("the eBPF probe should load");
+        let mut command = Command::new("/bin/bash");
+        command.args(["-c", &format!("printf ping > /dev/tcp/127.0.0.1/{port}")]);
+        scope
+            .configure(&mut command)
+            .expect("the command should enter the test cgroup");
+
+        let run = probe.start().expect("the event reader should start");
+        let status = command.status().expect("the fixture command should run");
+        let output = run.stop().expect("the event reader should stop");
+        server.join().expect("the server should finish");
+
+        assert!(status.success());
+        assert_eq!(output.lost_events, 0);
+        assert!(output.events.iter().any(|event| {
+            event.syscall_operation() == Some(SyscallOperation::Connect)
+                && event
+                    .socket_data()
+                    .ok()
+                    .flatten()
+                    .map(|data| !data.address.is_empty())
+                    .unwrap_or(false)
+        }));
+        assert!(output.events.iter().any(|event| {
+            event.syscall_operation() == Some(SyscallOperation::Write)
+                && event
+                    .socket_data()
+                    .ok()
+                    .flatten()
+                    .map(|data| data.payload == b"ping")
+                    .unwrap_or(false)
+        }));
     }
 }

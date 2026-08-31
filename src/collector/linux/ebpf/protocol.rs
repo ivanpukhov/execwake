@@ -4,6 +4,12 @@ pub const VERSION: u16 = 1;
 pub const HEADER_BYTES: usize = 88;
 pub const MAX_DATA_BYTES: usize = 384;
 pub const MAX_EVENT_BYTES: usize = HEADER_BYTES + MAX_DATA_BYTES;
+const SOCKET_ADDRESS_BYTES: usize = 128;
+const SOCKET_PAYLOAD_OFFSET: usize = 8 + SOCKET_ADDRESS_BYTES;
+const SYSCALL_OPERATION_MASK: u32 = 0xffff;
+const DATA_HAS_ADDRESS: u32 = 1 << 16;
+const DATA_HAS_PAYLOAD: u32 = 1 << 17;
+const DATA_TRUNCATED: u32 = 1 << 18;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -13,6 +19,50 @@ pub enum EventKind {
     ProcessExec = 2,
     ProcessExit = 3,
     Syscall = 4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum SyscallOperation {
+    Socket = 1,
+    Bind = 2,
+    Connect = 3,
+    Listen = 4,
+    Accept = 5,
+    Close = 6,
+    Duplicate = 7,
+    Fcntl = 8,
+    SendTo = 9,
+    ReceiveFrom = 10,
+    Write = 11,
+    Read = 12,
+}
+
+impl SyscallOperation {
+    fn parse(value: u32) -> Option<Self> {
+        match value {
+            1 => Some(Self::Socket),
+            2 => Some(Self::Bind),
+            3 => Some(Self::Connect),
+            4 => Some(Self::Listen),
+            5 => Some(Self::Accept),
+            6 => Some(Self::Close),
+            7 => Some(Self::Duplicate),
+            8 => Some(Self::Fcntl),
+            9 => Some(Self::SendTo),
+            10 => Some(Self::ReceiveFrom),
+            11 => Some(Self::Write),
+            12 => Some(Self::Read),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SocketData {
+    pub address: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub truncated: bool,
 }
 
 impl EventKind {
@@ -38,6 +88,41 @@ pub struct Event {
     pub arguments: [u64; 6],
     pub flags: u32,
     pub data: Vec<u8>,
+}
+
+impl Event {
+    pub fn syscall_operation(&self) -> Option<SyscallOperation> {
+        (self.kind == EventKind::Syscall)
+            .then(|| SyscallOperation::parse(self.flags & SYSCALL_OPERATION_MASK))
+            .flatten()
+    }
+
+    pub fn socket_data(&self) -> io::Result<Option<SocketData>> {
+        let has_address = self.flags & DATA_HAS_ADDRESS != 0;
+        let has_payload = self.flags & DATA_HAS_PAYLOAD != 0;
+        if !has_address && !has_payload {
+            return Ok(None);
+        }
+        if self.kind != EventKind::Syscall || self.data.len() != MAX_DATA_BYTES {
+            return Err(invalid_event("eBPF socket data is invalid"));
+        }
+
+        let address_length = read_u32(&self.data, 0)? as usize;
+        let payload_length = read_u32(&self.data, 4)? as usize;
+        if address_length > SOCKET_ADDRESS_BYTES
+            || payload_length > MAX_DATA_BYTES - SOCKET_PAYLOAD_OFFSET
+            || (!has_address && address_length != 0)
+            || (!has_payload && payload_length != 0)
+        {
+            return Err(invalid_event("eBPF socket data length is invalid"));
+        }
+        Ok(Some(SocketData {
+            address: self.data[8..8 + address_length].to_vec(),
+            payload: self.data[SOCKET_PAYLOAD_OFFSET..SOCKET_PAYLOAD_OFFSET + payload_length]
+                .to_vec(),
+            truncated: self.flags & DATA_TRUNCATED != 0,
+        }))
+    }
 }
 
 pub fn decode(bytes: &[u8]) -> io::Result<Event> {
@@ -112,7 +197,10 @@ fn invalid_event(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, EventKind, HEADER_BYTES, MAX_DATA_BYTES, VERSION};
+    use super::{
+        decode, EventKind, SyscallOperation, DATA_HAS_ADDRESS, DATA_HAS_PAYLOAD, HEADER_BYTES,
+        MAX_DATA_BYTES, SOCKET_PAYLOAD_OFFSET, VERSION,
+    };
 
     #[test]
     fn decodes_a_bounded_little_endian_event() {
@@ -154,5 +242,33 @@ mod tests {
         bytes[4..8].copy_from_slice(&((HEADER_BYTES + MAX_DATA_BYTES + 1) as u32).to_le_bytes());
         bytes[80..84].copy_from_slice(&((MAX_DATA_BYTES + 1) as u32).to_le_bytes());
         assert!(decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn decodes_bounded_socket_data() {
+        let mut bytes = vec![0_u8; HEADER_BYTES + MAX_DATA_BYTES];
+        let event_length = bytes.len() as u32;
+        bytes[0..2].copy_from_slice(&VERSION.to_le_bytes());
+        bytes[2..4].copy_from_slice(&(EventKind::Syscall as u16).to_le_bytes());
+        bytes[4..8].copy_from_slice(&event_length.to_le_bytes());
+        bytes[80..84].copy_from_slice(&(MAX_DATA_BYTES as u32).to_le_bytes());
+        let flags = SyscallOperation::Connect as u32 | DATA_HAS_ADDRESS | DATA_HAS_PAYLOAD;
+        bytes[84..88].copy_from_slice(&flags.to_le_bytes());
+        bytes[88..92].copy_from_slice(&4_u32.to_le_bytes());
+        bytes[92..96].copy_from_slice(&3_u32.to_le_bytes());
+        bytes[96..100].copy_from_slice(b"addr");
+        let payload = HEADER_BYTES + SOCKET_PAYLOAD_OFFSET;
+        bytes[payload..payload + 3].copy_from_slice(b"dns");
+
+        let event = decode(&bytes).expect("the event should decode");
+        let data = event
+            .socket_data()
+            .expect("socket data should be valid")
+            .expect("socket data should be present");
+
+        assert_eq!(event.syscall_operation(), Some(SyscallOperation::Connect));
+        assert_eq!(data.address, b"addr");
+        assert_eq!(data.payload, b"dns");
+        assert!(!data.truncated);
     }
 }
