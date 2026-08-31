@@ -6,6 +6,8 @@ pub(crate) const MAX_IMPORTED_EVENTS: usize = 1_000_000;
 pub(crate) const MAX_IMPORTED_PROCESSES: usize = 100_000;
 pub(crate) const MAX_IMPORTED_FINDINGS: usize = 100_000;
 pub(crate) const MAX_DISPLAY_TEXT_BYTES: usize = 16 * 1024;
+pub(crate) const REPORT_EVENT_PAGE_SIZE: usize = 500;
+pub(crate) const REPORT_TIMELINE_EVENT_LIMIT: usize = 5_000;
 
 #[cfg(target_os = "linux")]
 pub(crate) const MAX_LIVE_PROCESSES: usize = 1_024;

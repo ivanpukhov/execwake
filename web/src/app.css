@@ -94,7 +94,7 @@ h2 { font-size: 16px; letter-spacing: -0.01em; }
 .event-table-head { position: sticky; top: 0; z-index: 1; min-width: 760px; height: 34px; color: #68766d; background: #eef2ef; font-size: 10px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
 .event-table-head span, .event-row span { padding: 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .event-spacer { position: relative; min-width: 760px; }
-.event-row { position: absolute; top: 0; right: 0; left: 0; height: 36px; border-bottom: 1px solid #edf0ee; color: #3c4740; font-size: 11px; }
+.event-row { position: absolute; top: 0; right: 0; left: 0; height: 30px; border-bottom: 1px solid #edf0ee; color: #3c4740; font-size: 11px; }
 .event-row:hover { background: #f6f8f6; }
 .event-time { color: #69766e; font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
 .event-target { font-family: ui-monospace, monospace; }

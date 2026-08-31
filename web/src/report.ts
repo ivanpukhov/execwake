@@ -50,8 +50,15 @@ export interface SessionReport {
   interruption: string | null;
   coverage: CoverageReport[];
   processes: ProcessReport[];
-  events: EventReport[];
+  eventCount: number;
+  timelineEvents: EventReport[];
   findings: FindingReport[];
+}
+
+export interface EventPage {
+  offset: number;
+  total: number;
+  events: EventReport[];
 }
 
 export type DiffStatus = 'NEW' | 'REMOVED' | 'CHANGED' | 'UNCHANGED';
@@ -150,6 +157,24 @@ export async function loadReport(): Promise<SessionReport> {
     throw new Error(`Report request failed (${response.status}).`);
   }
   return response.json() as Promise<SessionReport>;
+}
+
+export async function loadEventPage(
+  sessionId: string,
+  offset: number,
+  category: string,
+  search: string
+): Promise<EventPage> {
+  const query = new URLSearchParams({ offset: String(offset) });
+  if (category !== 'all') query.set('category', category);
+  if (search.length > 0) query.set('search', search);
+  const response = await fetch(
+    `/api/session/${encodeURIComponent(sessionId)}/events?${query.toString()}`
+  );
+  if (!response.ok) {
+    throw new Error(`Event request failed (${response.status}).`);
+  }
+  return response.json() as Promise<EventPage>;
 }
 
 export async function loadDiff(): Promise<SemanticDiff> {

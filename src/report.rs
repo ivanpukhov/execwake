@@ -139,6 +139,7 @@ impl ReportServer {
         let protected = Router::new()
             .route("/session/:id", get(index))
             .route("/api/session/:id", get(session_api))
+            .route("/api/session/:id/events", get(session_events_api))
             .route("/diff", get(diff_index))
             .route("/api/diff", get(diff_api))
             .route("/assets/app.js", get(app_javascript))
@@ -239,6 +240,23 @@ async fn session_api(State(state): State<AppState>, Path(id): Path<String>) -> R
     };
     match tokio::task::spawn_blocking(move || load_report(database)).await {
         Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn session_events_api(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<EventQuery>,
+) -> Response {
+    let database = match state.source.as_ref() {
+        ReportSource::Session(session) if id == session.id().as_str() => {
+            session.database().to_owned()
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match tokio::task::spawn_blocking(move || load_event_page(database, query)).await {
+        Ok(Ok(page)) => Json(page).into_response(),
         Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -447,7 +465,8 @@ struct SessionReport {
     interruption: Option<String>,
     coverage: Vec<CoverageReport>,
     processes: Vec<ProcessReport>,
-    events: Vec<EventReport>,
+    event_count: i64,
+    timeline_events: Vec<EventReport>,
     findings: Vec<FindingReport>,
 }
 
@@ -482,6 +501,23 @@ struct EventReport {
     process_id: Option<i64>,
     occurred_at_ms: i64,
     evidence: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EventQuery {
+    #[serde(default)]
+    offset: usize,
+    category: Option<String>,
+    search: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EventPage {
+    offset: usize,
+    total: i64,
+    events: Vec<EventReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -528,7 +564,8 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
                     .map(|value| sanitize(&value)),
                 coverage: Vec::new(),
                 processes: Vec::new(),
-                events: Vec::new(),
+                event_count: 0,
+                timeline_events: Vec::new(),
                 findings: Vec::new(),
             })
         },
@@ -536,7 +573,8 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
 
     report.coverage = query_coverage(&connection)?;
     report.processes = query_processes(&connection)?;
-    report.events = query_events(&connection)?;
+    report.event_count = query_event_count(&connection)?;
+    report.timeline_events = query_timeline_events(&connection, report.event_count)?;
     report.findings = query_findings(&connection)?;
     Ok(report)
 }
@@ -579,26 +617,109 @@ fn query_processes(connection: &Connection) -> rusqlite::Result<Vec<ProcessRepor
     rows
 }
 
-fn query_events(connection: &Connection) -> rusqlite::Result<Vec<EventReport>> {
+fn query_event_count(connection: &Connection) -> rusqlite::Result<i64> {
+    connection.query_row("SELECT COUNT(*) FROM event", [], |row| row.get(0))
+}
+
+fn query_timeline_events(
+    connection: &Connection,
+    event_count: i64,
+) -> rusqlite::Result<Vec<EventReport>> {
+    let limit = i64::try_from(crate::limits::REPORT_TIMELINE_EVENT_LIMIT)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let stride = event_count
+        .saturating_add(limit - 1)
+        .checked_div(limit)
+        .unwrap_or(1)
+        .max(1);
     let mut statement = connection.prepare(
         "SELECT event_id, category, operation, target, process_id,
                 occurred_at_ms, evidence
-         FROM event ORDER BY occurred_at_ms, event_id",
+         FROM event
+         WHERE event_id % ?1 = 0 OR event_id = 1
+         ORDER BY occurred_at_ms, event_id
+         LIMIT ?2",
     )?;
     let rows = statement
-        .query_map([], |row| {
-            Ok(EventReport {
-                event_id: row.get(0)?,
-                category: sanitize(&row.get::<_, String>(1)?),
-                operation: sanitize(&row.get::<_, String>(2)?),
-                target: sanitize(&row.get::<_, String>(3)?),
-                process_id: row.get(4)?,
-                occurred_at_ms: row.get(5)?,
-                evidence: sanitize(&row.get::<_, String>(6)?),
-            })
-        })?
+        .query_map([stride, limit], event_report_from_row)?
         .collect();
     rows
+}
+
+fn load_event_page(database: PathBuf, query: EventQuery) -> rusqlite::Result<EventPage> {
+    let connection = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    configure_read_only(&connection)?;
+    let category = match query.category {
+        Some(value)
+            if !matches!(
+                value.as_str(),
+                "process" | "filesystem" | "network" | "environment"
+            ) =>
+        {
+            return Err(rusqlite::Error::InvalidQuery)
+        }
+        value => value,
+    };
+    let search = query.search.unwrap_or_default();
+    let has_search = !search.is_empty();
+    let has_category = category.is_some();
+    let total = connection.query_row(
+        "SELECT COUNT(*) FROM event
+         WHERE (?1 = 0 OR category = ?2)
+           AND (?3 = 0 OR instr(lower(target), lower(?4)) > 0
+                        OR instr(lower(operation), lower(?4)) > 0)",
+        rusqlite::params![has_category, category, has_search, search],
+        |row| row.get(0),
+    )?;
+    let offset = query
+        .offset
+        .min(usize::try_from(total).unwrap_or(usize::MAX));
+    let mut statement = connection.prepare(
+        "SELECT event_id, category, operation, target, process_id,
+                occurred_at_ms, evidence
+         FROM event
+         WHERE (?1 = 0 OR category = ?2)
+           AND (?3 = 0 OR instr(lower(target), lower(?4)) > 0
+                        OR instr(lower(operation), lower(?4)) > 0)
+         ORDER BY event_id
+         LIMIT ?5 OFFSET ?6",
+    )?;
+    let events = statement
+        .query_map(
+            rusqlite::params![
+                has_category,
+                category,
+                has_search,
+                search,
+                i64::try_from(crate::limits::REPORT_EVENT_PAGE_SIZE)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                i64::try_from(offset).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            ],
+            event_report_from_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(EventPage {
+        offset,
+        total,
+        events,
+    })
+}
+
+fn event_report_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventReport> {
+    Ok(EventReport {
+        event_id: row.get(0)?,
+        category: sanitize(&row.get::<_, String>(1)?),
+        operation: sanitize(&row.get::<_, String>(2)?),
+        target: sanitize(&row.get::<_, String>(3)?),
+        process_id: row.get(4)?,
+        occurred_at_ms: row.get(5)?,
+        evidence: sanitize(&row.get::<_, String>(6)?),
+    })
 }
 
 fn query_findings(connection: &Connection) -> rusqlite::Result<Vec<FindingReport>> {
@@ -643,7 +764,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{load_report, ReportServer, BODY_LIMIT};
+    use super::{load_event_page, load_report, EventQuery, ReportServer, BODY_LIMIT};
     use crate::storage::{SessionOutcome, SessionStore};
 
     struct TestDirectory(PathBuf);
@@ -732,7 +853,18 @@ mod tests {
         .await;
         assert!(report.starts_with("HTTP/1.1 200 OK"));
         assert!(report.contains("\"commandName\":\"printf\""));
+        assert!(report.contains("\"eventCount\":0"));
         assert!(report.contains("\"findings\":[]"));
+
+        let events = request(
+            address,
+            &format!(
+                "GET /api{session_path}/events?offset=0 HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(events.starts_with("HTTP/1.1 200 OK"));
+        assert!(events.contains("\"total\":0"));
 
         let asset = request(
             address,
@@ -863,7 +995,7 @@ mod tests {
         drop(connection);
 
         let report = load_report(session.database().to_owned()).expect("the report should load");
-        let displayed = &report.events[0].target;
+        let displayed = &report.timeline_events[0].target;
 
         assert!(!displayed.contains("<script>"));
         assert!(!displayed.contains("<style>"));
@@ -878,6 +1010,77 @@ mod tests {
             .query_row("SELECT target FROM event", [], |row| row.get(0))
             .expect("the raw event should remain available");
         assert_eq!(raw, hostile);
+    }
+
+    #[test]
+    fn pages_and_filters_large_event_sets() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin("fixture", 0)
+            .expect("a session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the session should finalize");
+        let mut connection = rusqlite::Connection::open(session.database())
+            .expect("the session database should open");
+        let transaction = connection
+            .transaction()
+            .expect("an event transaction should start");
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO event (
+                         category, operation, target, process_id, occurred_at_ms, evidence
+                     ) VALUES (?1, ?2, ?3, NULL, ?4, 'observed')",
+                )
+                .expect("the insert should prepare");
+            for index in 0..1_200_i64 {
+                let category = if index % 2 == 0 {
+                    "filesystem"
+                } else {
+                    "network"
+                };
+                statement
+                    .execute(rusqlite::params![
+                        category,
+                        "read",
+                        format!("target-{index}"),
+                        index
+                    ])
+                    .expect("the event should be inserted");
+            }
+        }
+        transaction.commit().expect("the events should commit");
+        drop(connection);
+
+        let first = load_event_page(
+            session.database().to_owned(),
+            EventQuery {
+                offset: 0,
+                category: None,
+                search: None,
+            },
+        )
+        .expect("the first event page should load");
+        assert_eq!(first.total, 1_200);
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.events.len(), 500);
+
+        let filtered = load_event_page(
+            session.database().to_owned(),
+            EventQuery {
+                offset: 0,
+                category: Some("network".to_owned()),
+                search: Some("target-1199".to_owned()),
+            },
+        )
+        .expect("the filtered event page should load");
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.events[0].target, "target-1199");
+
+        let report = load_report(session.database().to_owned()).expect("the report should load");
+        assert_eq!(report.event_count, 1_200);
+        assert_eq!(report.timeline_events.len(), 1_200);
     }
 
     async fn request(address: std::net::SocketAddr, request: &str) -> String {

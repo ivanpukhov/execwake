@@ -1,0 +1,7 @@
+{
+  "name": "execwake-benchmark-workload",
+  "private": true,
+  "scripts": {
+    "noop": "node -e \"process.stdout.write('ok')\""
+  }
+}

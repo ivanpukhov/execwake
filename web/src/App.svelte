@@ -64,7 +64,7 @@
     <section class="metrics" aria-label="Session summary">
       <article><span>Duration</span><strong>{formatDuration(durationMs(report))}</strong></article>
       <article><span>Processes</span><strong>{report.processes.length}</strong></article>
-      <article><span>Events</span><strong>{report.events.length}</strong></article>
+      <article><span>Events</span><strong>{report.eventCount}</strong></article>
       <article><span>Findings</span><strong>{report.findings.length}</strong></article>
     </section>
 
@@ -96,7 +96,7 @@
         <div class="panel-heading"><h2>Timeline</h2></div>
         <Timeline
           processes={report.processes}
-          events={report.events}
+          events={report.timelineEvents}
           startedAtMs={report.startedAtMs}
           endedAtMs={report.endedAtMs}
         />
@@ -105,7 +105,11 @@
 
     <section class="panel">
       <div class="panel-heading"><h2>Events</h2></div>
-      <VirtualEventTable events={report.events} startedAtMs={report.startedAtMs} />
+      <VirtualEventTable
+        sessionId={report.id}
+        eventCount={report.eventCount}
+        startedAtMs={report.startedAtMs}
+      />
     </section>
   {:else}
     <section class="message" aria-live="polite"><p>Loading report…</p></section>
