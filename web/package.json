@@ -6,9 +6,11 @@
   "scripts": {
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "dev": "vite"
+    "dev": "vite",
+    "test:browser": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "1.62.1",
     "@sveltejs/vite-plugin-svelte": "7.3.0",
     "svelte": "5.57.0",
     "svelte-check": "4.7.6",
