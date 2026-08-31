@@ -1,4 +1,5 @@
 #define SEC(name) __attribute__((section(name), used))
+#define ALWAYS_INLINE inline __attribute__((always_inline))
 
 #include "protocol.h"
 
@@ -92,15 +93,17 @@ static long (*bpf_probe_read_kernel_str)(void *destination, __u32 size,
                                          const void *source) = (void *)115;
 static long (*bpf_probe_read_user)(void *destination, __u32 size,
                                    const void *source) = (void *)112;
+static long (*bpf_probe_read_user_str)(void *destination, __u32 size,
+                                       const void *source) = (void *)114;
 
-static __inline int in_target_cgroup(void) {
+static ALWAYS_INLINE int in_target_cgroup(void) {
     __u32 key = 0;
     __u64 *target = bpf_map_lookup_elem(&TARGET_CGROUP, &key);
     return target && bpf_get_current_cgroup_id() == *target;
 }
 
-static __inline void initialize_event(struct execwake_event_header *event,
-                                      __u16 kind) {
+static ALWAYS_INLINE void initialize_event(struct execwake_event_header *event,
+                                            __u16 kind) {
     __u64 process = bpf_get_current_pid_tgid();
     event->version = EXECWAKE_PROTOCOL_VERSION;
     event->kind = kind;
@@ -113,8 +116,8 @@ static __inline void initialize_event(struct execwake_event_header *event,
     event->flags = 0;
 }
 
-static __inline void capture_address(struct execwake_event *event,
-                                     const void *address, __u64 length) {
+static ALWAYS_INLINE void capture_address(struct execwake_event *event,
+                                           const void *address, __u64 length) {
     if (!address || !length)
         return;
     struct execwake_socket_data *data = (void *)event->data;
@@ -132,8 +135,8 @@ static __inline void capture_address(struct execwake_event *event,
     }
 }
 
-static __inline void capture_payload(struct execwake_event *event,
-                                     const void *payload, __u64 length) {
+static ALWAYS_INLINE void capture_payload(struct execwake_event *event,
+                                           const void *payload, __u64 length) {
     if (!payload || !length)
         return;
     struct execwake_socket_data *data = (void *)event->data;
@@ -151,8 +154,75 @@ static __inline void capture_payload(struct execwake_event *event,
     }
 }
 
-static __inline void capture_enter_data(struct execwake_event *event,
-                                        __u32 operation) {
+static ALWAYS_INLINE void capture_first_path(struct execwake_event *event,
+                                              const void *path) {
+    if (!path)
+        return;
+    struct execwake_path_data *data = (void *)event->data;
+    long length = bpf_probe_read_user_str(data->first, sizeof(data->first), path);
+    if (length > 0) {
+        data->first_length = length - 1;
+        event->header.flags |= EXECWAKE_DATA_HAS_FIRST_PATH;
+        if (length == sizeof(data->first))
+            event->header.flags |= EXECWAKE_DATA_TRUNCATED;
+    }
+}
+
+static ALWAYS_INLINE void capture_second_path(struct execwake_event *event,
+                                               const void *path) {
+    if (!path)
+        return;
+    struct execwake_path_data *data = (void *)event->data;
+    long length = bpf_probe_read_user_str(data->second, sizeof(data->second), path);
+    if (length > 0) {
+        data->second_length = length - 1;
+        event->header.flags |= EXECWAKE_DATA_HAS_SECOND_PATH;
+        if (length == sizeof(data->second))
+            event->header.flags |= EXECWAKE_DATA_TRUNCATED;
+    }
+}
+
+static ALWAYS_INLINE void capture_path_data(struct execwake_event *event,
+                                             __u32 operation) {
+    if (operation == EXECWAKE_SYSCALL_OPEN_AT ||
+        operation == EXECWAKE_SYSCALL_OPEN_AT_2 ||
+        operation == EXECWAKE_SYSCALL_UNLINK_AT ||
+        operation == EXECWAKE_SYSCALL_MAKE_DIRECTORY_AT ||
+        operation == EXECWAKE_SYSCALL_STAT_AT ||
+        operation == EXECWAKE_SYSCALL_READ_LINK_AT) {
+        capture_first_path(event, (void *)event->header.arguments[1]);
+    } else if (operation == EXECWAKE_SYSCALL_RENAME_AT ||
+               operation == EXECWAKE_SYSCALL_LINK_AT) {
+        capture_first_path(event, (void *)event->header.arguments[1]);
+        capture_second_path(event, (void *)event->header.arguments[3]);
+    } else if (operation == EXECWAKE_SYSCALL_SYMLINK_AT) {
+        capture_first_path(event, (void *)event->header.arguments[0]);
+        capture_second_path(event, (void *)event->header.arguments[2]);
+    } else if (operation == EXECWAKE_SYSCALL_TRUNCATE ||
+               operation == EXECWAKE_SYSCALL_CHANGE_DIRECTORY ||
+               operation == EXECWAKE_SYSCALL_OPEN ||
+               operation == EXECWAKE_SYSCALL_CREATE ||
+               operation == EXECWAKE_SYSCALL_UNLINK ||
+               operation == EXECWAKE_SYSCALL_MAKE_DIRECTORY ||
+               operation == EXECWAKE_SYSCALL_REMOVE_DIRECTORY ||
+               operation == EXECWAKE_SYSCALL_STAT) {
+        capture_first_path(event, (void *)event->header.arguments[0]);
+    } else if (operation == EXECWAKE_SYSCALL_RENAME ||
+               operation == EXECWAKE_SYSCALL_LINK ||
+               operation == EXECWAKE_SYSCALL_SYMLINK) {
+        capture_first_path(event, (void *)event->header.arguments[0]);
+        capture_second_path(event, (void *)event->header.arguments[1]);
+    }
+}
+
+static ALWAYS_INLINE void capture_enter_data(struct execwake_event *event,
+                                              __u32 operation) {
+    if (operation == EXECWAKE_SYSCALL_OPEN_AT_2) {
+        __u64 flags = 0;
+        if (bpf_probe_read_user(&flags, sizeof(flags),
+                                (void *)event->header.arguments[2]) == 0)
+            event->header.arguments[2] = flags;
+    }
     if (operation == EXECWAKE_SYSCALL_BIND ||
         operation == EXECWAKE_SYSCALL_CONNECT) {
         capture_address(event, (void *)event->header.arguments[1],
@@ -166,10 +236,11 @@ static __inline void capture_enter_data(struct execwake_event *event,
         capture_payload(event, (void *)event->header.arguments[1],
                         event->header.arguments[2]);
     }
+    capture_path_data(event, operation);
 }
 
-static __inline void capture_exit_data(struct execwake_event *event,
-                                       __u32 operation, __s64 result) {
+static ALWAYS_INLINE void capture_exit_data(struct execwake_event *event,
+                                             __u32 operation, __s64 result) {
     if (result <= 0)
         return;
     if (operation == EXECWAKE_SYSCALL_RECVFROM) {
@@ -268,7 +339,8 @@ int observe_syscall_enter(struct raw_syscalls_enter_context *context) {
     event.header.arguments[5] = context->arguments[5];
     capture_enter_data(&event, *operation);
     if (event.header.flags &
-        (EXECWAKE_DATA_HAS_ADDRESS | EXECWAKE_DATA_HAS_PAYLOAD)) {
+        (EXECWAKE_DATA_HAS_ADDRESS | EXECWAKE_DATA_HAS_PAYLOAD |
+         EXECWAKE_DATA_HAS_FIRST_PATH | EXECWAKE_DATA_HAS_SECOND_PATH)) {
         event.header.data_length = sizeof(event.data);
         event.header.size = sizeof(event);
     }

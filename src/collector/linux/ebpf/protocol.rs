@@ -10,6 +10,9 @@ const SYSCALL_OPERATION_MASK: u32 = 0xffff;
 const DATA_HAS_ADDRESS: u32 = 1 << 16;
 const DATA_HAS_PAYLOAD: u32 = 1 << 17;
 const DATA_TRUNCATED: u32 = 1 << 18;
+const DATA_HAS_FIRST_PATH: u32 = 1 << 19;
+const DATA_HAS_SECOND_PATH: u32 = 1 << 20;
+const PATH_BYTES: usize = 188;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -36,6 +39,34 @@ pub enum SyscallOperation {
     ReceiveFrom = 10,
     Write = 11,
     Read = 12,
+    OpenAt = 13,
+    ReadVector = 14,
+    WriteVector = 15,
+    ReadAt = 16,
+    WriteAt = 17,
+    Truncate = 18,
+    FileTruncate = 19,
+    RenameAt = 20,
+    LinkAt = 21,
+    SymlinkAt = 22,
+    UnlinkAt = 23,
+    MakeDirectoryAt = 24,
+    ChangeDirectory = 25,
+    ChangeDirectoryFd = 26,
+    MemoryMap = 27,
+    StatAt = 28,
+    ReadLinkAt = 29,
+    ReadDirectory = 30,
+    Open = 31,
+    Create = 32,
+    Rename = 33,
+    Link = 34,
+    Symlink = 35,
+    Unlink = 36,
+    MakeDirectory = 37,
+    RemoveDirectory = 38,
+    Stat = 39,
+    OpenAt2 = 40,
 }
 
 impl SyscallOperation {
@@ -53,6 +84,34 @@ impl SyscallOperation {
             10 => Some(Self::ReceiveFrom),
             11 => Some(Self::Write),
             12 => Some(Self::Read),
+            13 => Some(Self::OpenAt),
+            14 => Some(Self::ReadVector),
+            15 => Some(Self::WriteVector),
+            16 => Some(Self::ReadAt),
+            17 => Some(Self::WriteAt),
+            18 => Some(Self::Truncate),
+            19 => Some(Self::FileTruncate),
+            20 => Some(Self::RenameAt),
+            21 => Some(Self::LinkAt),
+            22 => Some(Self::SymlinkAt),
+            23 => Some(Self::UnlinkAt),
+            24 => Some(Self::MakeDirectoryAt),
+            25 => Some(Self::ChangeDirectory),
+            26 => Some(Self::ChangeDirectoryFd),
+            27 => Some(Self::MemoryMap),
+            28 => Some(Self::StatAt),
+            29 => Some(Self::ReadLinkAt),
+            30 => Some(Self::ReadDirectory),
+            31 => Some(Self::Open),
+            32 => Some(Self::Create),
+            33 => Some(Self::Rename),
+            34 => Some(Self::Link),
+            35 => Some(Self::Symlink),
+            36 => Some(Self::Unlink),
+            37 => Some(Self::MakeDirectory),
+            38 => Some(Self::RemoveDirectory),
+            39 => Some(Self::Stat),
+            40 => Some(Self::OpenAt2),
             _ => None,
         }
     }
@@ -62,6 +121,13 @@ impl SyscallOperation {
 pub struct SocketData {
     pub address: Vec<u8>,
     pub payload: Vec<u8>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathData {
+    pub first: Vec<u8>,
+    pub second: Vec<u8>,
     pub truncated: bool,
 }
 
@@ -120,6 +186,32 @@ impl Event {
             address: self.data[8..8 + address_length].to_vec(),
             payload: self.data[SOCKET_PAYLOAD_OFFSET..SOCKET_PAYLOAD_OFFSET + payload_length]
                 .to_vec(),
+            truncated: self.flags & DATA_TRUNCATED != 0,
+        }))
+    }
+
+    pub fn path_data(&self) -> io::Result<Option<PathData>> {
+        let has_first = self.flags & DATA_HAS_FIRST_PATH != 0;
+        let has_second = self.flags & DATA_HAS_SECOND_PATH != 0;
+        if !has_first && !has_second {
+            return Ok(None);
+        }
+        if self.kind != EventKind::Syscall || self.data.len() != MAX_DATA_BYTES {
+            return Err(invalid_event("eBPF path data is invalid"));
+        }
+
+        let first_length = read_u32(&self.data, 0)? as usize;
+        let second_length = read_u32(&self.data, 4)? as usize;
+        if first_length >= PATH_BYTES
+            || second_length >= PATH_BYTES
+            || (!has_first && first_length != 0)
+            || (!has_second && second_length != 0)
+        {
+            return Err(invalid_event("eBPF path data length is invalid"));
+        }
+        Ok(Some(PathData {
+            first: self.data[8..8 + first_length].to_vec(),
+            second: self.data[8 + PATH_BYTES..8 + PATH_BYTES + second_length].to_vec(),
             truncated: self.flags & DATA_TRUNCATED != 0,
         }))
     }
@@ -198,8 +290,9 @@ fn invalid_event(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, EventKind, SyscallOperation, DATA_HAS_ADDRESS, DATA_HAS_PAYLOAD, HEADER_BYTES,
-        MAX_DATA_BYTES, SOCKET_PAYLOAD_OFFSET, VERSION,
+        decode, EventKind, SyscallOperation, DATA_HAS_ADDRESS, DATA_HAS_FIRST_PATH,
+        DATA_HAS_PAYLOAD, DATA_HAS_SECOND_PATH, HEADER_BYTES, MAX_DATA_BYTES, PATH_BYTES,
+        SOCKET_PAYLOAD_OFFSET, VERSION,
     };
 
     #[test]
@@ -269,6 +362,33 @@ mod tests {
         assert_eq!(event.syscall_operation(), Some(SyscallOperation::Connect));
         assert_eq!(data.address, b"addr");
         assert_eq!(data.payload, b"dns");
+        assert!(!data.truncated);
+    }
+
+    #[test]
+    fn decodes_two_bounded_paths() {
+        let mut bytes = vec![0_u8; HEADER_BYTES + MAX_DATA_BYTES];
+        let event_length = bytes.len() as u32;
+        bytes[0..2].copy_from_slice(&VERSION.to_le_bytes());
+        bytes[2..4].copy_from_slice(&(EventKind::Syscall as u16).to_le_bytes());
+        bytes[4..8].copy_from_slice(&event_length.to_le_bytes());
+        bytes[80..84].copy_from_slice(&(MAX_DATA_BYTES as u32).to_le_bytes());
+        let flags = SyscallOperation::RenameAt as u32 | DATA_HAS_FIRST_PATH | DATA_HAS_SECOND_PATH;
+        bytes[84..88].copy_from_slice(&flags.to_le_bytes());
+        bytes[88..92].copy_from_slice(&3_u32.to_le_bytes());
+        bytes[92..96].copy_from_slice(&3_u32.to_le_bytes());
+        bytes[96..99].copy_from_slice(b"old");
+        let second = HEADER_BYTES + 8 + PATH_BYTES;
+        bytes[second..second + 3].copy_from_slice(b"new");
+
+        let event = decode(&bytes).expect("the event should decode");
+        let data = event
+            .path_data()
+            .expect("path data should be valid")
+            .expect("path data should be present");
+
+        assert_eq!(data.first, b"old");
+        assert_eq!(data.second, b"new");
         assert!(!data.truncated);
     }
 }

@@ -234,16 +234,16 @@ impl EbpfProbe {
         target.set(0, cgroup_id, 0).map_err(other_error)?;
         drop(target);
 
-        let mut syscall_operations = BpfHashMap::<_, i64, u32>::try_from(
+        let mut operation_map = BpfHashMap::<_, i64, u32>::try_from(
             bpf.map_mut("SYSCALL_OPERATIONS").map_err(other_error)?,
         )
         .map_err(other_error)?;
-        for (number, operation) in network_syscall_operations() {
-            syscall_operations
+        for (number, operation) in syscall_operations() {
+            operation_map
                 .insert(number, operation as u32, 0)
                 .map_err(other_error)?;
         }
-        drop(syscall_operations);
+        drop(operation_map);
 
         for event in [
             "sched_process_fork",
@@ -316,10 +316,10 @@ fn attach_tracepoint(
     Ok(())
 }
 
-fn network_syscall_operations() -> Vec<(i64, protocol::SyscallOperation)> {
+fn syscall_operations() -> Vec<(i64, protocol::SyscallOperation)> {
     use protocol::SyscallOperation;
 
-    let mut operations = Vec::with_capacity(15);
+    let mut operations = Vec::with_capacity(48);
     operations.extend([
         (libc::SYS_socket, SyscallOperation::Socket),
         (libc::SYS_bind, SyscallOperation::Bind),
@@ -334,11 +334,46 @@ fn network_syscall_operations() -> Vec<(i64, protocol::SyscallOperation)> {
         (libc::SYS_recvfrom, SyscallOperation::ReceiveFrom),
         (libc::SYS_write, SyscallOperation::Write),
         (libc::SYS_read, SyscallOperation::Read),
+        (libc::SYS_openat, SyscallOperation::OpenAt),
+        (libc::SYS_openat2, SyscallOperation::OpenAt2),
+        (libc::SYS_readv, SyscallOperation::ReadVector),
+        (libc::SYS_preadv, SyscallOperation::ReadVector),
+        (libc::SYS_preadv2, SyscallOperation::ReadVector),
+        (libc::SYS_writev, SyscallOperation::WriteVector),
+        (libc::SYS_pwritev, SyscallOperation::WriteVector),
+        (libc::SYS_pwritev2, SyscallOperation::WriteVector),
+        (libc::SYS_pread64, SyscallOperation::ReadAt),
+        (libc::SYS_pwrite64, SyscallOperation::WriteAt),
+        (libc::SYS_truncate, SyscallOperation::Truncate),
+        (libc::SYS_ftruncate, SyscallOperation::FileTruncate),
+        (libc::SYS_renameat, SyscallOperation::RenameAt),
+        (libc::SYS_renameat2, SyscallOperation::RenameAt),
+        (libc::SYS_linkat, SyscallOperation::LinkAt),
+        (libc::SYS_symlinkat, SyscallOperation::SymlinkAt),
+        (libc::SYS_unlinkat, SyscallOperation::UnlinkAt),
+        (libc::SYS_mkdirat, SyscallOperation::MakeDirectoryAt),
+        (libc::SYS_chdir, SyscallOperation::ChangeDirectory),
+        (libc::SYS_fchdir, SyscallOperation::ChangeDirectoryFd),
+        (libc::SYS_mmap, SyscallOperation::MemoryMap),
+        (libc::SYS_newfstatat, SyscallOperation::StatAt),
+        (libc::SYS_statx, SyscallOperation::StatAt),
+        (libc::SYS_readlinkat, SyscallOperation::ReadLinkAt),
+        (libc::SYS_getdents64, SyscallOperation::ReadDirectory),
     ]);
     #[cfg(target_arch = "x86_64")]
     operations.extend([
         (libc::SYS_accept, SyscallOperation::Accept),
         (libc::SYS_dup2, SyscallOperation::Duplicate),
+        (libc::SYS_open, SyscallOperation::Open),
+        (libc::SYS_creat, SyscallOperation::Create),
+        (libc::SYS_rename, SyscallOperation::Rename),
+        (libc::SYS_link, SyscallOperation::Link),
+        (libc::SYS_symlink, SyscallOperation::Symlink),
+        (libc::SYS_unlink, SyscallOperation::Unlink),
+        (libc::SYS_mkdir, SyscallOperation::MakeDirectory),
+        (libc::SYS_rmdir, SyscallOperation::RemoveDirectory),
+        (libc::SYS_stat, SyscallOperation::Stat),
+        (libc::SYS_lstat, SyscallOperation::Stat),
     ]);
     operations
 }
@@ -417,7 +452,9 @@ fn drain_buffers(
 
 fn valid_event(event: &protocol::Event) -> bool {
     event.kind != protocol::EventKind::Syscall
-        || event.syscall_operation().is_some() && event.socket_data().is_ok()
+        || event.syscall_operation().is_some()
+            && event.socket_data().is_ok()
+            && event.path_data().is_ok()
 }
 
 fn other_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
@@ -430,15 +467,19 @@ fn sink_error(error: crate::collector::SinkError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::Read;
     use std::net::TcpListener;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
     use crate::session::CoverageState;
 
     use super::protocol::{EventKind, SyscallOperation};
     use super::{coverage_after_loss, CgroupScope, EbpfProbe};
+
+    static TEST_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn buffer_loss_marks_every_category_partial() {
@@ -541,5 +582,81 @@ mod tests {
                     .map(|data| data.payload == b"ping")
                     .unwrap_or(false)
         }));
+    }
+
+    #[test]
+    fn captures_filesystem_paths_and_operations() {
+        if std::env::var_os("EXECWAKE_REQUIRE_EBPF").is_none() {
+            return;
+        }
+
+        let sequence = TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "execwake-ebpf-files-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("the fixture directory should be created");
+
+        let scope = CgroupScope::create().expect("the test cgroup should be available");
+        let mut probe = EbpfProbe::load(scope.id()).expect("the eBPF probe should load");
+        let mut command = Command::new("/bin/bash");
+        command
+            .current_dir(&root)
+            .args([
+                "-c",
+                "printf data > created.txt && mv created.txt renamed.txt && ln renamed.txt linked.txt && rm linked.txt",
+            ]);
+        scope
+            .configure(&mut command)
+            .expect("the command should enter the test cgroup");
+
+        let run = probe.start().expect("the event reader should start");
+        let status = command.status().expect("the fixture command should run");
+        let output = run.stop().expect("the event reader should stop");
+        fs::remove_dir_all(&root).expect("the fixture directory should be removed");
+
+        assert!(status.success());
+        assert_eq!(output.lost_events, 0);
+        assert!(has_path_event(
+            &output.events,
+            SyscallOperation::OpenAt,
+            b"created.txt",
+            b""
+        ));
+        assert!(has_path_event(
+            &output.events,
+            SyscallOperation::RenameAt,
+            b"created.txt",
+            b"renamed.txt"
+        ));
+        assert!(has_path_event(
+            &output.events,
+            SyscallOperation::LinkAt,
+            b"renamed.txt",
+            b"linked.txt"
+        ));
+        assert!(has_path_event(
+            &output.events,
+            SyscallOperation::UnlinkAt,
+            b"linked.txt",
+            b""
+        ));
+    }
+
+    fn has_path_event(
+        events: &[super::protocol::Event],
+        operation: SyscallOperation,
+        first: &[u8],
+        second: &[u8],
+    ) -> bool {
+        events.iter().any(|event| {
+            event.syscall_operation() == Some(operation)
+                && event
+                    .path_data()
+                    .ok()
+                    .flatten()
+                    .map(|data| data.first == first && data.second == second)
+                    .unwrap_or(false)
+        })
     }
 }
