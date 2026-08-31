@@ -3,6 +3,7 @@ use std::io;
 pub const VERSION: u16 = 1;
 pub const HEADER_BYTES: usize = 88;
 pub const MAX_DATA_BYTES: usize = 384;
+pub const MAX_EVENT_BYTES: usize = HEADER_BYTES + MAX_DATA_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]

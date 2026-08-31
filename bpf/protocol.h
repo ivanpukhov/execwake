@@ -5,6 +5,7 @@ typedef unsigned char __u8;
 typedef unsigned short __u16;
 typedef unsigned int __u32;
 typedef unsigned long long __u64;
+typedef int __s32;
 typedef long long __s64;
 
 enum execwake_event_kind {
@@ -19,6 +20,8 @@ enum {
     EXECWAKE_PROTOCOL_VERSION = 1,
     EXECWAKE_EVENT_DATA_BYTES = 384,
 };
+
+#define EXECWAKE_RESULT_UNKNOWN (-9223372036854775807LL - 1)
 
 struct execwake_event_header {
     __u16 version;

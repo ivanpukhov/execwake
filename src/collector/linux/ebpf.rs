@@ -16,14 +16,14 @@ mod protocol;
 
 use aya::maps::perf::PerfEventArrayBuffer;
 use aya::maps::{Array, MapRefMut, PerfEventArray};
-use aya::programs::RawTracePoint;
+use aya::programs::TracePoint;
 use aya::util::online_cpus;
 use aya::Bpf;
 use bytes::BytesMut;
 
 use super::PtraceCollector;
 use crate::collector::{Collector, CollectorSink};
-use crate::limits::{EBPF_BUFFER_PAGES, EBPF_READ_BATCH};
+use crate::limits::{EBPF_BUFFER_PAGES, EBPF_READ_BATCH, MAX_EBPF_QUEUED_EVENTS};
 use crate::session::{CategoryCoverage, SessionCoverage};
 
 static CGROUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -117,10 +117,11 @@ impl Collector for EbpfCollector {
     ) -> io::Result<ExitStatus> {
         let run = self.probe.start()?;
         let result = self.ptrace.collect(child, sink);
-        let lost_events = run.stop()?;
+        let output = run.stop()?;
+        let _captured_events = output.events.len();
         sink.set_backend(self.backend_name()).map_err(sink_error)?;
-        if lost_events > 0 {
-            sink.set_coverage(coverage_after_loss(lost_events))
+        if output.lost_events > 0 {
+            sink.set_coverage(coverage_after_loss(output.lost_events))
                 .map_err(sink_error)?;
         }
         result
@@ -233,13 +234,31 @@ impl EbpfProbe {
         target.set(0, cgroup_id, 0).map_err(other_error)?;
         drop(target);
 
-        let program: &mut RawTracePoint = bpf
-            .program_mut("sys_enter")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "eBPF program is missing"))?
-            .try_into()
-            .map_err(other_error)?;
-        program.load().map_err(other_error)?;
-        program.attach("sys_enter").map_err(other_error)?;
+        for event in [
+            "sched_process_fork",
+            "sched_process_exec",
+            "sched_process_exit",
+        ] {
+            let program: &mut TracePoint = bpf
+                .program_mut(event)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "eBPF program is missing")
+                })?
+                .try_into()
+                .map_err(other_error)?;
+            program.load().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("loading {event} eBPF program: {error}"),
+                )
+            })?;
+            program.attach("sched", event).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("attaching {event} eBPF program: {error}"),
+                )
+            })?;
+        }
 
         let mut event_array = PerfEventArray::try_from(bpf.map_mut("EVENTS").map_err(other_error)?)
             .map_err(other_error)?;
@@ -268,56 +287,69 @@ impl EbpfProbe {
 
 struct ProbeRun {
     stop: Arc<AtomicBool>,
-    lost: Arc<AtomicU64>,
-    thread: thread::JoinHandle<()>,
+    thread: thread::JoinHandle<ProbeOutput>,
+}
+
+struct ProbeOutput {
+    events: Vec<protocol::Event>,
+    lost_events: u64,
 }
 
 impl ProbeRun {
     fn start(mut buffers: Vec<PerfEventArrayBuffer<MapRefMut>>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let lost = Arc::new(AtomicU64::new(0));
         let thread_stop = stop.clone();
-        let thread_lost = lost.clone();
         let thread = thread::spawn(move || {
             let mut output: Vec<_> = (0..EBPF_READ_BATCH)
-                .map(|_| BytesMut::with_capacity(16))
+                .map(|_| BytesMut::with_capacity(protocol::MAX_EVENT_BYTES))
                 .collect();
+            let mut events = Vec::new();
+            let mut lost_events = 0_u64;
             while !thread_stop.load(Ordering::Acquire) {
-                drain_buffers(&mut buffers, &mut output, &thread_lost);
+                drain_buffers(&mut buffers, &mut output, &mut events, &mut lost_events);
                 thread::sleep(Duration::from_millis(1));
             }
-            drain_buffers(&mut buffers, &mut output, &thread_lost);
+            drain_buffers(&mut buffers, &mut output, &mut events, &mut lost_events);
+            ProbeOutput {
+                events,
+                lost_events,
+            }
         });
-        Self { stop, lost, thread }
+        Self { stop, thread }
     }
 
-    fn stop(self) -> io::Result<u64> {
+    fn stop(self) -> io::Result<ProbeOutput> {
         self.stop.store(true, Ordering::Release);
         self.thread
             .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "eBPF reader thread failed"))?;
-        Ok(self.lost.load(Ordering::Acquire))
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "eBPF reader thread failed"))
     }
 }
 
 fn drain_buffers(
     buffers: &mut [PerfEventArrayBuffer<MapRefMut>],
     output: &mut [BytesMut],
-    lost: &AtomicU64,
+    captured: &mut Vec<protocol::Event>,
+    lost: &mut u64,
 ) {
     for buffer in buffers.iter_mut().filter(|buffer| buffer.readable()) {
         match buffer.read_events(output) {
             Ok(events) => {
-                lost.fetch_add(events.lost as u64, Ordering::Relaxed);
+                *lost = lost.saturating_add(events.lost as u64);
                 for event in output.iter_mut().take(events.read) {
-                    if protocol::decode(event).is_err() {
-                        lost.fetch_add(1, Ordering::Relaxed);
+                    match protocol::decode(event) {
+                        Ok(event) if captured.len() < MAX_EBPF_QUEUED_EVENTS => {
+                            captured.push(event);
+                        }
+                        Ok(_) | Err(_) => {
+                            *lost = lost.saturating_add(1);
+                        }
                     }
                     event.clear();
                 }
             }
             Err(_) => {
-                lost.fetch_add(1, Ordering::Relaxed);
+                *lost = lost.saturating_add(1);
             }
         }
     }
@@ -333,9 +365,12 @@ fn sink_error(error: crate::collector::SinkError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use crate::session::CoverageState;
 
-    use super::coverage_after_loss;
+    use super::protocol::EventKind;
+    use super::{coverage_after_loss, CgroupScope, EbpfProbe};
 
     #[test]
     fn buffer_loss_marks_every_category_partial() {
@@ -349,6 +384,39 @@ mod tests {
         ] {
             assert_eq!(category.state(), CoverageState::Partial);
             assert_eq!(category.lost_events(), 19);
+        }
+    }
+
+    #[test]
+    fn captures_process_lifecycle_events() {
+        if std::env::var_os("EXECWAKE_REQUIRE_EBPF").is_none() {
+            return;
+        }
+
+        let scope = CgroupScope::create().expect("the test cgroup should be available");
+        let mut probe = EbpfProbe::load(scope.id()).expect("the eBPF probe should load");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "/bin/true & wait"]);
+        scope
+            .configure(&mut command)
+            .expect("the command should enter the test cgroup");
+
+        let run = probe.start().expect("the event reader should start");
+        let status = command.status().expect("the fixture command should run");
+        let output = run.stop().expect("the event reader should stop");
+
+        assert!(status.success());
+        assert_eq!(output.lost_events, 0);
+        for kind in [
+            EventKind::ProcessFork,
+            EventKind::ProcessExec,
+            EventKind::ProcessExit,
+        ] {
+            assert!(
+                output.events.iter().any(|event| event.kind == kind),
+                "missing {kind:?} event: {:?}",
+                output.events
+            );
         }
     }
 }

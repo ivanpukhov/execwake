@@ -25,6 +25,8 @@ pub(crate) const MAX_DNS_QUERIES_PER_SOCKET: usize = 256;
 pub(crate) const EBPF_BUFFER_PAGES: usize = 8;
 #[cfg(target_os = "linux")]
 pub(crate) const EBPF_READ_BATCH: usize = 64;
+#[cfg(target_os = "linux")]
+pub(crate) const MAX_EBPF_QUEUED_EVENTS: usize = 250_000;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CaptureLimits {
