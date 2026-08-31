@@ -18,6 +18,8 @@ use axum::{Json, Router};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
+use crate::session::CURRENT_SCHEMA_VERSION;
+use crate::session_input::{canonical_session_file, check_integrity, configure_read_only};
 use crate::storage::SessionPaths;
 
 const BODY_LIMIT: usize = crate::limits::REPORT_REQUEST_BYTES;
@@ -374,29 +376,38 @@ fn validate_session(session: &SessionPaths) -> io::Result<()> {
         ));
     }
 
+    let database = canonical_session_file(session.database())?;
     let connection = Connection::open_with_flags(
-        session.database(),
+        database,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(server_error)?;
-    configure_read_only_connection(&connection).map_err(server_error)?;
-    let (id, state, finalized) = connection
+    configure_read_only(&connection).map_err(server_error)?;
+    if !check_integrity(&connection).map_err(server_error)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "report session database is corrupt",
+        ));
+    }
+    let (id, schema_version, state, finalized) = connection
         .query_row(
-            "SELECT id, state, finalized FROM session WHERE singleton = 1",
+            "SELECT id, schema_version, state, finalized FROM session WHERE singleton = 1",
             [],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         )
         .map_err(server_error)?;
 
     if id != session.id().as_str()
+        || schema_version != i64::from(CURRENT_SCHEMA_VERSION)
         || finalized != 1
         || !matches!(state.as_str(), "finalized" | "interrupted")
     {
@@ -488,7 +499,7 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
-    configure_read_only_connection(&connection)?;
+    configure_read_only(&connection)?;
     let mut report = connection.query_row(
         "SELECT id, schema_version, mode, state, finalized, command_name,
                 argument_count, started_at_ms, ended_at_ms, exit_code,
@@ -522,14 +533,6 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
     report.events = query_events(&connection)?;
     report.findings = query_findings(&connection)?;
     Ok(report)
-}
-
-fn configure_read_only_connection(connection: &Connection) -> rusqlite::Result<()> {
-    connection.execute_batch(
-        "PRAGMA query_only = ON;
-         PRAGMA trusted_schema = OFF;
-         PRAGMA foreign_keys = ON;",
-    )
 }
 
 fn query_coverage(connection: &Connection) -> rusqlite::Result<Vec<CoverageReport>> {

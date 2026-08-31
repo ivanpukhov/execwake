@@ -1,5 +1,10 @@
 pub(crate) const REPORT_REQUEST_BYTES: usize = 16 * 1024;
 pub(crate) const SQLITE_CACHE_KIB: i64 = 16 * 1024;
+pub(crate) const MAX_SESSION_INPUT_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_SQLITE_VALUE_BYTES: i32 = 1024 * 1024;
+pub(crate) const MAX_IMPORTED_EVENTS: usize = 1_000_000;
+pub(crate) const MAX_IMPORTED_PROCESSES: usize = 100_000;
+pub(crate) const MAX_IMPORTED_FINDINGS: usize = 100_000;
 
 #[cfg(target_os = "linux")]
 pub(crate) const MAX_LIVE_PROCESSES: usize = 1_024;

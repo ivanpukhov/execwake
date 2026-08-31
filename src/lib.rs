@@ -9,4 +9,5 @@ pub mod runner;
 pub mod semantic_diff;
 mod sensitive_path;
 pub mod session;
+mod session_input;
 pub mod storage;

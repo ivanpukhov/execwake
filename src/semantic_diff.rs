@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
@@ -12,8 +11,10 @@ use crate::behavior::{
     BehaviorValue,
 };
 use crate::findings::Severity;
+use crate::limits::{MAX_IMPORTED_EVENTS, MAX_IMPORTED_FINDINGS, MAX_IMPORTED_PROCESSES};
 use crate::privacy::CURRENT_PRIVACY_PROFILE;
 use crate::session::CURRENT_SCHEMA_VERSION;
+use crate::session_input::{canonical_session_file, check_integrity, configure_read_only};
 use crate::storage::SessionId;
 
 #[derive(Debug)]
@@ -200,18 +201,19 @@ pub fn compare(before: SessionSnapshot, after: SessionSnapshot) -> SemanticDiff 
 
 impl SessionSnapshot {
     pub fn load(path: &Path) -> Result<Self, DiffError> {
-        let database = canonical_regular_file(path)?;
+        let database = canonical_session_file(path)?;
         let connection = Connection::open_with_flags(
             database,
             OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        connection.execute_batch(
-            "PRAGMA query_only = ON;
-             PRAGMA trusted_schema = OFF;
-             PRAGMA foreign_keys = ON;",
-        )?;
+        configure_read_only(&connection)?;
+        if !check_integrity(&connection)? {
+            return Err(DiffError::InvalidSession(
+                "session database is corrupt".to_owned(),
+            ));
+        }
 
         let (id, schema_version, mode, state, finalized, command_name, runner_pid) = connection
             .query_row(
@@ -248,6 +250,11 @@ impl SessionSnapshot {
         let schema_version = u32::try_from(schema_version).map_err(|_| {
             DiffError::InvalidSession("session schema version is out of range".to_owned())
         })?;
+        if schema_version == 0 || schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(DiffError::InvalidSession(
+                "session schema version is unsupported".to_owned(),
+            ));
+        }
         let backend = optional_session_text(&connection, "collector_backend")?;
         let privacy_profile = optional_session_text(&connection, "privacy_profile")?;
         let info = SessionInfo {
@@ -279,16 +286,6 @@ impl SessionSnapshot {
             findings,
         })
     }
-}
-
-fn canonical_regular_file(path: &Path) -> io::Result<PathBuf> {
-    if !fs::symlink_metadata(path)?.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "session input is not a regular file",
-        ));
-    }
-    fs::canonicalize(path)
 }
 
 fn table_has_column(connection: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -353,11 +350,12 @@ fn load_coverage(
 }
 
 fn load_processes(connection: &Connection) -> rusqlite::Result<Vec<BehaviorProcess>> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT process_id, operating_system_id, parent_process_id, executable,
                 exit_code, termination_signal, evidence
-         FROM process ORDER BY process_id",
-    )?;
+         FROM process ORDER BY process_id LIMIT {}",
+        MAX_IMPORTED_PROCESSES + 1
+    ))?;
     let rows = statement
         .query_map([], |row| {
             Ok(BehaviorProcess {
@@ -370,15 +368,19 @@ fn load_processes(connection: &Connection) -> rusqlite::Result<Vec<BehaviorProce
                 evidence: row.get(6)?,
             })
         })?
-        .collect();
-    rows
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.len() > MAX_IMPORTED_PROCESSES {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(rows)
 }
 
 fn load_events(connection: &Connection) -> rusqlite::Result<Vec<BehaviorEvent>> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT event_id, category, operation, target, process_id, evidence
-         FROM event ORDER BY event_id",
-    )?;
+         FROM event ORDER BY event_id LIMIT {}",
+        MAX_IMPORTED_EVENTS + 1
+    ))?;
     let rows = statement
         .query_map([], |row| {
             Ok(BehaviorEvent {
@@ -390,18 +392,22 @@ fn load_events(connection: &Connection) -> rusqlite::Result<Vec<BehaviorEvent>> 
                 evidence: row.get(5)?,
             })
         })?
-        .collect();
-    rows
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.len() > MAX_IMPORTED_EVENTS {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(rows)
 }
 
 fn load_findings(
     connection: &Connection,
     process_roles: &BTreeMap<i64, String>,
 ) -> Result<Vec<FindingSnapshot>, DiffError> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT finding_id, rule_id, rule_version, severity, process_id, subject
-         FROM finding ORDER BY rule_id, rule_version, process_id, subject",
-    )?;
+         FROM finding ORDER BY rule_id, rule_version, process_id, subject LIMIT {}",
+        MAX_IMPORTED_FINDINGS + 1
+    ))?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -415,6 +421,11 @@ fn load_findings(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
+    if rows.len() > MAX_IMPORTED_FINDINGS {
+        return Err(DiffError::InvalidSession(
+            "session contains too many findings".to_owned(),
+        ));
+    }
 
     let mut findings = Vec::new();
     for (finding_id, rule_id, rule_version, severity, process_id, subject) in rows {
@@ -438,19 +449,21 @@ fn load_findings(
                 "finding rule version is invalid".to_owned(),
             ));
         }
-        let mut evidence_statement = connection.prepare(
+        let mut evidence_statement = connection.prepare(&format!(
             "SELECT finding_evidence.event_id, event.process_id
              FROM finding_evidence
              LEFT JOIN event ON event.event_id = finding_evidence.event_id
              WHERE finding_evidence.finding_id = ?1
-             ORDER BY finding_evidence.event_id",
-        )?;
+             ORDER BY finding_evidence.event_id LIMIT {}",
+            MAX_IMPORTED_EVENTS + 1
+        ))?;
         let evidence = evidence_statement
             .query_map([finding_id], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if evidence.is_empty()
+            || evidence.len() > MAX_IMPORTED_EVENTS
             || evidence.iter().any(|(event_id, event_process)| {
                 *event_id <= 0 || *event_process != Some(process_id)
             })
@@ -778,6 +791,7 @@ fn category_from_coverage_name(value: &str) -> Option<BehaviorCategory> {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::io::{Seek, Write};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1077,6 +1091,47 @@ mod tests {
                     .issues
                     .contains(&CompatibilityIssue::UnsupportedSchema)
         }));
+    }
+
+    #[test]
+    fn rejects_corrupt_and_future_session_inputs() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let future = store
+            .begin("npm", 0)
+            .expect("the future session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the future session should finalize");
+        let connection = Connection::open(future.database()).expect("the session should open");
+        connection
+            .execute(
+                "UPDATE session SET schema_version = ?1 WHERE singleton = 1",
+                [i64::from(crate::session::CURRENT_SCHEMA_VERSION) + 1],
+            )
+            .expect("the schema version should be changed");
+        drop(connection);
+
+        assert!(matches!(
+            SessionSnapshot::load(future.database()),
+            Err(DiffError::InvalidSession(_))
+        ));
+
+        let corrupt = store
+            .begin("npm", 0)
+            .expect("the corrupt session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the corrupt session should finalize");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(corrupt.database())
+            .expect("the session file should open");
+        file.rewind()
+            .expect("the session header should be selected");
+        file.write_all(b"Not SQLite data")
+            .expect("the session header should be corrupted");
+        drop(file);
+
+        assert!(SessionSnapshot::load(corrupt.database()).is_err());
     }
 
     #[test]
