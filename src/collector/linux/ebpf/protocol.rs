@@ -299,11 +299,199 @@ fn invalid_event(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
     use super::{
         decode, EventKind, SyscallOperation, DATA_HAS_ADDRESS, DATA_HAS_FIRST_PATH,
-        DATA_HAS_PAYLOAD, DATA_HAS_SECOND_PATH, HEADER_BYTES, MAX_DATA_BYTES, PATH_BYTES,
-        SOCKET_PAYLOAD_OFFSET, VERSION,
+        DATA_HAS_PAYLOAD, DATA_HAS_SECOND_PATH, DATA_TRUNCATED, HEADER_BYTES, MAX_DATA_BYTES,
+        MAX_EVENT_BYTES, PATH_BYTES, SOCKET_ADDRESS_BYTES, SOCKET_PAYLOAD_OFFSET,
+        SYSCALL_OPERATION_MASK, VERSION,
     };
+
+    #[test]
+    fn c_protocol_matches_the_rust_decoder() {
+        let mut source = String::from(
+            "#include <stddef.h>\n#include \"protocol.h\"\n#define CHECK(name, value) _Static_assert((name) == (value), #name \" mismatch\")\n",
+        );
+        let event_kinds = [
+            ("EXECWAKE_EVENT_HEARTBEAT", EventKind::Heartbeat as u16),
+            ("EXECWAKE_EVENT_PROCESS_FORK", EventKind::ProcessFork as u16),
+            ("EXECWAKE_EVENT_PROCESS_EXEC", EventKind::ProcessExec as u16),
+            ("EXECWAKE_EVENT_PROCESS_EXIT", EventKind::ProcessExit as u16),
+            ("EXECWAKE_EVENT_SYSCALL", EventKind::Syscall as u16),
+        ];
+        for (name, value) in event_kinds {
+            writeln!(source, "CHECK({name}, {value});").expect("writing to a string cannot fail");
+        }
+
+        let syscall_operations = [
+            ("EXECWAKE_SYSCALL_SOCKET", SyscallOperation::Socket),
+            ("EXECWAKE_SYSCALL_BIND", SyscallOperation::Bind),
+            ("EXECWAKE_SYSCALL_CONNECT", SyscallOperation::Connect),
+            ("EXECWAKE_SYSCALL_LISTEN", SyscallOperation::Listen),
+            ("EXECWAKE_SYSCALL_ACCEPT", SyscallOperation::Accept),
+            ("EXECWAKE_SYSCALL_CLOSE", SyscallOperation::Close),
+            ("EXECWAKE_SYSCALL_DUP", SyscallOperation::Duplicate),
+            ("EXECWAKE_SYSCALL_FCNTL", SyscallOperation::Fcntl),
+            ("EXECWAKE_SYSCALL_SENDTO", SyscallOperation::SendTo),
+            ("EXECWAKE_SYSCALL_RECVFROM", SyscallOperation::ReceiveFrom),
+            ("EXECWAKE_SYSCALL_WRITE", SyscallOperation::Write),
+            ("EXECWAKE_SYSCALL_READ", SyscallOperation::Read),
+            ("EXECWAKE_SYSCALL_OPEN_AT", SyscallOperation::OpenAt),
+            ("EXECWAKE_SYSCALL_READ_VECTOR", SyscallOperation::ReadVector),
+            (
+                "EXECWAKE_SYSCALL_WRITE_VECTOR",
+                SyscallOperation::WriteVector,
+            ),
+            ("EXECWAKE_SYSCALL_READ_AT", SyscallOperation::ReadAt),
+            ("EXECWAKE_SYSCALL_WRITE_AT", SyscallOperation::WriteAt),
+            ("EXECWAKE_SYSCALL_TRUNCATE", SyscallOperation::Truncate),
+            (
+                "EXECWAKE_SYSCALL_FILE_TRUNCATE",
+                SyscallOperation::FileTruncate,
+            ),
+            ("EXECWAKE_SYSCALL_RENAME_AT", SyscallOperation::RenameAt),
+            ("EXECWAKE_SYSCALL_LINK_AT", SyscallOperation::LinkAt),
+            ("EXECWAKE_SYSCALL_SYMLINK_AT", SyscallOperation::SymlinkAt),
+            ("EXECWAKE_SYSCALL_UNLINK_AT", SyscallOperation::UnlinkAt),
+            (
+                "EXECWAKE_SYSCALL_MAKE_DIRECTORY_AT",
+                SyscallOperation::MakeDirectoryAt,
+            ),
+            (
+                "EXECWAKE_SYSCALL_CHANGE_DIRECTORY",
+                SyscallOperation::ChangeDirectory,
+            ),
+            (
+                "EXECWAKE_SYSCALL_CHANGE_DIRECTORY_FD",
+                SyscallOperation::ChangeDirectoryFd,
+            ),
+            ("EXECWAKE_SYSCALL_MEMORY_MAP", SyscallOperation::MemoryMap),
+            ("EXECWAKE_SYSCALL_STAT_AT", SyscallOperation::StatAt),
+            (
+                "EXECWAKE_SYSCALL_READ_LINK_AT",
+                SyscallOperation::ReadLinkAt,
+            ),
+            (
+                "EXECWAKE_SYSCALL_READ_DIRECTORY",
+                SyscallOperation::ReadDirectory,
+            ),
+            ("EXECWAKE_SYSCALL_OPEN", SyscallOperation::Open),
+            ("EXECWAKE_SYSCALL_CREATE", SyscallOperation::Create),
+            ("EXECWAKE_SYSCALL_RENAME", SyscallOperation::Rename),
+            ("EXECWAKE_SYSCALL_LINK", SyscallOperation::Link),
+            ("EXECWAKE_SYSCALL_SYMLINK", SyscallOperation::Symlink),
+            ("EXECWAKE_SYSCALL_UNLINK", SyscallOperation::Unlink),
+            (
+                "EXECWAKE_SYSCALL_MAKE_DIRECTORY",
+                SyscallOperation::MakeDirectory,
+            ),
+            (
+                "EXECWAKE_SYSCALL_REMOVE_DIRECTORY",
+                SyscallOperation::RemoveDirectory,
+            ),
+            ("EXECWAKE_SYSCALL_STAT", SyscallOperation::Stat),
+            ("EXECWAKE_SYSCALL_OPEN_AT_2", SyscallOperation::OpenAt2),
+            ("EXECWAKE_SYSCALL_CLONE", SyscallOperation::Clone),
+            ("EXECWAKE_SYSCALL_CLONE_3", SyscallOperation::Clone3),
+            ("EXECWAKE_SYSCALL_FORK", SyscallOperation::Fork),
+            (
+                "EXECWAKE_SYSCALL_GET_SOCKET_NAME",
+                SyscallOperation::GetSocketName,
+            ),
+            (
+                "EXECWAKE_SYSCALL_GET_PEER_NAME",
+                SyscallOperation::GetPeerName,
+            ),
+        ];
+        for (name, operation) in syscall_operations {
+            writeln!(source, "CHECK({name}, {});", operation as u32)
+                .expect("writing to a string cannot fail");
+        }
+
+        for (name, value) in [
+            ("EXECWAKE_PROTOCOL_VERSION", u64::from(VERSION)),
+            ("EXECWAKE_EVENT_DATA_BYTES", MAX_DATA_BYTES as u64),
+            ("EXECWAKE_SOCKET_ADDRESS_BYTES", SOCKET_ADDRESS_BYTES as u64),
+            (
+                "EXECWAKE_SOCKET_PAYLOAD_BYTES",
+                (MAX_DATA_BYTES - SOCKET_PAYLOAD_OFFSET) as u64,
+            ),
+            (
+                "EXECWAKE_SYSCALL_OPERATION_MASK",
+                u64::from(SYSCALL_OPERATION_MASK),
+            ),
+            ("EXECWAKE_DATA_HAS_ADDRESS", u64::from(DATA_HAS_ADDRESS)),
+            ("EXECWAKE_DATA_HAS_PAYLOAD", u64::from(DATA_HAS_PAYLOAD)),
+            ("EXECWAKE_DATA_TRUNCATED", u64::from(DATA_TRUNCATED)),
+            (
+                "EXECWAKE_DATA_HAS_FIRST_PATH",
+                u64::from(DATA_HAS_FIRST_PATH),
+            ),
+            (
+                "EXECWAKE_DATA_HAS_SECOND_PATH",
+                u64::from(DATA_HAS_SECOND_PATH),
+            ),
+            ("EXECWAKE_PATH_BYTES", PATH_BYTES as u64),
+        ] {
+            writeln!(source, "CHECK({name}, {value});").expect("writing to a string cannot fail");
+        }
+        for (expression, value) in [
+            ("sizeof(struct execwake_event_header)", HEADER_BYTES),
+            ("sizeof(struct execwake_event)", MAX_EVENT_BYTES),
+            ("offsetof(struct execwake_event, data)", HEADER_BYTES),
+            ("offsetof(struct execwake_event_header, monotonic_ns)", 8),
+            ("offsetof(struct execwake_event_header, tgid)", 16),
+            ("offsetof(struct execwake_event_header, result)", 24),
+            ("offsetof(struct execwake_event_header, arguments)", 32),
+            ("offsetof(struct execwake_event_header, data_length)", 80),
+            ("offsetof(struct execwake_event_header, flags)", 84),
+            ("sizeof(struct execwake_socket_data)", MAX_DATA_BYTES),
+            (
+                "offsetof(struct execwake_socket_data, payload)",
+                SOCKET_PAYLOAD_OFFSET,
+            ),
+            ("sizeof(struct execwake_path_data)", MAX_DATA_BYTES),
+            ("offsetof(struct execwake_path_data, first)", 8),
+            (
+                "offsetof(struct execwake_path_data, second)",
+                8 + PATH_BYTES,
+            ),
+        ] {
+            writeln!(
+                source,
+                "_Static_assert({expression} == {value}, \"{expression}\");"
+            )
+            .expect("writing to a string cannot fail");
+        }
+
+        let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+        let mut child = Command::new(compiler)
+            .args(["-x", "c", "-std=c11", "-Wall", "-Werror", "-fsyntax-only"])
+            .arg("-I")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/bpf"))
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("a C compiler is required to verify the eBPF protocol");
+        child
+            .stdin
+            .take()
+            .expect("the compiler stdin should be piped")
+            .write_all(source.as_bytes())
+            .expect("the protocol contract should reach the compiler");
+        let output = child
+            .wait_with_output()
+            .expect("the protocol compiler should finish");
+        assert!(
+            output.status.success(),
+            "C and Rust eBPF protocols differ:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn decodes_a_bounded_little_endian_event() {
