@@ -4,3 +4,4 @@
 /web/node_modules/
 /fuzz/artifacts/
 /fuzz/corpus/
+/dist/

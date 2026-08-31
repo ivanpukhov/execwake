@@ -1,0 +1,24 @@
+name: Linux release artifact
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.67.0
+      - run: scripts/package-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: execwake-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
