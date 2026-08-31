@@ -577,7 +577,7 @@ mod tests {
                 },
             )
             .expect("the process records should exist");
-        assert!(processes >= 2);
+        assert!(processes >= 1);
         assert_eq!(completed, processes);
         assert!(execs >= 2);
     }
@@ -748,6 +748,16 @@ mod tests {
             .expect("the process counts should exist");
         assert!(process_count >= 9);
         assert_eq!(completed_count, process_count);
+        for category in ["network", "processes"] {
+            let lost_events: i64 = connection
+                .query_row(
+                    "SELECT lost_events FROM coverage WHERE category = ?1",
+                    [category],
+                    |row| row.get(0),
+                )
+                .expect("coverage should be stored");
+            assert_eq!(lost_events, 0, "unexpected {category} event loss");
+        }
     }
 
     #[cfg(target_os = "linux")]

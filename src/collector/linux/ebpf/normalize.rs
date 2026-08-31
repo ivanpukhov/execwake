@@ -16,7 +16,7 @@ use crate::collector::{
 };
 use crate::limits::{
     MAX_DNS_QUERIES_PER_SOCKET, MAX_FILE_SNAPSHOTS, MAX_LIVE_PROCESSES, MAX_SOCKETS_PER_PROCESS,
-    MAX_TRACKED_DESCRIPTORS_PER_PROCESS,
+    MAX_TRACKED_DESCRIPTORS_PER_PROCESS, MAX_TRACKED_THREADS,
 };
 use crate::privacy::{is_valid_environment_name, PathRoots};
 use crate::session::EvidenceKind;
@@ -96,6 +96,7 @@ struct SocketState {
 struct CloneClassification {
     parent: u32,
     operation: &'static str,
+    thread: bool,
 }
 
 #[derive(Default)]
@@ -225,6 +226,9 @@ impl Normalizer {
         else {
             return Ok(());
         };
+        if classification.thread {
+            return self.register_thread(child, classification.parent, sink);
+        }
         self.register_child(
             child,
             classification.parent,
@@ -237,6 +241,25 @@ impl Normalizer {
     fn observe_exec(&mut self, event: &Event, sink: &mut dyn CollectorSink) -> io::Result<()> {
         let process_id = event.tgid;
         let former = event.arguments[1] as u32;
+        if !self.processes.contains_key(&process_id) {
+            for alias in [event.arguments[0] as u32, former] {
+                if alias == process_id {
+                    continue;
+                }
+                let Some(process) = self.processes.remove(&alias) else {
+                    continue;
+                };
+                self.processes.insert(process_id, process);
+                self.threads.remove(&alias);
+                for owner in self.threads.values_mut() {
+                    if *owner == alias {
+                        *owner = process_id;
+                    }
+                }
+                self.threads.insert(process_id, process_id);
+                break;
+            }
+        }
         if former != process_id {
             if let Some(process) = self.processes.remove(&former) {
                 let occurred_at_ms = self.clock.event_time(event.monotonic_ns);
@@ -400,6 +423,9 @@ impl Normalizer {
             return Ok(());
         }
         let child = event.result as u32;
+        if clone_creates_thread(operation, event) {
+            return self.register_thread(child, event.tgid, sink);
+        }
         let label = if operation == SyscallOperation::Fork {
             "fork"
         } else {
@@ -485,9 +511,6 @@ impl Normalizer {
         let data = event.socket_data().map_err(|error| {
             io::Error::new(io::ErrorKind::InvalidData, format!("socket event: {error}"))
         })?;
-        if data.as_ref().map(|data| data.truncated).unwrap_or(false) {
-            sink.record_lost_events("network", 1).map_err(sink_error)?;
-        }
         match operation {
             SyscallOperation::Socket if event.result >= 0 => {
                 let socket_type = event.arguments[1] as i32 & 0xf;
@@ -676,6 +699,9 @@ impl Normalizer {
         let Some(data) = data else {
             return Ok(());
         };
+        if data.truncated {
+            sink.record_lost_events("network", 1).map_err(sink_error)?;
+        }
         if sending {
             if let Some((transaction, hostname)) = parse_dns_query(&data.payload) {
                 if !socket.dns_queries.contains_key(&transaction)
@@ -1325,6 +1351,20 @@ impl Normalizer {
         )
     }
 
+    fn register_thread(
+        &mut self,
+        thread: u32,
+        parent: u32,
+        sink: &mut dyn CollectorSink,
+    ) -> io::Result<()> {
+        if self.threads.len() >= MAX_TRACKED_THREADS {
+            return sink.record_lost_events("processes", 1).map_err(sink_error);
+        }
+        let owner = self.threads.get(&parent).copied().unwrap_or(parent);
+        self.threads.insert(thread, owner);
+        Ok(())
+    }
+
     fn register_orphan(
         &mut self,
         process_id: u32,
@@ -1515,15 +1555,8 @@ const fn event_kind_order(kind: EventKind) -> u8 {
 
 fn plan_clones(events: &[Event]) -> ClonePlan {
     let mut plan = ClonePlan::default();
-    let mut pending: HashMap<u32, VecDeque<(u64, u32)>> = HashMap::new();
+    let mut pending: HashMap<(u32, u32), VecDeque<&Event>> = HashMap::new();
     for event in events {
-        if event.kind == EventKind::ProcessFork {
-            pending
-                .entry(event.arguments[1] as u32)
-                .or_default()
-                .push_back((event.monotonic_ns, event.tgid));
-            continue;
-        }
         let Some(operation) = event.syscall_operation() else {
             continue;
         };
@@ -1535,32 +1568,53 @@ fn plan_clones(events: &[Event]) -> ClonePlan {
         {
             continue;
         }
-        let child = event.result as u32;
-        let Some(queue) = pending.get_mut(&child) else {
+        pending
+            .entry((event.tgid, event.tid))
+            .or_default()
+            .push_back(event);
+    }
+
+    for event in events
+        .iter()
+        .filter(|event| event.kind == EventKind::ProcessFork)
+    {
+        let Some(queue) = pending.get_mut(&(event.tgid, event.tid)) else {
             continue;
         };
-        let Some(position) = queue.iter().position(|(_, parent)| *parent == event.tgid) else {
+        let Some(position) = queue
+            .iter()
+            .position(|clone| clone.monotonic_ns <= event.monotonic_ns)
+        else {
             continue;
         };
-        let Some((fork_time, parent)) = queue.remove(position) else {
+        let Some(clone) = queue.remove(position) else {
             continue;
         };
+        let operation = clone
+            .syscall_operation()
+            .expect("pending clone has an operation");
         let operation_name = if operation == SyscallOperation::Fork {
             "fork"
         } else {
             "clone"
         };
+        let child = event.arguments[1] as u32;
         plan.forks.insert(
-            (fork_time, child),
+            (event.monotonic_ns, child),
             CloneClassification {
-                parent,
+                parent: event.tgid,
                 operation: operation_name,
+                thread: clone_creates_thread(operation, clone),
             },
         );
         plan.matched_clones
-            .insert((event.monotonic_ns, event.tgid, event.tid, event.result));
+            .insert((clone.monotonic_ns, clone.tgid, clone.tid, clone.result));
     }
     plan
+}
+
+fn clone_creates_thread(operation: SyscallOperation, event: &Event) -> bool {
+    operation != SyscallOperation::Fork && event.arguments[0] & (libc::CLONE_THREAD as u64) != 0
 }
 
 fn clean_path(path: PathBuf) -> PathBuf {
