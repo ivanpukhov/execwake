@@ -26,9 +26,12 @@ environment coverage is reported as partial because syscall observation cannot
 prove that every behavior was captured. ExecWake reports sockets, not HTTP
 requests, and does not store general application payloads.
 
-The default Linux backend combines ptrace detail capture with a cgroup-scoped
-eBPF loss monitor. It falls back to ptrace when the eBPF probe or cgroup v2
-scope is unavailable. Current overhead measurements are published in
+The default Linux backend uses a cgroup-scoped eBPF collector for process,
+filesystem, and socket events. It requires cgroup v2, the tracefs `sched` and
+`raw_syscalls` tracepoints, permission to create a child cgroup, and permission
+to load eBPF programs. ExecWake falls back to ptrace when those requirements
+are unavailable. The selected backend is stored in every session manifest.
+Current overhead measurements are published in
 [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 
 ## Build
