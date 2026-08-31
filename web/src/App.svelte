@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import DiffView from './DiffView.svelte';
   import Findings from './Findings.svelte';
+  import NodeEnrichment from './NodeEnrichment.svelte';
   import ProcessTree from './ProcessTree.svelte';
   import Timeline from './Timeline.svelte';
   import VirtualEventTable from './VirtualEventTable.svelte';
@@ -59,7 +60,10 @@
         <p class="eyebrow">ExecWake session</p>
         <h1>{report.commandName}</h1>
       </div>
-      <span class:interrupted={report.state === 'interrupted'} class="state">{report.state}</span>
+      <div class="session-labels">
+        {#if report.mode === 'instrumented'}<span class="state mode">instrumented</span>{/if}
+        <span class:interrupted={report.state === 'interrupted'} class="state">{report.state}</span>
+      </div>
     </header>
 
     <section class="metrics" aria-label="Session summary">
@@ -73,6 +77,17 @@
       <div class="panel-heading"><div><p class="eyebrow">Findings</p><h2>Deterministic rules</h2></div></div>
       <Findings findings={report.findings} total={report.findingCount} />
     </section>
+
+    {#if report.mode === 'instrumented'}
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Node enrichment</p><h2>Runtime evidence</h2></div>
+          <span class="section-count">{report.nodeEnrichmentCount} events</span>
+        </div>
+        <p class="evidence-note">Runtime evidence is separate from kernel socket events. Coverage is partial.</p>
+        <NodeEnrichment events={report.nodeEnrichment} total={report.nodeEnrichmentCount} />
+      </section>
+    {/if}
 
     <section class="panel">
       <div class="panel-heading">

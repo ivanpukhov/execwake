@@ -80,7 +80,6 @@ if (eventPath) {
     try {
       process.env = new Proxy(originalEnvironment, {
         get(target, property) {
-          const value = Reflect.get(target, property, target);
           if (
             typeof property === 'string' &&
             property !== controlName &&
@@ -92,7 +91,7 @@ if (eventPath) {
             seenEnvironmentNames.add(property);
             emit({ kind: 'environment', name: property });
           }
-          return value;
+          return Reflect.get(target, property, target);
         },
       });
     } catch {

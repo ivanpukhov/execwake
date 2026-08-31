@@ -527,13 +527,7 @@ fn event_message(process_id: libc::pid_t) -> io::Result<libc::c_ulong> {
 fn reap_killed_tracee(process_id: libc::pid_t) {
     loop {
         let mut wait_status = 0;
-        let result = unsafe {
-            libc::waitpid(
-                process_id,
-                &mut wait_status,
-                libc::__WALL | libc::__WNOTHREAD,
-            )
-        };
+        let result = unsafe { libc::waitpid(process_id, &mut wait_status, libc::__WALL) };
         if result < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -576,8 +570,7 @@ fn detach_new_tracee(process_id: libc::pid_t) -> io::Result<()> {
 
 fn wait_for(process_id: libc::pid_t, wait_status: &mut libc::c_int) -> io::Result<libc::pid_t> {
     loop {
-        let result =
-            unsafe { libc::waitpid(process_id, wait_status, libc::__WALL | libc::__WNOTHREAD) };
+        let result = unsafe { libc::waitpid(process_id, wait_status, libc::__WALL) };
         if result >= 0 {
             return Ok(result);
         }

@@ -36,10 +36,22 @@ export interface FindingReport {
   evidenceTruncated: boolean;
 }
 
+export interface NodeEnrichmentReport {
+  enrichmentId: number;
+  kind: 'http' | 'environment';
+  method: string | null;
+  host: string | null;
+  path: string | null;
+  environmentName: string | null;
+  processId: number;
+  monotonicNs: string;
+  evidence: 'observed';
+}
+
 export interface SessionReport {
   id: string;
   schemaVersion: number;
-  mode: 'observe';
+  mode: 'observe' | 'instrumented';
   state: 'running' | 'finalized' | 'interrupted';
   finalized: boolean;
   commandName: string;
@@ -54,6 +66,8 @@ export interface SessionReport {
   processes: ProcessReport[];
   eventCount: number;
   timelineEvents: EventReport[];
+  nodeEnrichmentCount: number;
+  nodeEnrichment: NodeEnrichmentReport[];
   findingCount: number;
   findings: FindingReport[];
 }

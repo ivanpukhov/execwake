@@ -225,8 +225,7 @@ impl NodeEnrichmentRecord {
         host: &str,
         path: &str,
     ) -> Option<Self> {
-        let method = clean_method(method)?;
-        let (host, path) = clean_host_and_path(host, path)?;
+        let (method, host, path) = sanitize_http_fact(method, host, path)?;
         Some(Self {
             operating_system_id,
             monotonic_ns,
@@ -245,6 +244,16 @@ impl NodeEnrichmentRecord {
             }
         })
     }
+}
+
+pub(crate) fn sanitize_http_fact(
+    method: &str,
+    host: &str,
+    path: &str,
+) -> Option<(String, String, String)> {
+    let method = clean_method(method)?;
+    let (host, path) = clean_host_and_path(host, path)?;
+    Some((method, host, path))
 }
 
 fn clean_method(method: &str) -> Option<String> {

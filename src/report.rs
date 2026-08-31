@@ -19,6 +19,8 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::display_text::sanitize;
+use crate::node_enrichment::sanitize_http_fact;
+use crate::privacy::is_valid_environment_name;
 use crate::session::{SessionMode, CURRENT_SCHEMA_VERSION};
 use crate::session_input::{canonical_session_file, check_integrity, configure_read_only};
 use crate::storage::SessionPaths;
@@ -468,6 +470,8 @@ struct SessionReport {
     processes: Vec<ProcessReport>,
     event_count: i64,
     timeline_events: Vec<EventReport>,
+    node_enrichment_count: i64,
+    node_enrichment: Vec<NodeEnrichmentReport>,
     finding_count: i64,
     findings: Vec<FindingReport>,
 }
@@ -524,6 +528,20 @@ struct EventPage {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct NodeEnrichmentReport {
+    enrichment_id: i64,
+    kind: String,
+    method: Option<String>,
+    host: Option<String>,
+    path: Option<String>,
+    environment_name: Option<String>,
+    process_id: i64,
+    monotonic_ns: String,
+    evidence: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct FindingReport {
     finding_id: i64,
     rule_id: String,
@@ -570,6 +588,8 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
                 processes: Vec::new(),
                 event_count: 0,
                 timeline_events: Vec::new(),
+                node_enrichment_count: 0,
+                node_enrichment: Vec::new(),
                 finding_count: 0,
                 findings: Vec::new(),
             })
@@ -581,9 +601,70 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
     report.processes = query_processes(&connection)?;
     report.event_count = query_event_count(&connection)?;
     report.timeline_events = query_timeline_events(&connection, report.event_count)?;
+    report.node_enrichment_count = query_count(&connection, "node_enrichment")?;
+    report.node_enrichment = query_node_enrichment(&connection)?;
     report.finding_count = query_count(&connection, "finding")?;
     report.findings = query_findings(&connection)?;
     Ok(report)
+}
+
+fn query_node_enrichment(connection: &Connection) -> rusqlite::Result<Vec<NodeEnrichmentReport>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT enrichment_id, kind, method, host, path, environment_name,
+                process_id, monotonic_ns, evidence
+         FROM node_enrichment
+         ORDER BY enrichment_id
+         LIMIT {}",
+        crate::limits::REPORT_NODE_ENRICHMENT_LIMIT
+    ))?;
+    let rows = statement
+        .query_map([], |row| {
+            let enrichment_id = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let method: Option<String> = row.get(2)?;
+            let host: Option<String> = row.get(3)?;
+            let path: Option<String> = row.get(4)?;
+            let environment_name: Option<String> = row.get(5)?;
+            let process_id = row.get(6)?;
+            let monotonic_ns = row.get::<_, i64>(7)?.to_string();
+            let evidence = sanitize(&row.get::<_, String>(8)?);
+            let report = match kind.as_str() {
+                "http" => method
+                    .as_deref()
+                    .zip(host.as_deref())
+                    .zip(path.as_deref())
+                    .and_then(|((method, host), path)| sanitize_http_fact(method, host, path))
+                    .map(|(method, host, path)| NodeEnrichmentReport {
+                        enrichment_id,
+                        kind,
+                        method: Some(method),
+                        host: Some(host),
+                        path: Some(path),
+                        environment_name: None,
+                        process_id,
+                        monotonic_ns,
+                        evidence,
+                    }),
+                "environment" => environment_name
+                    .filter(|name| is_valid_environment_name(name))
+                    .map(|name| NodeEnrichmentReport {
+                        enrichment_id,
+                        kind,
+                        method: None,
+                        host: None,
+                        path: None,
+                        environment_name: Some(sanitize(&name)),
+                        process_id,
+                        monotonic_ns,
+                        evidence,
+                    }),
+                _ => None,
+            };
+            Ok(report)
+        })?
+        .filter_map(|row| row.transpose())
+        .collect();
+    rows
 }
 
 fn query_coverage(connection: &Connection) -> rusqlite::Result<Vec<CoverageReport>> {
@@ -1047,6 +1128,74 @@ mod tests {
             .query_row("SELECT target FROM event", [], |row| row.get(0))
             .expect("the raw event should remain available");
         assert_eq!(raw, hostile);
+    }
+
+    #[test]
+    fn bounds_and_sanitizes_node_enrichment_in_the_report_payload() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin_in_mode("node", 0, SessionMode::Instrumented)
+            .expect("an instrumented session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the instrumented session should finalize");
+        let mut connection = rusqlite::Connection::open(session.database())
+            .expect("the session database should open");
+        let transaction = connection
+            .transaction()
+            .expect("an enrichment transaction should start");
+        transaction
+            .execute(
+                "INSERT INTO process (
+                     process_id, operating_system_id, parent_process_id, executable,
+                     started_at_ms, evidence
+                 ) VALUES (1, 77, NULL, 'node', 0, 'observed')",
+                [],
+            )
+            .expect("the process should be inserted");
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO node_enrichment (
+                         kind, method, host, path, environment_name, process_id,
+                         monotonic_ns, evidence
+                     ) VALUES (
+                         'http', 'GET', ?1, '/path?token=<script>', NULL, 1, ?2, 'observed'
+                     )",
+                )
+                .expect("the enrichment insert should prepare");
+            for index in 0..=crate::limits::REPORT_NODE_ENRICHMENT_LIMIT {
+                statement
+                    .execute(rusqlite::params![
+                        "example.test",
+                        i64::try_from(index).expect("the timestamp should fit")
+                    ])
+                    .expect("the enrichment row should be inserted");
+            }
+        }
+        transaction
+            .commit()
+            .expect("the enrichment rows should commit");
+        drop(connection);
+
+        let report = load_report(session.database().to_owned()).expect("the report should load");
+
+        assert_eq!(
+            report.node_enrichment_count,
+            i64::try_from(crate::limits::REPORT_NODE_ENRICHMENT_LIMIT + 1)
+                .expect("the count should fit")
+        );
+        assert_eq!(
+            report.node_enrichment.len(),
+            crate::limits::REPORT_NODE_ENRICHMENT_LIMIT
+        );
+        assert_eq!(
+            report.node_enrichment[0]
+                .path
+                .as_deref()
+                .expect("the path should be present"),
+            "/path"
+        );
     }
 
     #[test]

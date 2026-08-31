@@ -70,6 +70,45 @@ Pipelines require an explicit shell:
 execwake run -- sh -c 'printf input | sort'
 ```
 
+### Node enrichment
+
+Node enrichment is disabled by default. Enable it for a Node command with:
+
+```sh
+execwake run --node-enrichment -- node app.js
+```
+
+The resulting manifest uses `instrumented` mode and reports
+`node_enrichment` coverage as partial. Runtime evidence contains only:
+
+- the HTTP method and cleaned host and path;
+- the name of a property read through `process.env`;
+- the process identity and a monotonic timestamp.
+
+Query strings, fragments, environment values, headers, cookies, request and
+response bodies are not collected. Runtime HTTP evidence is stored separately
+from kernel socket facts and does not replace them.
+
+ExecWake appends a CommonJS `--require` preload to `NODE_OPTIONS`, preserving
+existing options. The preload subscribes to the Node
+`http.client.request.start` diagnostics channel and the Undici
+`undici:request:create` channel used by built-in `fetch`. Node processes that
+inherit `NODE_OPTIONS`, including ordinary child Node processes and workers,
+also load the preload. CommonJS and ESM entry points are supported.
+
+The integration test uses Node 22 and covers CommonJS, ESM, child processes,
+workers, built-in `fetch`, and `https.request` against loopback servers.
+
+`NODE_OPTIONS` is visible to the traced program and can affect startup in the
+same way as a manually supplied `--require`. A program can bypass or disrupt
+enrichment by clearing or replacing `NODE_OPTIONS` for a child, changing worker
+execution options, replacing `process.env`, using native environment access,
+changing the control event file, forging runtime records, using an HTTP client
+that does not publish these channels, or writing directly to sockets. The
+diagnostics channels and runtime HTTP implementations can also change between
+Node releases. These limits are why enrichment remains partial and is not a
+security boundary.
+
 Compare two finalized session files with:
 
 ```sh
