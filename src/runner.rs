@@ -385,6 +385,17 @@ mod tests {
                 .expect("the collector backend should be stored");
             assert_eq!(backend, "ebpf");
         }
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("EXECWAKE_FORCE_PTRACE").is_some() {
+            let backend: String = connection
+                .query_row(
+                    "SELECT collector_backend FROM session WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the collector backend should be stored");
+            assert_eq!(backend, "ptrace");
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -35,6 +35,10 @@ pub enum LinuxCollector {
 
 impl LinuxCollector {
     pub fn new(root_executable: String) -> Self {
+        #[cfg(test)]
+        if std::env::var_os("EXECWAKE_FORCE_PTRACE").is_some() {
+            return Self::Ptrace(PtraceCollector::new(root_executable));
+        }
         match EbpfCollector::new(root_executable.clone()) {
             Ok(collector) => Self::Ebpf(collector),
             Err(_error) => {
@@ -568,7 +572,7 @@ mod tests {
 
         let run = probe.start().expect("the event reader should start");
         let status = command.status().expect("the fixture command should run");
-        let output = run.stop().expect("the event reader should stop");
+        let output = probe.stop(run).expect("the event reader should stop");
 
         assert!(status.success());
         assert_eq!(output.lost_events, 0);
@@ -615,7 +619,7 @@ mod tests {
 
         let run = probe.start().expect("the event reader should start");
         let status = command.status().expect("the fixture command should run");
-        let output = run.stop().expect("the event reader should stop");
+        let output = probe.stop(run).expect("the event reader should stop");
         server.join().expect("the server should finish");
 
         assert!(status.success());
@@ -668,7 +672,7 @@ mod tests {
 
         let run = probe.start().expect("the event reader should start");
         let status = command.status().expect("the fixture command should run");
-        let output = run.stop().expect("the event reader should stop");
+        let output = probe.stop(run).expect("the event reader should stop");
         fs::remove_dir_all(&root).expect("the fixture directory should be removed");
 
         assert!(status.success());
