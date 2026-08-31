@@ -10,18 +10,20 @@ Engine 29.5.2.
 Each result is the median of seven runs after one warm-up. Baseline and traced
 runs used the same local fixture and did not contact package registries. The
 fixture is in `benchmarks/fixtures/workload` and the complete command is
-`benchmarks/measure-overhead.sh`.
+`benchmarks/measure-overhead.sh /path/to/execwake 7 ebpf`. The run required the
+eBPF backend, verified zero process and network event loss, and enforced a
+1,000 ms added-latency budget for each workload.
 
 Tool versions: npm 9.2.0, pnpm 8.15.9, bun 1.1.38, pip 23.0.1 with Python
 3.11.2, and cargo 1.88.0.
 
 | Workload | Baseline ms | ExecWake ms | Added ms | Ratio |
 | --- | ---: | ---: | ---: | ---: |
-| `npm run --silent noop` | 396.2 | 10976.1 | 10579.9 | 27.70x |
-| `pnpm run --silent noop` | 526.9 | 3064.0 | 2537.1 | 5.82x |
-| `bun run noop` | 76.1 | 1012.3 | 936.3 | 13.31x |
-| `python3 -m pip show pip` | 215.7 | 6901.0 | 6685.2 | 31.99x |
-| `cargo metadata --quiet --no-deps --format-version 1` | 55.7 | 759.0 | 703.3 | 13.62x |
+| `npm run --silent noop` | 418.1 | 708.4 | 290.4 | 1.69x |
+| `pnpm run --silent noop` | 541.3 | 720.0 | 178.7 | 1.33x |
+| `bun run noop` | 77.8 | 231.0 | 153.2 | 2.97x |
+| `python3 -m pip show pip` | 206.9 | 457.5 | 250.6 | 2.21x |
+| `cargo metadata --quiet --no-deps --format-version 1` | 48.3 | 189.6 | 141.2 | 3.92x |
 
 These short workloads emphasize collector startup and final state-delta work.
 They are not install or build throughput measurements.
