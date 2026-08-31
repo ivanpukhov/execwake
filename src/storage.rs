@@ -13,6 +13,7 @@ use crate::collector::{
     FileDeltaRecord, ProcessExecRecord, ProcessExitRecord, ProcessRecord, SinkError,
 };
 use crate::findings::{evaluate, EvidenceReference, FindingEvent};
+use crate::limits::{CaptureLimits, SQLITE_CACHE_KIB};
 use crate::privacy::CURRENT_PRIVACY_PROFILE;
 use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage, CURRENT_SCHEMA_VERSION};
 
@@ -191,8 +192,23 @@ impl SessionStore {
         command_name: &str,
         argument_count: usize,
     ) -> Result<ActiveSession, StoreError> {
+        self.begin_with_limits(command_name, argument_count, CaptureLimits::DEFAULT)
+    }
+
+    fn begin_with_limits(
+        &self,
+        command_name: &str,
+        argument_count: usize,
+        limits: CaptureLimits,
+    ) -> Result<ActiveSession, StoreError> {
         if command_name.is_empty() || command_name.chars().any(|character| character.is_control()) {
             return Err(StoreError::InvalidInput("invalid command name"));
+        }
+        if limits.event_count == 0
+            || limits.text_bytes == 0
+            || limits.finalization_bytes >= limits.session_bytes
+        {
+            return Err(StoreError::InvalidInput("invalid capture limits"));
         }
 
         let argument_count = i64::try_from(argument_count)
@@ -202,13 +218,18 @@ impl SessionStore {
         FileExt::try_lock_exclusive(&lock_file)?;
         create_private_file(paths.database())?;
 
-        let result = initialize_database(&paths, command_name, argument_count);
+        let result = initialize_database(&paths, command_name, argument_count, limits);
         match result {
             Ok(connection) => Ok(ActiveSession {
                 paths,
                 connection,
                 lock_file: Some(lock_file),
                 finalized: false,
+                limits,
+                recorded_events: 0,
+                capture_losses: CaptureLosses::default(),
+                database_saturated: false,
+                writes_until_size_check: 0,
             }),
             Err(error) => {
                 let _ = FileExt::unlock(&lock_file);
@@ -255,11 +276,119 @@ pub struct ActiveSession {
     connection: Connection,
     lock_file: Option<File>,
     finalized: bool,
+    limits: CaptureLimits,
+    recorded_events: u64,
+    capture_losses: CaptureLosses,
+    database_saturated: bool,
+    writes_until_size_check: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CaptureLosses {
+    processes: u64,
+    filesystem: u64,
+    network: u64,
+    environment: u64,
+}
+
+impl CaptureLosses {
+    fn record(&mut self, category: &str) {
+        let counter = match category {
+            "process" | "processes" => &mut self.processes,
+            "filesystem" => &mut self.filesystem,
+            "network" => &mut self.network,
+            "environment" => &mut self.environment,
+            _ => return,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    const fn any(self) -> bool {
+        self.processes > 0 || self.filesystem > 0 || self.network > 0 || self.environment > 0
+    }
 }
 
 impl ActiveSession {
     pub fn paths(&self) -> &SessionPaths {
         &self.paths
+    }
+
+    fn capture_allowed(
+        &mut self,
+        category: &str,
+        text: &[&str],
+        event: bool,
+    ) -> Result<bool, SinkError> {
+        if self.database_saturated
+            || (event && self.recorded_events >= self.limits.event_count)
+            || text
+                .iter()
+                .any(|value| value.len() > self.limits.text_bytes)
+        {
+            self.capture_losses.record(category);
+            return Ok(false);
+        }
+
+        if self.writes_until_size_check == 0 {
+            let page_count: i64 = self
+                .connection
+                .query_row("PRAGMA page_count", [], |row| row.get(0))
+                .map_err(|error| Box::new(error) as SinkError)?;
+            let page_size: i64 = self
+                .connection
+                .query_row("PRAGMA page_size", [], |row| row.get(0))
+                .map_err(|error| Box::new(error) as SinkError)?;
+            let allocated_bytes = u64::try_from(page_count)
+                .ok()
+                .and_then(|count| {
+                    u64::try_from(page_size)
+                        .ok()
+                        .and_then(|size| count.checked_mul(size))
+                })
+                .ok_or_else(|| {
+                    Box::new(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "session database size is invalid",
+                    )) as SinkError
+                })?;
+            let capture_budget = self
+                .limits
+                .session_bytes
+                .saturating_sub(self.limits.finalization_bytes);
+            if allocated_bytes >= capture_budget {
+                self.database_saturated = true;
+                self.capture_losses.record(category);
+                return Ok(false);
+            }
+            self.writes_until_size_check = 64;
+        }
+
+        Ok(true)
+    }
+
+    fn finish_capture(
+        &mut self,
+        category: &str,
+        event: bool,
+        result: rusqlite::Result<usize>,
+    ) -> Result<(), SinkError> {
+        match result {
+            Ok(_) => {
+                self.writes_until_size_check = self.writes_until_size_check.saturating_sub(1);
+                if event {
+                    self.recorded_events = self.recorded_events.saturating_add(1);
+                }
+                Ok(())
+            }
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DiskFull =>
+            {
+                self.database_saturated = true;
+                self.capture_losses.record(category);
+                Ok(())
+            }
+            Err(error) => Err(Box::new(error)),
+        }
     }
 
     pub fn record_root_process(&mut self, process_id: u32) -> Result<(), StoreError> {
@@ -310,7 +439,10 @@ impl ActiveSession {
                )",
             [ended_at_ms],
         )?;
-        persist_findings(&transaction)?;
+        if !self.database_saturated {
+            persist_findings(&transaction)?;
+        }
+        apply_capture_losses(&transaction, self.capture_losses)?;
         let updated = transaction.execute(
             "UPDATE session
              SET state = 'finalized', finalized = 1, ended_at_ms = ?1,
@@ -349,13 +481,15 @@ impl CollectorSink for ActiveSession {
     }
 
     fn record_process(&mut self, process: ProcessRecord) -> Result<(), SinkError> {
+        if !self.capture_allowed("processes", &[&process.executable], false)? {
+            return Ok(());
+        }
         let process_id = database_process_id(process.identity.get())?;
         let parent_process_id = process
             .parent
             .map(|identity| database_process_id(identity.get()))
             .transpose()?;
-        self.connection
-            .execute(
+        let result = self.connection.execute(
                 "INSERT INTO process (
                      process_id, operating_system_id, start_time_ticks, parent_process_id, executable,
                      started_at_ms, evidence
@@ -369,119 +503,124 @@ impl CollectorSink for ActiveSession {
                     process.occurred_at_ms,
                     process.evidence.as_str(),
                 ],
-            )
-            .map(|_| ())
-            .map_err(|error| Box::new(error) as SinkError)
+            );
+        self.finish_capture("processes", false, result)
     }
 
     fn record_process_exec(&mut self, process: ProcessExecRecord) -> Result<(), SinkError> {
+        if !self.capture_allowed("processes", &[&process.executable], false)? {
+            return Ok(());
+        }
         let process_id = database_process_id(process.identity.get())?;
-        self.connection
-            .execute(
-                "UPDATE process SET executable = ?1 WHERE process_id = ?2",
-                params![process.executable, process_id],
-            )
-            .map(|_| ())
-            .map_err(|error| Box::new(error) as SinkError)
+        let result = self.connection.execute(
+            "UPDATE process SET executable = ?1 WHERE process_id = ?2",
+            params![process.executable, process_id],
+        );
+        self.finish_capture("processes", false, result)
     }
 
     fn record_process_exit(&mut self, process: ProcessExitRecord) -> Result<(), SinkError> {
+        if !self.capture_allowed("processes", &[], false)? {
+            return Ok(());
+        }
         let process_id = database_process_id(process.identity.get())?;
-        self.connection
-            .execute(
-                "UPDATE process
+        let result = self.connection.execute(
+            "UPDATE process
                  SET ended_at_ms = ?1, exit_code = ?2, termination_signal = ?3
                  WHERE process_id = ?4",
-                params![
-                    process.occurred_at_ms,
-                    process.exit_code,
-                    process.termination_signal,
-                    process_id,
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| Box::new(error) as SinkError)
+            params![
+                process.occurred_at_ms,
+                process.exit_code,
+                process.termination_signal,
+                process_id,
+            ],
+        );
+        self.finish_capture("processes", false, result)
     }
 
     fn record_file_delta(&mut self, delta: FileDeltaRecord) -> Result<(), SinkError> {
-        self.connection
-            .execute(
-                "INSERT INTO filesystem_delta (
+        if !self.capture_allowed("filesystem", &[&delta.path], false)? {
+            return Ok(());
+        }
+        let result = self.connection.execute(
+            "INSERT INTO filesystem_delta (
                      path, before_kind, before_size, before_modified_at_ns,
                      after_kind, after_size, after_modified_at_ns, evidence
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'derived')",
-                params![
-                    delta.path,
-                    delta.before.kind.as_str(),
-                    delta.before.size,
-                    delta.before.modified_at_ns,
-                    delta.after.kind.as_str(),
-                    delta.after.size,
-                    delta.after.modified_at_ns,
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| Box::new(error) as SinkError)
+            params![
+                delta.path,
+                delta.before.kind.as_str(),
+                delta.before.size,
+                delta.before.modified_at_ns,
+                delta.after.kind.as_str(),
+                delta.after.size,
+                delta.after.modified_at_ns,
+            ],
+        );
+        self.finish_capture("filesystem", false, result)
     }
 
     fn record_dns_correlation(&mut self, dns: DnsCorrelationRecord) -> Result<(), SinkError> {
-        self.connection
-            .execute(
-                "INSERT INTO dns_correlation (
+        if !self.capture_allowed("network", &[&dns.hostname, &dns.address], false)? {
+            return Ok(());
+        }
+        let result = self.connection.execute(
+            "INSERT INTO dns_correlation (
                      hostname, address, process_id, occurred_at_ms, evidence, confidence
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    dns.hostname,
-                    dns.address,
-                    database_process_id(dns.process.get())?,
-                    dns.occurred_at_ms,
-                    dns.evidence.as_str(),
-                    dns.confidence.as_str(),
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| Box::new(error) as SinkError)
+            params![
+                dns.hostname,
+                dns.address,
+                database_process_id(dns.process.get())?,
+                dns.occurred_at_ms,
+                dns.evidence.as_str(),
+                dns.confidence.as_str(),
+            ],
+        );
+        self.finish_capture("network", false, result)
     }
 
     fn record_environment_variable(
         &mut self,
         environment: EnvironmentVariableRecord,
     ) -> Result<(), SinkError> {
-        self.connection
-            .execute(
-                "INSERT INTO environment_variable (name, process_id, evidence)
+        if !self.capture_allowed("environment", &[&environment.name], false)? {
+            return Ok(());
+        }
+        let result = self.connection.execute(
+            "INSERT INTO environment_variable (name, process_id, evidence)
                  VALUES (?1, ?2, ?3)",
-                params![
-                    environment.name,
-                    database_process_id(environment.process.get())?,
-                    environment.evidence.as_str(),
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| Box::new(error) as SinkError)
+            params![
+                environment.name,
+                database_process_id(environment.process.get())?,
+                environment.evidence.as_str(),
+            ],
+        );
+        self.finish_capture("environment", false, result)
     }
 
     fn record_event(&mut self, event: CollectorEvent) -> Result<(), SinkError> {
+        if !self.capture_allowed(event.category, &[&event.target], true)? {
+            return Ok(());
+        }
         let process_id = event
             .process
             .map(|identity| database_process_id(identity.get()))
             .transpose()?;
-        self.connection
-            .execute(
-                "INSERT INTO event (
+        let result = self.connection.execute(
+            "INSERT INTO event (
                      category, operation, target, process_id, occurred_at_ms, evidence
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    event.category,
-                    event.operation,
-                    event.target,
-                    process_id,
-                    event.occurred_at_ms,
-                    event.evidence.as_str(),
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| Box::new(error) as SinkError)
+            params![
+                event.category,
+                event.operation,
+                event.target,
+                process_id,
+                event.occurred_at_ms,
+                event.evidence.as_str(),
+            ],
+        );
+        self.finish_capture(event.category, true, result)
     }
 
     fn set_coverage(&mut self, coverage: SessionCoverage) -> Result<(), SinkError> {
@@ -525,6 +664,32 @@ fn update_coverage(
     Ok(())
 }
 
+fn apply_capture_losses(
+    transaction: &rusqlite::Transaction<'_>,
+    losses: CaptureLosses,
+) -> rusqlite::Result<()> {
+    if !losses.any() {
+        return Ok(());
+    }
+    for (category, lost_events) in [
+        ("processes", losses.processes),
+        ("filesystem", losses.filesystem),
+        ("network", losses.network),
+        ("environment", losses.environment),
+    ] {
+        if lost_events == 0 {
+            continue;
+        }
+        transaction.execute(
+            "UPDATE coverage
+             SET state = 'partial', lost_events = lost_events + ?1
+             WHERE category = ?2",
+            params![lost_events, category],
+        )?;
+    }
+    Ok(())
+}
+
 impl Drop for ActiveSession {
     fn drop(&mut self) {
         if !self.finalized {
@@ -539,6 +704,7 @@ fn initialize_database(
     paths: &SessionPaths,
     command_name: &str,
     argument_count: i64,
+    limits: CaptureLimits,
 ) -> Result<Connection, StoreError> {
     let mut connection = Connection::open_with_flags(
         paths.database(),
@@ -550,6 +716,8 @@ fn initialize_database(
         "PRAGMA journal_mode = DELETE;
          PRAGMA synchronous = FULL;
          PRAGMA foreign_keys = ON;
+         PRAGMA temp_store = FILE;
+         PRAGMA mmap_size = 0;
          CREATE TABLE session (
              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
              id TEXT NOT NULL,
@@ -636,6 +804,15 @@ fn initialize_database(
              PRIMARY KEY (finding_id, event_id)
          );",
     )?;
+    connection.pragma_update(None, "cache_size", -SQLITE_CACHE_KIB)?;
+    let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let page_size = u64::try_from(page_size)
+        .map_err(|_| StoreError::InvalidInput("invalid SQLite page size"))?;
+    let max_pages = limits.session_bytes / page_size;
+    if max_pages == 0 {
+        return Err(StoreError::InvalidInput("session size limit is too small"));
+    }
+    connection.pragma_update(None, "max_page_count", max_pages)?;
 
     let transaction = connection.transaction()?;
     transaction.execute(
@@ -955,6 +1132,7 @@ mod tests {
     use crate::collector::{
         CollectorEvent, CollectorSink, EnvironmentVariableRecord, ProcessIdentity, ProcessRecord,
     };
+    use crate::limits::CaptureLimits;
     use crate::privacy::CURRENT_PRIVACY_PROFILE;
     use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage};
 
@@ -1108,6 +1286,59 @@ mod tests {
             .expect("the session row should exist");
 
         assert_eq!(row, ("finalized".to_owned(), 1, "printf".to_owned(), 2, 7));
+    }
+
+    #[test]
+    fn capture_limits_keep_a_partial_finalized_session() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let limits = CaptureLimits {
+            event_count: 2,
+            session_bytes: 512 * 1024,
+            finalization_bytes: 64 * 1024,
+            text_bytes: 8,
+        };
+        let mut session = store
+            .begin_with_limits("fixture", 0, limits)
+            .expect("a limited session should start");
+
+        for target in ["first", "second", "third", "target-too-long"] {
+            session
+                .record_event(CollectorEvent {
+                    category: "filesystem",
+                    operation: "read",
+                    target: target.to_owned(),
+                    process: None,
+                    occurred_at_ms: 1,
+                    evidence: EvidenceKind::Observed,
+                })
+                .expect("capture pressure should not fail the session");
+        }
+        let paths = session
+            .finalize(SessionOutcome::exited(0))
+            .expect("the limited session should finalize");
+
+        let connection = Connection::open(paths.database()).expect("the database should open");
+        let event_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM event", [], |row| row.get(0))
+            .expect("events should be counted");
+        let coverage: (String, i64) = connection
+            .query_row(
+                "SELECT state, lost_events FROM coverage WHERE category = 'filesystem'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("coverage should be readable");
+        let page_count: i64 = connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .expect("page count should be readable");
+        let page_size: i64 = connection
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .expect("page size should be readable");
+
+        assert_eq!(event_count, 2);
+        assert_eq!(coverage, ("partial".to_owned(), 2));
+        assert!(page_count * page_size <= limits.session_bytes as i64);
     }
 
     #[test]

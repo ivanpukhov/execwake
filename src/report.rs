@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::SessionPaths;
 
-const BODY_LIMIT: usize = 16 * 1024;
+const BODY_LIMIT: usize = crate::limits::REPORT_REQUEST_BYTES;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const REPORT_SHELL: &str = include_str!("report/assets/index.html");
 const REPORT_JAVASCRIPT: &[u8] = include_bytes!("report/assets/assets/app.js");

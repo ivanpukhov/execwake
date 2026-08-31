@@ -2,6 +2,7 @@ pub mod behavior;
 pub mod cli;
 pub mod collector;
 pub mod findings;
+mod limits;
 pub mod privacy;
 pub mod report;
 pub mod runner;
