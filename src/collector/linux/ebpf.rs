@@ -127,7 +127,7 @@ impl Collector for EbpfCollector {
         let clock = normalize::CaptureClock::now()?;
         let run = self.probe.start()?;
         let result = child.wait();
-        let output = run.stop()?;
+        let output = self.probe.stop(run)?;
         let status = result?;
         let root_pid = output
             .events
@@ -260,7 +260,7 @@ impl Drop for CgroupScope {
 }
 
 struct EbpfProbe {
-    _bpf: Bpf,
+    bpf: Bpf,
     buffers: Option<Vec<PerfEventArrayBuffer<MapRefMut>>>,
 }
 
@@ -316,7 +316,7 @@ impl EbpfProbe {
             );
         }
         Ok(Self {
-            _bpf: bpf,
+            bpf,
             buffers: Some(buffers),
         })
     }
@@ -327,6 +327,16 @@ impl EbpfProbe {
             .take()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "eBPF probe already started"))?;
         Ok(ProbeRun::start(buffers))
+    }
+
+    fn stop(&mut self, run: ProbeRun) -> io::Result<ProbeOutput> {
+        let mut output = run.stop()?;
+        let losses = Array::<_, u64>::try_from(self.bpf.map_mut("LOSSES").map_err(other_error)?)
+            .map_err(other_error)?;
+        output.lost_events = output
+            .lost_events
+            .saturating_add(losses.get(&0, 0).map_err(other_error)?);
+        Ok(output)
     }
 }
 

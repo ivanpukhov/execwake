@@ -71,6 +71,13 @@ struct bpf_map_def SEC("maps") EVENTS = {
     .max_entries = 0,
 };
 
+struct bpf_map_def SEC("maps") LOSSES = {
+    .type = BPF_MAP_TYPE_ARRAY,
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(__u64),
+    .max_entries = 1,
+};
+
 struct bpf_map_def SEC("maps") SYSCALL_OPERATIONS = {
     .type = BPF_MAP_TYPE_HASH,
     .key_size = sizeof(__s64),
@@ -105,6 +112,19 @@ static ALWAYS_INLINE int in_target_cgroup(void) {
     __u32 key = 0;
     __u64 *target = bpf_map_lookup_elem(&TARGET_CGROUP, &key);
     return target && bpf_get_current_cgroup_id() == *target;
+}
+
+static ALWAYS_INLINE void record_loss(void) {
+    __u32 key = 0;
+    __u64 *losses = bpf_map_lookup_elem(&LOSSES, &key);
+    if (losses)
+        __sync_fetch_and_add(losses, 1);
+}
+
+static ALWAYS_INLINE void emit_event(void *context, const void *event,
+                                     __u32 size) {
+    if (bpf_perf_event_output(context, &EVENTS, 0xffffffffULL, event, size) < 0)
+        record_loss();
 }
 
 static ALWAYS_INLINE void initialize_event(struct execwake_event_header *event,
@@ -314,8 +334,7 @@ int observe_process_fork(struct sched_process_fork_context *context) {
     initialize_event(&event, EXECWAKE_EVENT_PROCESS_FORK);
     event.arguments[0] = context->parent_pid;
     event.arguments[1] = context->child_pid;
-    bpf_perf_event_output(context, &EVENTS, 0xffffffffULL, &event,
-                          sizeof(event));
+    emit_event(context, &event, sizeof(event));
     return 0;
 }
 
@@ -336,11 +355,12 @@ int observe_process_exec(struct sched_process_exec_context *context) {
         event.header.data_length = length;
         output_size += length;
     }
-    if (output_size > sizeof(event))
+    if (output_size > sizeof(event)) {
+        record_loss();
         return 0;
+    }
     event.header.size = output_size;
-    bpf_perf_event_output(context, &EVENTS, 0xffffffffULL, &event,
-                          output_size);
+    emit_event(context, &event, output_size);
     return 0;
 }
 
@@ -352,8 +372,7 @@ int observe_process_exit(struct sched_process_exit_context *context) {
     struct execwake_event_header event = {};
     initialize_event(&event, EXECWAKE_EVENT_PROCESS_EXIT);
     event.arguments[0] = context->pid;
-    bpf_perf_event_output(context, &EVENTS, 0xffffffffULL, &event,
-                          sizeof(event));
+    emit_event(context, &event, sizeof(event));
     return 0;
 }
 
@@ -384,7 +403,8 @@ int observe_syscall_enter(struct raw_syscalls_enter_context *context) {
         event.header.data_length = sizeof(event.data);
         event.header.size = sizeof(event);
     }
-    bpf_map_update_elem(&PENDING_SYSCALLS, &key, &event, BPF_ANY);
+    if (bpf_map_update_elem(&PENDING_SYSCALLS, &key, &event, BPF_ANY) < 0)
+        record_loss();
     return 0;
 }
 
@@ -407,11 +427,11 @@ int observe_syscall_exit(struct raw_syscalls_exit_context *context) {
     }
     __u32 output_size = event->header.size;
     if (output_size < sizeof(event->header) || output_size > sizeof(*event)) {
+        record_loss();
         bpf_map_delete_elem(&PENDING_SYSCALLS, &key);
         return 0;
     }
-    bpf_perf_event_output(context, &EVENTS, 0xffffffffULL, event,
-                          output_size);
+    emit_event(context, event, output_size);
     bpf_map_delete_elem(&PENDING_SYSCALLS, &key);
     return 0;
 }
