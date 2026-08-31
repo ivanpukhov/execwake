@@ -14,8 +14,11 @@ use crate::collector::{
 };
 use crate::findings::{evaluate, EvidenceReference, FindingEvent};
 use crate::limits::{CaptureLimits, SQLITE_CACHE_KIB};
+use crate::node_enrichment::{NodeEnrichmentFact, NodeEnrichmentRecord, NODE_ENRICHMENT_EVIDENCE};
 use crate::privacy::CURRENT_PRIVACY_PROFILE;
-use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage, CURRENT_SCHEMA_VERSION};
+use crate::session::{
+    CategoryCoverage, EvidenceKind, SessionCoverage, SessionMode, CURRENT_SCHEMA_VERSION,
+};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -192,13 +195,33 @@ impl SessionStore {
         command_name: &str,
         argument_count: usize,
     ) -> Result<ActiveSession, StoreError> {
-        self.begin_with_limits(command_name, argument_count, CaptureLimits::DEFAULT)
+        self.begin_in_mode(command_name, argument_count, SessionMode::Observe)
     }
 
+    pub(crate) fn begin_in_mode(
+        &self,
+        command_name: &str,
+        argument_count: usize,
+        mode: SessionMode,
+    ) -> Result<ActiveSession, StoreError> {
+        self.begin_in_mode_with_limits(command_name, argument_count, mode, CaptureLimits::DEFAULT)
+    }
+
+    #[cfg(test)]
     fn begin_with_limits(
         &self,
         command_name: &str,
         argument_count: usize,
+        limits: CaptureLimits,
+    ) -> Result<ActiveSession, StoreError> {
+        self.begin_in_mode_with_limits(command_name, argument_count, SessionMode::Observe, limits)
+    }
+
+    fn begin_in_mode_with_limits(
+        &self,
+        command_name: &str,
+        argument_count: usize,
+        mode: SessionMode,
         limits: CaptureLimits,
     ) -> Result<ActiveSession, StoreError> {
         if command_name.is_empty() || command_name.chars().any(|character| character.is_control()) {
@@ -218,7 +241,7 @@ impl SessionStore {
         FileExt::try_lock_exclusive(&lock_file)?;
         create_private_file(paths.database())?;
 
-        let result = initialize_database(&paths, command_name, argument_count, limits);
+        let result = initialize_database(&paths, command_name, argument_count, mode, limits);
         match result {
             Ok(connection) => Ok(ActiveSession {
                 paths,
@@ -289,6 +312,7 @@ struct CaptureLosses {
     filesystem: u64,
     network: u64,
     environment: u64,
+    node_enrichment: u64,
 }
 
 impl CaptureLosses {
@@ -302,13 +326,18 @@ impl CaptureLosses {
             "filesystem" => &mut self.filesystem,
             "network" => &mut self.network,
             "environment" => &mut self.environment,
+            "node_enrichment" => &mut self.node_enrichment,
             _ => return,
         };
         *counter = counter.saturating_add(count);
     }
 
     const fn any(self) -> bool {
-        self.processes > 0 || self.filesystem > 0 || self.network > 0 || self.environment > 0
+        self.processes > 0
+            || self.filesystem > 0
+            || self.network > 0
+            || self.environment > 0
+            || self.node_enrichment > 0
     }
 }
 
@@ -421,6 +450,82 @@ impl ActiveSession {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn record_node_enrichment(
+        &mut self,
+        record: NodeEnrichmentRecord,
+    ) -> Result<(), SinkError> {
+        let Ok(monotonic_ns) = i64::try_from(record.monotonic_ns) else {
+            self.record_node_enrichment_loss(1);
+            return Ok(());
+        };
+        let operating_system_id = i64::from(record.operating_system_id);
+        let result = match record.fact {
+            NodeEnrichmentFact::Http { method, host, path } => {
+                if !self.capture_allowed(
+                    "node_enrichment",
+                    &[method.as_str(), host.as_str(), path.as_str()],
+                    true,
+                )? {
+                    return Ok(());
+                }
+                self.connection.execute(
+                    "INSERT INTO node_enrichment (
+                         kind, method, host, path, environment_name, process_id,
+                         monotonic_ns, evidence
+                     )
+                     SELECT 'http', ?1, ?2, ?3, NULL, process_id, ?5, ?6
+                     FROM process AS candidate
+                     WHERE operating_system_id = ?4
+                       AND NOT EXISTS (
+                           SELECT 1 FROM process AS other
+                           WHERE other.operating_system_id = candidate.operating_system_id
+                             AND other.process_id != candidate.process_id
+                       )
+                     LIMIT 1",
+                    params![
+                        method,
+                        host,
+                        path,
+                        operating_system_id,
+                        monotonic_ns,
+                        NODE_ENRICHMENT_EVIDENCE,
+                    ],
+                )
+            }
+            NodeEnrichmentFact::Environment { name } => {
+                if !self.capture_allowed("node_enrichment", &[name.as_str()], true)? {
+                    return Ok(());
+                }
+                self.connection.execute(
+                    "INSERT INTO node_enrichment (
+                         kind, method, host, path, environment_name, process_id,
+                         monotonic_ns, evidence
+                     )
+                     SELECT 'environment', NULL, NULL, NULL, ?1, process_id, ?3, ?4
+                     FROM process AS candidate
+                     WHERE operating_system_id = ?2
+                       AND NOT EXISTS (
+                           SELECT 1 FROM process AS other
+                           WHERE other.operating_system_id = candidate.operating_system_id
+                             AND other.process_id != candidate.process_id
+                       )
+                     LIMIT 1",
+                    params![
+                        name,
+                        operating_system_id,
+                        monotonic_ns,
+                        NODE_ENRICHMENT_EVIDENCE,
+                    ],
+                )
+            }
+        };
+        self.finish_capture("node_enrichment", true, result)
+    }
+
+    pub(crate) fn record_node_enrichment_loss(&mut self, count: u64) {
+        self.capture_losses.record_count("node_enrichment", count);
     }
 
     pub fn finalize(mut self, outcome: SessionOutcome) -> Result<SessionPaths, StoreError> {
@@ -700,6 +805,7 @@ fn apply_capture_losses(
         ("filesystem", losses.filesystem),
         ("network", losses.network),
         ("environment", losses.environment),
+        ("node_enrichment", losses.node_enrichment),
     ] {
         if lost_events == 0 {
             continue;
@@ -728,6 +834,7 @@ fn initialize_database(
     paths: &SessionPaths,
     command_name: &str,
     argument_count: i64,
+    mode: SessionMode,
     limits: CaptureLimits,
 ) -> Result<Connection, StoreError> {
     let mut connection = Connection::open_with_flags(
@@ -746,7 +853,7 @@ fn initialize_database(
              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
              id TEXT NOT NULL,
              schema_version INTEGER NOT NULL,
-             mode TEXT NOT NULL CHECK (mode = 'observe'),
+             mode TEXT NOT NULL CHECK (mode IN ('observe', 'instrumented')),
              state TEXT NOT NULL CHECK (state IN ('running', 'finalized', 'interrupted')),
              finalized INTEGER NOT NULL CHECK (finalized IN (0, 1)),
              command_name TEXT NOT NULL,
@@ -813,6 +920,25 @@ fn initialize_database(
              evidence TEXT NOT NULL CHECK (evidence IN ('observed', 'inferred', 'derived')),
              PRIMARY KEY (name, process_id)
          );
+         CREATE TABLE node_enrichment (
+             enrichment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             kind TEXT NOT NULL CHECK (kind IN ('http', 'environment')),
+             method TEXT,
+             host TEXT,
+             path TEXT,
+             environment_name TEXT,
+             process_id INTEGER NOT NULL REFERENCES process(process_id),
+             monotonic_ns INTEGER NOT NULL CHECK (monotonic_ns >= 0),
+             evidence TEXT NOT NULL CHECK (evidence = 'observed'),
+             CHECK (
+                 (kind = 'http' AND method IS NOT NULL AND host IS NOT NULL
+                  AND path IS NOT NULL AND environment_name IS NULL)
+                 OR
+                 (kind = 'environment' AND method IS NULL AND host IS NULL
+                  AND path IS NULL AND environment_name IS NOT NULL
+                  AND instr(environment_name, '=') = 0)
+             )
+         );
          CREATE TABLE finding (
              finding_id INTEGER PRIMARY KEY AUTOINCREMENT,
              rule_id TEXT NOT NULL,
@@ -843,10 +969,11 @@ fn initialize_database(
         "INSERT INTO session (
              singleton, id, schema_version, mode, state, finalized,
              command_name, argument_count, started_at_ms, runner_pid, privacy_profile
-         ) VALUES (1, ?1, ?2, 'observe', 'running', 0, ?3, ?4, ?5, ?6, ?7)",
+         ) VALUES (1, ?1, ?2, ?3, 'running', 0, ?4, ?5, ?6, ?7, ?8)",
         params![
             paths.id().as_str(),
             i64::from(CURRENT_SCHEMA_VERSION),
+            mode.as_str(),
             command_name,
             argument_count,
             unix_time_ms()?,
@@ -863,6 +990,13 @@ fn initialize_database(
         transaction.execute(
             "INSERT INTO coverage (category, state, lost_events) VALUES (?1, ?2, 0)",
             params![category, state],
+        )?;
+    }
+    if mode == SessionMode::Instrumented {
+        transaction.execute(
+            "INSERT INTO coverage (category, state, lost_events)
+             VALUES ('node_enrichment', 'partial', 0)",
+            [],
         )?;
     }
     transaction.commit()?;
@@ -1159,8 +1293,9 @@ mod tests {
         ProcessRecord,
     };
     use crate::limits::CaptureLimits;
+    use crate::node_enrichment::NodeEnrichmentRecord;
     use crate::privacy::CURRENT_PRIVACY_PROFILE;
-    use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage};
+    use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage, SessionMode};
 
     use super::{SessionId, SessionOutcome, SessionStore};
 
@@ -1480,6 +1615,131 @@ mod tests {
                 ("processes".to_owned(), "partial".to_owned(), 4),
             ]
         );
+    }
+
+    #[test]
+    fn instrumented_sessions_store_only_bounded_node_evidence_fields() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let mut session = store
+            .begin_in_mode("node", 1, SessionMode::Instrumented)
+            .expect("an instrumented session should start");
+        let started_at_ms: i64 = session
+            .connection
+            .query_row(
+                "SELECT started_at_ms FROM session WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the start time should be readable");
+        let process = ProcessIdentity::new(1);
+        session
+            .record_process(ProcessRecord {
+                identity: process,
+                operating_system_id: 77,
+                start_time_ticks: Some(88),
+                parent: None,
+                executable: "node".to_owned(),
+                occurred_at_ms: started_at_ms,
+                evidence: EvidenceKind::Observed,
+            })
+            .expect("the Node process should be stored");
+        session
+            .record_node_enrichment(
+                NodeEnrichmentRecord::http(
+                    77,
+                    100,
+                    "post",
+                    "LOCALHOST:443",
+                    "/events?token=secret#fragment",
+                )
+                .expect("the HTTP evidence should be valid"),
+            )
+            .expect("the HTTP evidence should be stored");
+        session
+            .record_node_enrichment(
+                NodeEnrichmentRecord::environment(77, 101, "GITHUB_TOKEN")
+                    .expect("the environment evidence should be valid"),
+            )
+            .expect("the environment evidence should be stored");
+        session.record_node_enrichment_loss(1);
+        let paths = session
+            .finalize(SessionOutcome::exited(0))
+            .expect("the instrumented session should finalize");
+
+        let connection = Connection::open(paths.database()).expect("the database should open");
+        let mode: String = connection
+            .query_row("SELECT mode FROM session WHERE singleton = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("the mode should be read");
+        let coverage: (String, i64) = connection
+            .query_row(
+                "SELECT state, lost_events FROM coverage WHERE category = 'node_enrichment'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the enrichment coverage should be read");
+        type StoredNodeRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let rows: Vec<StoredNodeRow> = connection
+            .prepare(
+                "SELECT kind, method, host, path, environment_name
+                     FROM node_enrichment ORDER BY enrichment_id",
+            )
+            .expect("the enrichment query should prepare")
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("the enrichment rows should be queried")
+            .collect::<Result<_, _>>()
+            .expect("the enrichment rows should be read");
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(node_enrichment)")
+            .expect("the schema query should prepare")
+            .query_map([], |row| row.get(1))
+            .expect("the schema should be queried")
+            .collect::<Result<_, _>>()
+            .expect("the schema should be read");
+
+        assert_eq!(mode, "instrumented");
+        assert_eq!(coverage, ("partial".to_owned(), 1));
+        assert_eq!(
+            rows,
+            [
+                (
+                    "http".to_owned(),
+                    Some("POST".to_owned()),
+                    Some("localhost:443".to_owned()),
+                    Some("/events".to_owned()),
+                    None,
+                ),
+                (
+                    "environment".to_owned(),
+                    None,
+                    None,
+                    None,
+                    Some("GITHUB_TOKEN".to_owned()),
+                ),
+            ]
+        );
+        assert!(!columns.iter().any(|column| {
+            matches!(
+                column.as_str(),
+                "value" | "headers" | "cookies" | "query" | "request_body" | "response_body"
+            )
+        }));
     }
 
     #[test]

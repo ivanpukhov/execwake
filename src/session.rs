@@ -1,10 +1,28 @@
 use crate::privacy::is_valid_environment_name;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+pub const CURRENT_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionMode {
     Observe,
+    Instrumented,
+}
+
+impl SessionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::Instrumented => "instrumented",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "observe" => Some(Self::Observe),
+            "instrumented" => Some(Self::Instrumented),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,9 +163,13 @@ pub struct SessionManifest {
 
 impl SessionManifest {
     pub const fn new(coverage: SessionCoverage) -> Self {
+        Self::with_mode(SessionMode::Observe, coverage)
+    }
+
+    pub const fn with_mode(mode: SessionMode, coverage: SessionCoverage) -> Self {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
-            mode: SessionMode::Observe,
+            mode,
             coverage,
         }
     }
@@ -176,6 +198,17 @@ mod tests {
 
         assert_eq!(manifest.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(manifest.mode, SessionMode::Observe);
+    }
+
+    #[test]
+    fn instrumented_sessions_are_explicit_in_the_manifest() {
+        let manifest =
+            SessionManifest::with_mode(SessionMode::Instrumented, SessionCoverage::unavailable());
+
+        assert_eq!(manifest.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(manifest.mode, SessionMode::Instrumented);
+        assert_eq!(manifest.mode.as_str(), "instrumented");
+        assert_eq!(SessionMode::parse("instrumented"), Some(manifest.mode));
     }
 
     #[test]

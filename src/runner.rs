@@ -6,6 +6,8 @@ use std::process::{Command, ExitStatus, Stdio};
 
 #[cfg(target_os = "linux")]
 use crate::collector::{Collector, LinuxCollector};
+use crate::node_enrichment::NodeEnrichmentCapture;
+use crate::session::SessionMode;
 use crate::storage::{SessionOutcome, SessionPaths, SessionStore, StoreError};
 
 #[derive(Debug)]
@@ -47,18 +49,32 @@ pub struct RunResult {
     pub status: ExitStatus,
 }
 
-pub fn run(argv: Vec<OsString>) -> Result<RunResult, RunError> {
+pub fn run(argv: Vec<OsString>, node_enrichment: bool) -> Result<RunResult, RunError> {
     let store = SessionStore::discover().map_err(StoreError::from)?;
     store.recover_interrupted()?;
-    run_in_store(argv, &store)
+    run_in_store_with_options(argv, &store, node_enrichment)
 }
 
+#[cfg(test)]
 fn run_in_store(argv: Vec<OsString>, store: &SessionStore) -> Result<RunResult, RunError> {
+    run_in_store_with_options(argv, store, false)
+}
+
+fn run_in_store_with_options(
+    argv: Vec<OsString>,
+    store: &SessionStore,
+    node_enrichment: bool,
+) -> Result<RunResult, RunError> {
     let executable = argv
         .first()
         .expect("the CLI parser requires a command before running");
     let command_name = display_name(executable);
-    let mut session = store.begin(&command_name, argv.len().saturating_sub(1))?;
+    let mode = if node_enrichment {
+        SessionMode::Instrumented
+    } else {
+        SessionMode::Observe
+    };
+    let mut session = store.begin_in_mode(&command_name, argv.len().saturating_sub(1), mode)?;
     let forwarder = SignalForwarder::start().map_err(RunError::Signal)?;
 
     let mut command = Command::new(executable);
@@ -67,6 +83,23 @@ fn run_in_store(argv: Vec<OsString>, store: &SessionStore) -> Result<RunResult, 
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+
+    let node_capture = if node_enrichment {
+        match NodeEnrichmentCapture::install(&mut command, session.paths()) {
+            Ok(capture) => Some(capture),
+            Err(source) => {
+                forwarder.stop();
+                let session_path = session.paths().database().to_owned();
+                session.finalize(SessionOutcome::without_status())?;
+                return Err(RunError::Command {
+                    source,
+                    session: session_path,
+                });
+            }
+        }
+    } else {
+        None
+    };
 
     #[cfg(target_os = "linux")]
     let mut collector = LinuxCollector::new(command_name);
@@ -108,6 +141,10 @@ fn run_in_store(argv: Vec<OsString>, store: &SessionStore) -> Result<RunResult, 
     let status_result = collector.collect(&mut child, &mut session);
     #[cfg(not(target_os = "linux"))]
     let status_result = child.wait();
+
+    if let Some(capture) = node_capture {
+        capture.finish(&mut session);
+    }
 
     let status = match status_result {
         Ok(status) => status,

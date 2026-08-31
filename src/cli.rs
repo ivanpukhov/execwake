@@ -16,6 +16,7 @@ pub enum Command {
 #[derive(Debug)]
 pub struct RunArgs {
     pub command: Vec<OsString>,
+    pub node_enrichment: bool,
 }
 
 #[derive(Debug)]
@@ -95,9 +96,11 @@ impl Cli {
 pub fn help_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::Root => {
-            "ExecWake\n\nUsage:\n  execwake run [--] <command> [arguments...]\n  execwake diff <before> <after>\n"
+            "ExecWake\n\nUsage:\n  execwake run [--node-enrichment] [--] <command> [arguments...]\n  execwake diff <before> <after>\n"
         }
-        HelpTopic::Run => "Usage: execwake run [--] <command> [arguments...]\n",
+        HelpTopic::Run => {
+            "Usage: execwake run [--node-enrichment] [--] <command> [arguments...]\n"
+        }
         HelpTopic::Diff => "Usage: execwake diff <before> <after>\n",
     }
 }
@@ -109,8 +112,19 @@ fn parse_run(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
         return Ok(ParseResult::Help(HelpTopic::Run));
     }
 
-    if arguments.first().map(OsString::as_os_str) == Some(OsStr::new("--")) {
-        arguments.remove(0);
+    let mut node_enrichment = false;
+    loop {
+        match arguments.first().map(OsString::as_os_str) {
+            Some(value) if value == OsStr::new("--node-enrichment") => {
+                node_enrichment = true;
+                arguments.remove(0);
+            }
+            Some(value) if value == OsStr::new("--") => {
+                arguments.remove(0);
+                break;
+            }
+            _ => break,
+        }
     }
 
     if arguments.is_empty() {
@@ -118,7 +132,10 @@ fn parse_run(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
     }
 
     Ok(ParseResult::Command(Cli {
-        command: Command::Run(RunArgs { command: arguments }),
+        command: Command::Run(RunArgs {
+            command: arguments,
+            node_enrichment,
+        }),
     }))
 }
 
@@ -185,6 +202,45 @@ mod tests {
         };
 
         assert_eq!(args.command, [OsStr::new("printf"), OsStr::new("--help")]);
+        assert!(!args.node_enrichment);
+    }
+
+    #[test]
+    fn enables_node_enrichment_only_before_the_separator() {
+        let result = Cli::parse_from([
+            "execwake",
+            "run",
+            "--node-enrichment",
+            "--",
+            "node",
+            "fixture.cjs",
+        ])
+        .expect("run arguments should parse");
+        let ParseResult::Command(cli) = result else {
+            panic!("expected command");
+        };
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.node_enrichment);
+        assert_eq!(
+            args.command,
+            [OsStr::new("node"), OsStr::new("fixture.cjs")]
+        );
+
+        let result = Cli::parse_from(["execwake", "run", "--", "--node-enrichment", "fixture.cjs"])
+            .expect("argv after the separator should parse");
+        let ParseResult::Command(cli) = result else {
+            panic!("expected command");
+        };
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(!args.node_enrichment);
+        assert_eq!(
+            args.command,
+            [OsStr::new("--node-enrichment"), OsStr::new("fixture.cjs")]
+        );
     }
 
     #[test]

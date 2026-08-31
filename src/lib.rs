@@ -4,6 +4,7 @@ pub mod collector;
 pub mod display_text;
 pub mod findings;
 mod limits;
+mod node_enrichment;
 pub mod privacy;
 pub mod report;
 pub mod runner;

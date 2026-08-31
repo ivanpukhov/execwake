@@ -37,7 +37,7 @@ fn main() {
     };
 
     match cli.command {
-        Command::Run(args) => match execwake::runner::run(args.command) {
+        Command::Run(args) => match execwake::runner::run(args.command, args.node_enrichment) {
             Ok(result) => {
                 if result.status.code().is_some() {
                     report_launch::present(&result.session);

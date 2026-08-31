@@ -19,7 +19,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::display_text::sanitize;
-use crate::session::CURRENT_SCHEMA_VERSION;
+use crate::session::{SessionMode, CURRENT_SCHEMA_VERSION};
 use crate::session_input::{canonical_session_file, check_integrity, configure_read_only};
 use crate::storage::SessionPaths;
 
@@ -429,7 +429,7 @@ fn validate_session(session: &SessionPaths) -> io::Result<()> {
 
     if id != session.id().as_str()
         || schema_version != i64::from(CURRENT_SCHEMA_VERSION)
-        || mode != "observe"
+        || SessionMode::parse(&mode).is_none()
         || finalized != 1
         || !matches!(state.as_str(), "finalized" | "interrupted")
     {
@@ -787,6 +787,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{load_event_page, load_report, EventQuery, ReportServer, BODY_LIMIT};
+    use crate::session::SessionMode;
     use crate::storage::{SessionOutcome, SessionStore};
 
     struct TestDirectory(PathBuf);
@@ -808,6 +809,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn accepts_a_finalized_instrumented_session() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin_in_mode("node", 0, SessionMode::Instrumented)
+            .expect("an instrumented session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the instrumented session should finalize");
+
+        ReportServer::bind(session, Duration::from_secs(1))
+            .expect("an instrumented report should bind");
     }
 
     #[tokio::test]

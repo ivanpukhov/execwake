@@ -14,7 +14,7 @@ use crate::display_text::sanitize;
 use crate::findings::Severity;
 use crate::limits::{MAX_IMPORTED_EVENTS, MAX_IMPORTED_FINDINGS, MAX_IMPORTED_PROCESSES};
 use crate::privacy::CURRENT_PRIVACY_PROFILE;
-use crate::session::CURRENT_SCHEMA_VERSION;
+use crate::session::{SessionMode, CURRENT_SCHEMA_VERSION};
 use crate::session_input::{canonical_session_file, check_integrity, configure_read_only};
 use crate::storage::SessionId;
 
@@ -238,7 +238,7 @@ impl SessionSnapshot {
                 "session id is invalid".to_owned(),
             ));
         }
-        if mode != "observe" {
+        if SessionMode::parse(&mode).is_none() {
             return Err(DiffError::InvalidSession(
                 "session mode is unsupported".to_owned(),
             ));
@@ -805,6 +805,7 @@ mod tests {
     };
     use crate::findings::Severity;
     use crate::privacy::CURRENT_PRIVACY_PROFILE;
+    use crate::session::SessionMode;
     use crate::storage::{SessionOutcome, SessionStore};
 
     use super::{
@@ -828,6 +829,23 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn loads_instrumented_sessions_without_mixing_enrichment_with_kernel_behavior() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin_in_mode("node", 0, SessionMode::Instrumented)
+            .expect("an instrumented session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the instrumented session should finalize");
+
+        let snapshot = SessionSnapshot::load(session.database())
+            .expect("the instrumented session should load");
+
+        assert!(snapshot.behavior.facts.is_empty());
+        assert_eq!(snapshot.coverage.len(), BehaviorCategory::ALL.len());
     }
 
     fn fact(path: &str, operations: &[&str], event_id: i64) -> BehaviorFact {
