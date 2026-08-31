@@ -377,6 +377,10 @@ impl ActiveSession {
         result: rusqlite::Result<usize>,
     ) -> Result<(), SinkError> {
         match result {
+            Ok(0) => {
+                self.capture_losses.record(category);
+                Ok(())
+            }
             Ok(_) => {
                 self.writes_until_size_check = self.writes_until_size_check.saturating_sub(1);
                 if event {
@@ -497,7 +501,11 @@ impl CollectorSink for ActiveSession {
                 "INSERT INTO process (
                      process_id, operating_system_id, start_time_ticks, parent_process_id, executable,
                      started_at_ms, evidence
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                 WHERE ?4 IS NULL OR EXISTS (
+                     SELECT 1 FROM process WHERE process_id = ?4
+                 )",
                 params![
                     process_id,
                     i64::from(process.operating_system_id),
@@ -571,7 +579,9 @@ impl CollectorSink for ActiveSession {
         let result = self.connection.execute(
             "INSERT INTO dns_correlation (
                      hostname, address, process_id, occurred_at_ms, evidence, confidence
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                 WHERE EXISTS (SELECT 1 FROM process WHERE process_id = ?3)",
             params![
                 dns.hostname,
                 dns.address,
@@ -593,7 +603,8 @@ impl CollectorSink for ActiveSession {
         }
         let result = self.connection.execute(
             "INSERT INTO environment_variable (name, process_id, evidence)
-                 VALUES (?1, ?2, ?3)",
+                 SELECT ?1, ?2, ?3
+                 WHERE EXISTS (SELECT 1 FROM process WHERE process_id = ?2)",
             params![
                 environment.name,
                 database_process_id(environment.process.get())?,
@@ -614,7 +625,11 @@ impl CollectorSink for ActiveSession {
         let result = self.connection.execute(
             "INSERT INTO event (
                      category, operation, target, process_id, occurred_at_ms, evidence
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                 WHERE ?4 IS NULL OR EXISTS (
+                     SELECT 1 FROM process WHERE process_id = ?4
+                 )",
             params![
                 event.category,
                 event.operation,
@@ -1139,7 +1154,9 @@ mod tests {
     use rusqlite::Connection;
 
     use crate::collector::{
-        CollectorEvent, CollectorSink, EnvironmentVariableRecord, ProcessIdentity, ProcessRecord,
+        CollectorEvent, CollectorSink, DnsConfidence, DnsCorrelationRecord,
+        EnvironmentVariableRecord, ProcessExecRecord, ProcessExitRecord, ProcessIdentity,
+        ProcessRecord,
     };
     use crate::limits::CaptureLimits;
     use crate::privacy::CURRENT_PRIVACY_PROFILE;
@@ -1348,6 +1365,121 @@ mod tests {
         assert_eq!(event_count, 2);
         assert_eq!(coverage, ("partial".to_owned(), 2));
         assert!(page_count * page_size <= limits.session_bytes as i64);
+    }
+
+    #[test]
+    fn dropped_process_metadata_does_not_abort_the_trace() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let limits = CaptureLimits {
+            event_count: 10,
+            session_bytes: 512 * 1024,
+            finalization_bytes: 64 * 1024,
+            text_bytes: 8,
+        };
+        let mut session = store
+            .begin_with_limits("fixture", 0, limits)
+            .expect("a limited session should start");
+        let process = ProcessIdentity::new(1);
+
+        session
+            .record_process(ProcessRecord {
+                identity: process,
+                operating_system_id: 70,
+                start_time_ticks: Some(80),
+                parent: None,
+                executable: "executable-too-long".to_owned(),
+                occurred_at_ms: 1,
+                evidence: EvidenceKind::Observed,
+            })
+            .expect("oversized process metadata should be dropped");
+        session
+            .record_process(ProcessRecord {
+                identity: ProcessIdentity::new(2),
+                operating_system_id: 71,
+                start_time_ticks: Some(81),
+                parent: Some(process),
+                executable: "child".to_owned(),
+                occurred_at_ms: 2,
+                evidence: EvidenceKind::Observed,
+            })
+            .expect("a process with missing parent metadata should be dropped");
+        session
+            .record_process_exec(ProcessExecRecord {
+                identity: process,
+                executable: "renamed".to_owned(),
+                occurred_at_ms: 3,
+            })
+            .expect("exec metadata for a missing process should be dropped");
+        session
+            .record_process_exit(ProcessExitRecord {
+                identity: process,
+                occurred_at_ms: 4,
+                exit_code: Some(0),
+                termination_signal: None,
+            })
+            .expect("exit metadata for a missing process should be dropped");
+        session
+            .record_event(CollectorEvent {
+                category: "filesystem",
+                operation: "read",
+                target: "input".to_owned(),
+                process: Some(process),
+                occurred_at_ms: 5,
+                evidence: EvidenceKind::Observed,
+            })
+            .expect("dependent events should be dropped without an integrity error");
+        session
+            .record_dns_correlation(DnsCorrelationRecord {
+                hostname: "host".to_owned(),
+                address: "::1".to_owned(),
+                process,
+                occurred_at_ms: 6,
+                evidence: EvidenceKind::Observed,
+                confidence: DnsConfidence::High,
+            })
+            .expect("dependent DNS metadata should also be dropped");
+        session
+            .record_environment_variable(EnvironmentVariableRecord {
+                name: "PATH".to_owned(),
+                process,
+                evidence: EvidenceKind::Derived,
+            })
+            .expect("dependent environment metadata should also be dropped");
+        let paths = session
+            .finalize(SessionOutcome::exited(0))
+            .expect("the partial session should finalize");
+
+        let connection = Connection::open(paths.database()).expect("the database should open");
+        let process_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM process", [], |row| row.get(0))
+            .expect("processes should be counted");
+        let event_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM event", [], |row| row.get(0))
+            .expect("events should be counted");
+        let coverage: Vec<(String, String, i64)> = connection
+            .prepare(
+                "SELECT category, state, lost_events FROM coverage
+                 WHERE category IN ('processes', 'filesystem', 'network', 'environment')
+                 ORDER BY category",
+            )
+            .expect("the coverage query should prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("coverage should be queried")
+            .collect::<Result<_, _>>()
+            .expect("coverage should be read");
+
+        assert_eq!(process_count, 0);
+        assert_eq!(event_count, 0);
+        assert_eq!(
+            coverage,
+            [
+                ("environment".to_owned(), "partial".to_owned(), 1),
+                ("filesystem".to_owned(), "partial".to_owned(), 1),
+                ("network".to_owned(), "partial".to_owned(), 1),
+                ("processes".to_owned(), "partial".to_owned(), 4),
+            ]
+        );
     }
 
     #[test]
