@@ -19,6 +19,7 @@ use super::{
     EnvironmentVariableRecord, FileDeltaRecord, FileState, FileStateKind, ProcessExecRecord,
     ProcessExitRecord, ProcessIdentity, ProcessRecord, SinkError,
 };
+use crate::limits::{MAX_FILE_SNAPSHOTS, MAX_LIVE_PROCESSES};
 use crate::privacy::{is_valid_environment_name, PathRoots};
 use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage};
 
@@ -59,9 +60,16 @@ impl PtraceCollector {
         parent_id: Option<libc::pid_t>,
         operation: &'static str,
         sink: &mut dyn CollectorSink,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if self.processes.contains_key(&process_id) {
-            return Ok(());
+            return Ok(true);
+        }
+        if parent_id.is_some() && self.processes.len() >= MAX_LIVE_PROCESSES {
+            for category in ["processes", "filesystem", "network", "environment"] {
+                sink.record_lost_events(category, 1).map_err(sink_error)?;
+            }
+            detach_new_tracee(process_id)?;
+            return Ok(false);
         }
 
         let inherited_syscalls = parent_id.and_then(|id| {
@@ -131,7 +139,7 @@ impl PtraceCollector {
                 .map_err(sink_error)?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn record_exec(
@@ -249,10 +257,15 @@ impl PtraceCollector {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "syscall from unknown process"))?;
         let identity = process.identity;
         let observation = process.syscalls.observe_stop(process_id)?;
+        if observation.lost_network_events > 0 {
+            sink.record_lost_events("network", observation.lost_network_events)
+                .map_err(sink_error)?;
+        }
         for path in observation.mutation_paths {
-            self.file_snapshots
-                .entry(path.clone())
-                .or_insert_with(|| capture_file_state(&path));
+            if !remember_file_snapshot(&mut self.file_snapshots, path, MAX_FILE_SNAPSHOTS) {
+                sink.record_lost_events("filesystem", 1)
+                    .map_err(sink_error)?;
+            }
         }
         for event in observation.events {
             let target = event
@@ -378,7 +391,12 @@ impl PtraceCollector {
             ));
         }
 
-        self.register_process(root_id, None, "start", sink)?;
+        if !self.register_process(root_id, None, "start", sink)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "root process could not be tracked",
+            ));
+        }
         let options = libc::PTRACE_O_TRACESYSGOOD
             | libc::PTRACE_O_TRACEFORK
             | libc::PTRACE_O_TRACEVFORK
@@ -535,6 +553,27 @@ fn reap_killed_tracee(process_id: libc::pid_t) {
     }
 }
 
+fn detach_new_tracee(process_id: libc::pid_t) -> io::Result<()> {
+    let mut wait_status = 0;
+    wait_for(process_id, &mut wait_status)?;
+    if libc::WIFEXITED(wait_status) || libc::WIFSIGNALED(wait_status) {
+        return Ok(());
+    }
+    if !libc::WIFSTOPPED(wait_status) {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "untracked process did not stop before detach",
+        ));
+    }
+    ptrace_call(
+        libc::PTRACE_DETACH,
+        process_id,
+        ptr::null_mut(),
+        ptr::null_mut(),
+    )
+    .map(|_| ())
+}
+
 fn wait_for(process_id: libc::pid_t, wait_status: &mut libc::c_int) -> io::Result<libc::pid_t> {
     loop {
         let result =
@@ -639,6 +678,22 @@ fn capture_file_state(path: &std::path::Path) -> FileState {
     }
 }
 
+fn remember_file_snapshot(
+    snapshots: &mut HashMap<std::path::PathBuf, FileState>,
+    path: std::path::PathBuf,
+    limit: usize,
+) -> bool {
+    if snapshots.contains_key(&path) {
+        return true;
+    }
+    if snapshots.len() >= limit {
+        return false;
+    }
+    let state = capture_file_state(&path);
+    snapshots.insert(path, state);
+    true
+}
+
 fn inherited_environment_names() -> Vec<String> {
     extern "C" {
         static mut environ: *mut *mut libc::c_char;
@@ -676,7 +731,9 @@ fn inherited_environment_names() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io;
+    use std::path::PathBuf;
     use std::process::Command;
 
     use crate::collector::{
@@ -685,7 +742,9 @@ mod tests {
     };
     use crate::session::SessionCoverage;
 
-    use super::{inherited_environment_names, process_start_time, PtraceCollector};
+    use super::{
+        inherited_environment_names, process_start_time, remember_file_snapshot, PtraceCollector,
+    };
 
     struct RejectingSink;
 
@@ -728,6 +787,14 @@ mod tests {
             Ok(())
         }
 
+        fn record_lost_events(
+            &mut self,
+            _category: &'static str,
+            _count: u64,
+        ) -> Result<(), SinkError> {
+            Ok(())
+        }
+
         fn set_coverage(&mut self, _coverage: SessionCoverage) -> Result<(), SinkError> {
             Ok(())
         }
@@ -764,5 +831,27 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "PATH"));
         assert!(names.iter().all(|name| !name.contains('=')));
+    }
+
+    #[test]
+    fn bounds_file_state_snapshots() {
+        let mut snapshots = HashMap::new();
+
+        assert!(remember_file_snapshot(
+            &mut snapshots,
+            PathBuf::from("/missing-first"),
+            1,
+        ));
+        assert!(remember_file_snapshot(
+            &mut snapshots,
+            PathBuf::from("/missing-first"),
+            1,
+        ));
+        assert!(!remember_file_snapshot(
+            &mut snapshots,
+            PathBuf::from("/missing-second"),
+            1,
+        ));
+        assert_eq!(snapshots.len(), 1);
     }
 }

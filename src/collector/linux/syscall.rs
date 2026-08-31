@@ -6,6 +6,8 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr;
 
+use crate::limits::{MAX_DNS_QUERIES_PER_SOCKET, MAX_SOCKETS_PER_PROCESS};
+
 pub struct SyscallState {
     pending: Option<PendingFileOperation>,
     pending_network: Option<PendingNetworkOperation>,
@@ -22,6 +24,7 @@ pub struct FileObservation {
     pub mutation_paths: Vec<PathBuf>,
     pub network_events: Vec<NetworkEvent>,
     pub dns_events: Vec<DnsEvent>,
+    pub lost_network_events: u64,
 }
 
 pub struct NetworkEvent {
@@ -83,6 +86,7 @@ enum PendingNetworkOperation {
 struct NetworkObservation {
     events: Vec<NetworkEvent>,
     dns_events: Vec<DnsEvent>,
+    lost_events: u64,
 }
 
 enum PendingFileOperation {
@@ -146,6 +150,7 @@ impl SyscallState {
                     mutation_paths,
                     network_events: Vec::new(),
                     dns_events: Vec::new(),
+                    lost_network_events: 0,
                 })
             }
             SyscallStop::Exit(result) => {
@@ -168,6 +173,7 @@ impl SyscallState {
                     mutation_paths: Vec::new(),
                     network_events: network.events,
                     dns_events: network.dns_events,
+                    lost_network_events: network.lost_events,
                 })
             }
             SyscallStop::Other => Ok(FileObservation {
@@ -175,6 +181,7 @@ impl SyscallState {
                 mutation_paths: Vec::new(),
                 network_events: Vec::new(),
                 dns_events: Vec::new(),
+                lost_network_events: 0,
             }),
         }
     }
@@ -335,6 +342,12 @@ fn finish_network_operation(
 ) -> NetworkObservation {
     match operation {
         PendingNetworkOperation::Socket { transport } => {
+            if !sockets.contains_key(&(result as i32)) && sockets.len() >= MAX_SOCKETS_PER_PROCESS {
+                return NetworkObservation {
+                    lost_events: 1,
+                    ..NetworkObservation::default()
+                };
+            }
             sockets.insert(
                 result as i32,
                 SocketInformation {
@@ -363,6 +376,7 @@ fn finish_network_operation(
                     endpoint,
                 }],
                 dns_events: Vec::new(),
+                lost_events: 0,
             }
         }
         PendingNetworkOperation::Connect {
@@ -381,6 +395,7 @@ fn finish_network_operation(
                         endpoint,
                     }],
                     dns_events: Vec::new(),
+                    lost_events: 0,
                 }
             }),
         PendingNetworkOperation::Listen { descriptor } => NetworkObservation {
@@ -398,6 +413,7 @@ fn finish_network_operation(
                 .into_iter()
                 .collect(),
             dns_events: Vec::new(),
+            lost_events: 0,
         },
         PendingNetworkOperation::Close { descriptor } => {
             sockets.remove(&descriptor);
@@ -405,7 +421,15 @@ fn finish_network_operation(
         }
         PendingNetworkOperation::Duplicate { source, requested } => {
             if let Some(socket) = sockets.get(&source).cloned() {
-                sockets.insert(requested.unwrap_or(result as i32), socket);
+                let descriptor = requested.unwrap_or(result as i32);
+                if sockets.contains_key(&descriptor) || sockets.len() < MAX_SOCKETS_PER_PROCESS {
+                    sockets.insert(descriptor, socket);
+                } else {
+                    return NetworkObservation {
+                        lost_events: 1,
+                        ..NetworkObservation::default()
+                    };
+                }
             }
             NetworkObservation::default()
         }
@@ -420,7 +444,12 @@ fn finish_network_operation(
                 let length = usize::try_from(result).unwrap_or(0).min(length).min(65_537);
                 if let Ok(bytes) = read_memory(process_id, buffer, length) {
                     if let Some((transaction, hostname)) = parse_dns_query(&bytes) {
-                        socket.dns_queries.insert(transaction, hostname);
+                        if !remember_dns_query(socket, transaction, hostname) {
+                            return NetworkObservation {
+                                lost_events: 1,
+                                ..NetworkObservation::default()
+                            };
+                        }
                     }
                 }
                 if socket.transport == "udp" {
@@ -436,6 +465,7 @@ fn finish_network_operation(
             NetworkObservation {
                 events,
                 dns_events: Vec::new(),
+                lost_events: 0,
             }
         }
         PendingNetworkOperation::Receive {
@@ -472,9 +502,23 @@ fn finish_network_operation(
             } else {
                 Vec::new()
             };
-            NetworkObservation { events, dns_events }
+            NetworkObservation {
+                events,
+                dns_events,
+                lost_events: 0,
+            }
         }
     }
+}
+
+fn remember_dns_query(socket: &mut SocketInformation, transaction: u16, hostname: String) -> bool {
+    if !socket.dns_queries.contains_key(&transaction)
+        && socket.dns_queries.len() >= MAX_DNS_QUERIES_PER_SOCKET
+    {
+        return false;
+    }
+    socket.dns_queries.insert(transaction, hostname);
+    true
 }
 
 fn read_socket_length(process_id: libc::pid_t, address: u64) -> io::Result<usize> {
@@ -1187,9 +1231,11 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        finish_file_operation, parse_dns_query, parse_dns_response, parse_socket_address,
-        PendingFileOperation, PendingNetworkOperation,
+        finish_file_operation, finish_network_operation, parse_dns_query, parse_dns_response,
+        parse_socket_address, remember_dns_query, PendingFileOperation, PendingNetworkOperation,
+        SocketInformation,
     };
+    use crate::limits::{MAX_DNS_QUERIES_PER_SOCKET, MAX_SOCKETS_PER_PROCESS};
 
     #[test]
     fn keeps_nonblocking_connect_attempts() {
@@ -1259,6 +1305,48 @@ mod tests {
         assert_eq!(events[0].hostname, "fixture.test");
         assert_eq!(events[0].address.to_string(), "127.0.0.7");
         assert!(parse_dns_response(&response, &mut HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn bounds_socket_and_dns_tracking() {
+        let mut sockets = HashMap::new();
+        for descriptor in 0..MAX_SOCKETS_PER_PROCESS {
+            let observation = finish_network_operation(
+                std::process::id() as libc::pid_t,
+                PendingNetworkOperation::Socket { transport: "tcp" },
+                descriptor as i64,
+                &mut sockets,
+            );
+            assert_eq!(observation.lost_events, 0);
+        }
+        let overflow = finish_network_operation(
+            std::process::id() as libc::pid_t,
+            PendingNetworkOperation::Socket { transport: "tcp" },
+            MAX_SOCKETS_PER_PROCESS as i64,
+            &mut sockets,
+        );
+        assert_eq!(sockets.len(), MAX_SOCKETS_PER_PROCESS);
+        assert_eq!(overflow.lost_events, 1);
+
+        let mut socket = SocketInformation {
+            transport: "udp",
+            local: None,
+            peer: None,
+            dns_queries: HashMap::new(),
+        };
+        for transaction in 0..MAX_DNS_QUERIES_PER_SOCKET {
+            assert!(remember_dns_query(
+                &mut socket,
+                transaction as u16,
+                format!("host-{transaction}.test"),
+            ));
+        }
+        assert!(!remember_dns_query(
+            &mut socket,
+            MAX_DNS_QUERIES_PER_SOCKET as u16,
+            "overflow.test".to_owned(),
+        ));
+        assert_eq!(socket.dns_queries.len(), MAX_DNS_QUERIES_PER_SOCKET);
     }
 
     fn dns_query() -> Vec<u8> {

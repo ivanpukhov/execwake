@@ -21,6 +21,7 @@ use bytes::BytesMut;
 
 use super::PtraceCollector;
 use crate::collector::{Collector, CollectorSink};
+use crate::limits::{EBPF_BUFFER_PAGES, EBPF_READ_BATCH};
 use crate::session::{CategoryCoverage, SessionCoverage};
 
 static CGROUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -235,7 +236,11 @@ impl EbpfProbe {
             .map_err(other_error)?;
         let mut buffers = Vec::new();
         for cpu in online_cpus()? {
-            buffers.push(event_array.open(cpu, Some(8)).map_err(other_error)?);
+            buffers.push(
+                event_array
+                    .open(cpu, Some(EBPF_BUFFER_PAGES))
+                    .map_err(other_error)?,
+            );
         }
         Ok(Self {
             _bpf: bpf,
@@ -265,7 +270,9 @@ impl ProbeRun {
         let thread_stop = stop.clone();
         let thread_lost = lost.clone();
         let thread = thread::spawn(move || {
-            let mut output: Vec<_> = (0..64).map(|_| BytesMut::with_capacity(16)).collect();
+            let mut output: Vec<_> = (0..EBPF_READ_BATCH)
+                .map(|_| BytesMut::with_capacity(16))
+                .collect();
             while !thread_stop.load(Ordering::Acquire) {
                 drain_buffers(&mut buffers, &mut output, &thread_lost);
                 thread::sleep(Duration::from_millis(1));

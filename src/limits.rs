@@ -1,6 +1,19 @@
 pub(crate) const REPORT_REQUEST_BYTES: usize = 16 * 1024;
 pub(crate) const SQLITE_CACHE_KIB: i64 = 16 * 1024;
 
+#[cfg(target_os = "linux")]
+pub(crate) const MAX_LIVE_PROCESSES: usize = 1_024;
+#[cfg(target_os = "linux")]
+pub(crate) const MAX_FILE_SNAPSHOTS: usize = 100_000;
+#[cfg(target_os = "linux")]
+pub(crate) const MAX_SOCKETS_PER_PROCESS: usize = 512;
+#[cfg(target_os = "linux")]
+pub(crate) const MAX_DNS_QUERIES_PER_SOCKET: usize = 256;
+#[cfg(target_os = "linux")]
+pub(crate) const EBPF_BUFFER_PAGES: usize = 8;
+#[cfg(target_os = "linux")]
+pub(crate) const EBPF_READ_BATCH: usize = 64;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CaptureLimits {
     pub event_count: u64,

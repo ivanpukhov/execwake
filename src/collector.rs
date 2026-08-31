@@ -138,6 +138,7 @@ pub trait CollectorSink {
         environment: EnvironmentVariableRecord,
     ) -> Result<(), SinkError>;
     fn record_event(&mut self, event: CollectorEvent) -> Result<(), SinkError>;
+    fn record_lost_events(&mut self, category: &'static str, count: u64) -> Result<(), SinkError>;
     fn set_coverage(&mut self, coverage: SessionCoverage) -> Result<(), SinkError>;
 }
 

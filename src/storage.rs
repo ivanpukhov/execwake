@@ -293,6 +293,10 @@ struct CaptureLosses {
 
 impl CaptureLosses {
     fn record(&mut self, category: &str) {
+        self.record_count(category, 1);
+    }
+
+    fn record_count(&mut self, category: &str, count: u64) {
         let counter = match category {
             "process" | "processes" => &mut self.processes,
             "filesystem" => &mut self.filesystem,
@@ -300,7 +304,7 @@ impl CaptureLosses {
             "environment" => &mut self.environment,
             _ => return,
         };
-        *counter = counter.saturating_add(1);
+        *counter = counter.saturating_add(count);
     }
 
     const fn any(self) -> bool {
@@ -621,6 +625,11 @@ impl CollectorSink for ActiveSession {
             ],
         );
         self.finish_capture(event.category, true, result)
+    }
+
+    fn record_lost_events(&mut self, category: &'static str, count: u64) -> Result<(), SinkError> {
+        self.capture_losses.record_count(category, count);
+        Ok(())
     }
 
     fn set_coverage(&mut self, coverage: SessionCoverage) -> Result<(), SinkError> {
