@@ -139,12 +139,29 @@ fn write_diff(diff: &SemanticDiff) -> io::Result<()> {
 }
 
 fn should_open_report() -> bool {
+    let (stdin_is_terminal, stderr_is_terminal) = standard_stream_terminal_state();
     report_open_allowed(
-        atty::is(atty::Stream::Stdin),
-        atty::is(atty::Stream::Stderr),
+        stdin_is_terminal,
+        stderr_is_terminal,
         env::var_os("CI").is_some(),
         graphical_session_available(),
     )
+}
+
+#[cfg(unix)]
+fn standard_stream_terminal_state() -> (bool, bool) {
+    // isatty accepts any file descriptor value and does not access caller-owned memory.
+    unsafe {
+        (
+            libc::isatty(libc::STDIN_FILENO) == 1,
+            libc::isatty(libc::STDERR_FILENO) == 1,
+        )
+    }
+}
+
+#[cfg(not(unix))]
+const fn standard_stream_terminal_state() -> (bool, bool) {
+    (false, false)
 }
 
 fn report_open_allowed(

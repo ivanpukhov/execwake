@@ -7,7 +7,6 @@ license = "MIT"
 description = "Record the observable side effects of a command"
 
 [dependencies]
-atty = "=0.2.14"
 axum = { version = "=0.6.20", default-features = false, features = ["http1", "json", "query", "tokio"] }
 fs2 = "=0.4.3"
 getrandom = "0.2.16"
@@ -15,14 +14,14 @@ libc = "0.2.189"
 rusqlite = { version = "=0.29.0", features = ["bundled", "limits"] }
 serde = { version = "=1.0.188", features = ["derive"] }
 serde_json = "=1.0.107"
-tokio = { version = "=1.32.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.38.2", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "=0.3.17"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = "=0.11.0"
-bytes = "=1.4.0"
+bytes = "=1.11.1"
 
 [[test]]
 name = "conformance"
