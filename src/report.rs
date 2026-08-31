@@ -18,6 +18,7 @@ use axum::{Json, Router};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
+use crate::display_text::sanitize;
 use crate::session::CURRENT_SCHEMA_VERSION;
 use crate::session_input::{canonical_session_file, check_integrity, configure_read_only};
 use crate::storage::SessionPaths;
@@ -391,16 +392,18 @@ fn validate_session(session: &SessionPaths) -> io::Result<()> {
             "report session database is corrupt",
         ));
     }
-    let (id, schema_version, state, finalized) = connection
+    let (id, schema_version, mode, state, finalized) = connection
         .query_row(
-            "SELECT id, schema_version, state, finalized FROM session WHERE singleton = 1",
+            "SELECT id, schema_version, mode, state, finalized
+             FROM session WHERE singleton = 1",
             [],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         )
@@ -408,6 +411,7 @@ fn validate_session(session: &SessionPaths) -> io::Result<()> {
 
     if id != session.id().as_str()
         || schema_version != i64::from(CURRENT_SCHEMA_VERSION)
+        || mode != "observe"
         || finalized != 1
         || !matches!(state.as_str(), "finalized" | "interrupted")
     {
@@ -513,13 +517,15 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
                 mode: row.get(2)?,
                 state: row.get(3)?,
                 finalized: row.get::<_, i64>(4)? == 1,
-                command_name: row.get(5)?,
+                command_name: sanitize(&row.get::<_, String>(5)?),
                 argument_count: row.get(6)?,
                 started_at_ms: row.get(7)?,
                 ended_at_ms: row.get(8)?,
                 exit_code: row.get(9)?,
                 termination_signal: row.get(10)?,
-                interruption: row.get(11)?,
+                interruption: row
+                    .get::<_, Option<String>>(11)?
+                    .map(|value| sanitize(&value)),
                 coverage: Vec::new(),
                 processes: Vec::new(),
                 events: Vec::new(),
@@ -541,8 +547,8 @@ fn query_coverage(connection: &Connection) -> rusqlite::Result<Vec<CoverageRepor
     let rows = statement
         .query_map([], |row| {
             Ok(CoverageReport {
-                category: row.get(0)?,
-                state: row.get(1)?,
+                category: sanitize(&row.get::<_, String>(0)?),
+                state: sanitize(&row.get::<_, String>(1)?),
                 lost_events: row.get(2)?,
             })
         })?
@@ -561,12 +567,12 @@ fn query_processes(connection: &Connection) -> rusqlite::Result<Vec<ProcessRepor
             Ok(ProcessReport {
                 process_id: row.get(0)?,
                 parent_process_id: row.get(1)?,
-                executable: row.get(2)?,
+                executable: sanitize(&row.get::<_, String>(2)?),
                 started_at_ms: row.get(3)?,
                 ended_at_ms: row.get(4)?,
                 exit_code: row.get(5)?,
                 termination_signal: row.get(6)?,
-                evidence: row.get(7)?,
+                evidence: sanitize(&row.get::<_, String>(7)?),
             })
         })?
         .collect();
@@ -583,12 +589,12 @@ fn query_events(connection: &Connection) -> rusqlite::Result<Vec<EventReport>> {
         .query_map([], |row| {
             Ok(EventReport {
                 event_id: row.get(0)?,
-                category: row.get(1)?,
-                operation: row.get(2)?,
-                target: row.get(3)?,
+                category: sanitize(&row.get::<_, String>(1)?),
+                operation: sanitize(&row.get::<_, String>(2)?),
+                target: sanitize(&row.get::<_, String>(3)?),
                 process_id: row.get(4)?,
                 occurred_at_ms: row.get(5)?,
-                evidence: row.get(6)?,
+                evidence: sanitize(&row.get::<_, String>(6)?),
             })
         })?
         .collect();
@@ -606,11 +612,11 @@ fn query_findings(connection: &Connection) -> rusqlite::Result<Vec<FindingReport
         .query_map([], |row| {
             Ok(FindingReport {
                 finding_id: row.get(0)?,
-                rule_id: row.get(1)?,
+                rule_id: sanitize(&row.get::<_, String>(1)?),
                 rule_version: row.get(2)?,
-                severity: row.get(3)?,
+                severity: sanitize(&row.get::<_, String>(3)?),
                 process_id: row.get(4)?,
-                subject: row.get(5)?,
+                subject: sanitize(&row.get::<_, String>(5)?),
                 evidence_event_ids: Vec::new(),
             })
         })?
@@ -637,7 +643,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{ReportServer, BODY_LIMIT};
+    use super::{load_report, ReportServer, BODY_LIMIT};
     use crate::storage::{SessionOutcome, SessionStore};
 
     struct TestDirectory(PathBuf);
@@ -829,6 +835,49 @@ mod tests {
             .expect("the session id should be changed");
 
         assert!(ReportServer::bind(session, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn neutralizes_hostile_report_text_without_changing_raw_evidence() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let session = store
+            .begin("fixture", 0)
+            .expect("a session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the session should finalize");
+        let hostile = format!(
+            "<script>alert(1)</script><style>body{{display:none}}</style>\u{1b}]8;;https://example.test\u{7}link\u{1b}]8;;\u{7}\u{202e}{}",
+            "x".repeat(20_000)
+        );
+        let connection = rusqlite::Connection::open(session.database())
+            .expect("the session database should open");
+        connection
+            .execute(
+                "INSERT INTO event (
+                     category, operation, target, process_id, occurred_at_ms, evidence
+                 ) VALUES ('filesystem', 'read', ?1, NULL, 1, 'observed')",
+                [&hostile],
+            )
+            .expect("the hostile event should be stored");
+        drop(connection);
+
+        let report = load_report(session.database().to_owned()).expect("the report should load");
+        let displayed = &report.events[0].target;
+
+        assert!(!displayed.contains("<script>"));
+        assert!(!displayed.contains("<style>"));
+        assert!(!displayed.contains('\u{1b}'));
+        assert!(!displayed.contains('\u{202e}'));
+        assert!(displayed.contains("\\u{003c}script\\u{003e}"));
+        assert!(displayed.contains("[truncated "));
+
+        let connection = rusqlite::Connection::open(session.database())
+            .expect("the session database should reopen");
+        let raw: String = connection
+            .query_row("SELECT target FROM event", [], |row| row.get(0))
+            .expect("the raw event should remain available");
+        assert_eq!(raw, hostile);
     }
 
     async fn request(address: std::net::SocketAddr, request: &str) -> String {

@@ -10,6 +10,7 @@ use crate::behavior::{
     BehaviorCategory, BehaviorEvent, BehaviorFact, BehaviorKey, BehaviorProcess, BehaviorSet,
     BehaviorValue,
 };
+use crate::display_text::sanitize;
 use crate::findings::Severity;
 use crate::limits::{MAX_IMPORTED_EVENTS, MAX_IMPORTED_FINDINGS, MAX_IMPORTED_PROCESSES};
 use crate::privacy::CURRENT_PRIVACY_PROFILE;
@@ -255,14 +256,16 @@ impl SessionSnapshot {
                 "session schema version is unsupported".to_owned(),
             ));
         }
-        let backend = optional_session_text(&connection, "collector_backend")?;
-        let privacy_profile = optional_session_text(&connection, "privacy_profile")?;
+        let backend =
+            optional_session_text(&connection, "collector_backend")?.map(|value| sanitize(&value));
+        let privacy_profile =
+            optional_session_text(&connection, "privacy_profile")?.map(|value| sanitize(&value));
         let info = SessionInfo {
             id: id.clone(),
             schema_version,
             backend,
             privacy_profile,
-            command_name,
+            command_name: sanitize(&command_name),
         };
         let coverage = load_coverage(&connection)?;
 
@@ -362,10 +365,10 @@ fn load_processes(connection: &Connection) -> rusqlite::Result<Vec<BehaviorProce
                 process_id: row.get(0)?,
                 operating_system_id: row.get(1)?,
                 parent_process_id: row.get(2)?,
-                executable: row.get(3)?,
+                executable: sanitize(&row.get::<_, String>(3)?),
                 exit_code: row.get(4)?,
                 termination_signal: row.get(5)?,
-                evidence: row.get(6)?,
+                evidence: sanitize(&row.get::<_, String>(6)?),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -385,11 +388,11 @@ fn load_events(connection: &Connection) -> rusqlite::Result<Vec<BehaviorEvent>> 
         .query_map([], |row| {
             Ok(BehaviorEvent {
                 event_id: row.get(0)?,
-                category: row.get(1)?,
-                operation: row.get(2)?,
-                target: row.get(3)?,
+                category: sanitize(&row.get::<_, String>(1)?),
+                operation: sanitize(&row.get::<_, String>(2)?),
+                target: sanitize(&row.get::<_, String>(3)?),
                 process_id: row.get(4)?,
-                evidence: row.get(5)?,
+                evidence: sanitize(&row.get::<_, String>(5)?),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -475,11 +478,11 @@ fn load_findings(
         let evidence_event_ids = evidence.into_iter().map(|(event_id, _)| event_id).collect();
         findings.push(FindingSnapshot {
             finding_id,
-            rule_id,
+            rule_id: sanitize(&rule_id),
             rule_version,
             severity,
             process: process.clone(),
-            subject,
+            subject: sanitize(&subject),
             evidence_event_ids,
         });
     }
