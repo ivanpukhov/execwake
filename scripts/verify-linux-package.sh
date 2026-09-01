@@ -41,9 +41,13 @@ while IFS= read -r member; do
       "$package/LICENSE" | \
       "$package/README.md" | \
       "$package/README.ru.md" | \
+      "$package/SECURITY.md" | \
+      "$package/SECURITY.ru.md" | \
       "$package/benchmarks/" | \
       "$package/benchmarks/RESULTS.md" | \
       "$package/docs/" | \
+      "$package/docs/diagnostics.md" | \
+      "$package/docs/diagnostics.ru.md" | \
       "$package/docs/assets/" | \
       "$package/docs/assets/execwake-report.gif" | \
       "$package/docs/assets/execwake-report.jpg" | \
@@ -60,9 +64,13 @@ for required in \
   "$package/LICENSE" \
   "$package/README.md" \
   "$package/README.ru.md" \
+  "$package/SECURITY.md" \
+  "$package/SECURITY.ru.md" \
   "$package/benchmarks/" \
   "$package/benchmarks/RESULTS.md" \
   "$package/docs/" \
+  "$package/docs/diagnostics.md" \
+  "$package/docs/diagnostics.ru.md" \
   "$package/docs/assets/" \
   "$package/docs/assets/execwake-report.gif" \
   "$package/docs/assets/execwake-report.jpg" \

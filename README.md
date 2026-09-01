@@ -154,6 +154,9 @@ Imported session files are opened read-only and checked before use. Displayed
 text makes markup, terminal controls, OSC-8 sequences, and bidirectional control
 characters visible. Raw evidence remains in SQLite.
 
+Report vulnerabilities through [SECURITY.md](SECURITY.md). For ordinary defects,
+use the [diagnostic checklist](docs/diagnostics.md) before opening an issue.
+
 ## Linux package
 
 On Linux, build a versioned archive and SHA-256 file with:
