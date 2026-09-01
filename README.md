@@ -13,7 +13,7 @@ environment coverage.
 
 ## Status
 
-ExecWake 0.1.0-rc.1 is a Linux alpha. The collector records:
+ExecWake 0.1.0-rc.2 is a Linux alpha. The collector records:
 
 - process fork, clone, exec, exit, exit code, and terminating signal;
 - file operations and verified final state deltas;
