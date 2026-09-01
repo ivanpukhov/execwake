@@ -1,5 +1,7 @@
 # ExecWake
 
+[Русский](README.ru.md)
+
 ![ExecWake report from the conformance fixture](docs/assets/execwake-report.gif)
 
 ExecWake records observable side effects of a command and compares behavior
@@ -145,7 +147,7 @@ scripts/package-linux.sh
 
 The packaging script uses the current architecture and refuses to overwrite an
 existing archive. Tagged builds and manual runs of the release workflow produce
-the x86_64 artifact.
+artifacts for x86_64 and arm64.
 
 ![Static ExecWake report overview](docs/assets/execwake-report.jpg)
 

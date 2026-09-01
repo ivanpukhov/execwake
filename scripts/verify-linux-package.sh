@@ -40,6 +40,7 @@ while IFS= read -r member; do
     "$package/" | \
       "$package/LICENSE" | \
       "$package/README.md" | \
+      "$package/README.ru.md" | \
       "$package/benchmarks/" | \
       "$package/benchmarks/RESULTS.md" | \
       "$package/docs/" | \
@@ -58,6 +59,7 @@ for required in \
   "$package/" \
   "$package/LICENSE" \
   "$package/README.md" \
+  "$package/README.ru.md" \
   "$package/benchmarks/" \
   "$package/benchmarks/RESULTS.md" \
   "$package/docs/" \

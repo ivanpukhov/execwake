@@ -59,7 +59,7 @@ staging=$(mktemp -d)
 trap 'rm -rf -- "$staging"' EXIT
 mkdir -p "$staging/$package/docs/assets" "$staging/$package/benchmarks"
 install -m 0755 "$binary" "$staging/$package/execwake"
-install -m 0644 LICENSE README.md "$staging/$package/"
+install -m 0644 LICENSE README.md README.ru.md "$staging/$package/"
 install -m 0644 docs/assets/execwake-report.gif docs/assets/execwake-report.jpg \
   "$staging/$package/docs/assets/"
 install -m 0644 benchmarks/RESULTS.md "$staging/$package/benchmarks/"
