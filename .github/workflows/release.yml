@@ -25,7 +25,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             image: rust@sha256:7e688b767f8cfc5296f5f73ab17982deeaaeb728f0c719ea9bb974544482d71a
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build Linux package
         id: package
         env:
