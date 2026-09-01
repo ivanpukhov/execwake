@@ -37,6 +37,24 @@ cgroup и загружать eBPF-программы. Если эти требо
 сессии. Текущие замеры накладных расходов опубликованы в
 [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 
+## Установка
+
+Для установщика нужны Linux, `curl`, `cosign`, `sha256sum` и `tar`. Скачайте его
+из того же тега, что и релиз, просмотрите файл и запустите с точным тегом:
+
+```sh
+tag=v0.1.0-rc.2
+curl --fail --location --proto '=https' --tlsv1.2 --remote-name \
+  "https://raw.githubusercontent.com/ivanpukhov/execwake/$tag/scripts/install-linux.sh"
+less install-linux.sh
+bash install-linux.sh "$tag"
+```
+
+По умолчанию бинарный файл устанавливается в `~/.local/bin`. Другой абсолютный
+путь можно передать вторым аргументом. Установщик проверяет Sigstore identity
+манифеста до его использования, затем проверяет SHA-256 архива и версию
+бинарного файла. Ссылки и каталоги с именем целевого файла не перезаписываются.
+
 ## Сборка
 
 Требуется Rust 1.67 или новее.

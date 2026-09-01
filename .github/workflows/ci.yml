@@ -40,6 +40,7 @@ jobs:
       - run: npm run test:browser
         working-directory: web
       - run: git diff --exit-code -- src/report/assets
+      - run: tests/install_linux.sh
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets

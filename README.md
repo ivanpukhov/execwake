@@ -36,6 +36,24 @@ are unavailable. The selected backend is stored in every session manifest.
 Current overhead measurements are published in
 [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 
+## Install
+
+The installer requires Linux, `curl`, `cosign`, `sha256sum`, and `tar`. Download
+it from the same tag as the release, inspect it, and run it with that exact tag:
+
+```sh
+tag=v0.1.0-rc.2
+curl --fail --location --proto '=https' --tlsv1.2 --remote-name \
+  "https://raw.githubusercontent.com/ivanpukhov/execwake/$tag/scripts/install-linux.sh"
+less install-linux.sh
+bash install-linux.sh "$tag"
+```
+
+The default destination is `~/.local/bin`; pass an absolute directory as the
+second argument to change it. The installer verifies the checksum manifest's
+Sigstore identity before using it, verifies the archive checksum and binary
+version, and refuses to replace a symlink or directory.
+
 ## Build
 
 Rust 1.67 or newer is required.
