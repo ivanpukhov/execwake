@@ -68,3 +68,76 @@ jobs:
             "RUSTUP_HOME=$(rustup show home)" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             scripts/test-linux-collectors.sh
+
+  package-smoke:
+    name: Package smoke (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.67.0
+      - name: Build and verify package
+        env:
+          CARGO_BUILD_JOBS: 2
+          EXECWAKE_TARGET: ${{ matrix.target }}
+        run: |
+          scripts/package-linux.sh
+          version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          archive="dist/execwake-v${version}-${EXECWAKE_TARGET}.tar.gz"
+          scripts/verify-linux-package.sh "$archive" "$EXECWAKE_TARGET"
+      - name: Run packaged binary
+        env:
+          EXECWAKE_TARGET: ${{ matrix.target }}
+          XDG_STATE_HOME: ${{ runner.temp }}/execwake-smoke-state
+        run: |
+          version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          package="execwake-v${version}-${EXECWAKE_TARGET}"
+          staging=$(mktemp -d)
+          trap 'rm -rf -- "$staging"' EXIT
+          tar -xzf "dist/$package.tar.gz" -C "$staging" "$package/execwake"
+          binary="$staging/$package/execwake"
+
+          "$binary" run -- /usr/bin/true
+
+          set +e
+          "$binary" run -- /bin/sh -c 'exit 17'
+          status=$?
+          set -e
+          if (( status != 17 )); then
+            echo "Expected exit code 17, got $status." >&2
+            exit 1
+          fi
+
+          sessions="$XDG_STATE_HOME/execwake/sessions"
+          database_count=$(find "$sessions" -maxdepth 1 -type f -name '*.sqlite3' | wc -l)
+          marker_count=$(find "$sessions" -maxdepth 1 -type f -name '*.finalized' | wc -l)
+          if (( database_count != 2 || marker_count != 2 )); then
+            echo "Expected two finalized sessions." >&2
+            exit 1
+          fi
+          if [[ $(stat -c '%a' "$sessions") != 700 ]]; then
+            echo "Session directory permissions are not private." >&2
+            exit 1
+          fi
+          while IFS= read -r file; do
+            if [[ $(stat -c '%a' "$file") != 600 ]]; then
+              echo "Session file permissions are not private: $file" >&2
+              exit 1
+            fi
+          done < <(find "$sessions" -maxdepth 1 -type f -print)
