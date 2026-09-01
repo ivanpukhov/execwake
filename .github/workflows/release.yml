@@ -80,11 +80,13 @@ jobs:
         run: |
           archive_directory=$(dirname -- "$ARCHIVE")
           archive_name=$(basename -- "$ARCHIVE")
+          checksum_manifest="$RUNNER_TEMP/$archive_name.sha256"
           (
             cd "$archive_directory"
-            sha256sum "$archive_name.spdx.json" >>"$archive_name.sha256"
-            sha256sum --check "$archive_name.sha256"
+            sha256sum "$archive_name" "$archive_name.spdx.json" >"$checksum_manifest"
+            sha256sum --check "$checksum_manifest"
           )
+          mv -f -- "$checksum_manifest" "$ARCHIVE.sha256"
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v3.0.6
