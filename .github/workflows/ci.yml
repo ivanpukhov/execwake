@@ -62,9 +62,20 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
 
-  collector-conformance:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
+  ebpf-conformance:
+    name: eBPF conformance (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-22.04-arm
+          - ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
@@ -77,14 +88,14 @@ jobs:
           mountpoint -q /sys/kernel/debug/tracing || sudo mount -t tracefs tracefs /sys/kernel/debug/tracing
       - name: Check Linux collector requirements
         run: sudo scripts/check-linux-collector.sh
-      - name: Test ptrace and eBPF collectors
+      - name: Test eBPF collector
         run: |
           sudo env \
             "PATH=$PATH" \
             "HOME=$HOME" \
             "RUSTUP_HOME=$(rustup show home)" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
-            scripts/test-linux-collectors.sh
+            scripts/test-linux-ebpf.sh
 
   ptrace-conformance:
     name: Ptrace conformance (${{ matrix.runner }})
