@@ -13,7 +13,7 @@ ExecWake записывает наблюдаемые побочные эффек
 
 ## Состояние проекта
 
-ExecWake 0.1.0-rc.2 — альфа-версия для Linux. Сборщик записывает:
+ExecWake 0.1.0-rc.3 — альфа-версия для Linux. Сборщик записывает:
 
 - fork, clone, exec и exit процессов, код завершения и завершающий сигнал;
 - файловые операции и проверенные изменения итогового состояния;
@@ -43,7 +43,7 @@ cgroup и загружать eBPF-программы. Если эти требо
 из того же тега, что и релиз, просмотрите файл и запустите с точным тегом:
 
 ```sh
-tag=v0.1.0-rc.2
+tag=v0.1.0-rc.3
 curl --fail --location --proto '=https' --tlsv1.2 --remote-name \
   "https://raw.githubusercontent.com/ivanpukhov/execwake/$tag/scripts/install-linux.sh"
 less install-linux.sh
@@ -177,10 +177,10 @@ execwake diff before.sqlite3 after.sqlite3
 
 ## Linux-пакет
 
-На Linux архив с версией и SHA-256-файл собираются так:
+На Linux две побайтно одинаковые копии архива собираются и проверяются так:
 
 ```sh
-scripts/package-linux.sh
+scripts/verify-reproducible-package.sh "$(rustc -vV | sed -n 's/^host: //p')"
 (cd dist && sha256sum --check *.tar.gz.sha256)
 ```
 

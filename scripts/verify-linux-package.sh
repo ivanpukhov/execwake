@@ -38,6 +38,8 @@ archive_directory=$(CDPATH= cd -- "$(dirname -- "$archive")" && pwd)
 while IFS= read -r member; do
   case "$member" in
     "$package/" | \
+      "$package/CHANGELOG.md" | \
+      "$package/CHANGELOG.ru.md" | \
       "$package/LICENSE" | \
       "$package/README.md" | \
       "$package/README.ru.md" | \
@@ -61,6 +63,8 @@ done < <(tar -tzf "$archive")
 
 for required in \
   "$package/" \
+  "$package/CHANGELOG.md" \
+  "$package/CHANGELOG.ru.md" \
   "$package/LICENSE" \
   "$package/README.md" \
   "$package/README.ru.md" \

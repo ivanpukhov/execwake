@@ -39,7 +39,7 @@ printf '%s\n' \
   'printf "%s\\n" "$@" >"$COSIGN_LOG"' >"$fake_bin/cosign"
 chmod 0755 "$fake_bin/uname" "$fake_bin/curl" "$fake_bin/cosign"
 
-version=0.1.0-rc.2
+version=0.1.0-rc.3
 target=x86_64-unknown-linux-gnu
 package=execwake-v${version}-${target}
 archive=$package.tar.gz
@@ -47,7 +47,7 @@ mkdir -p "$test_root/package/$package"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'if [[ ${1:-} == --version ]]; then' \
-  '  printf "execwake 0.1.0-rc.2\\n"' \
+  '  printf "execwake 0.1.0-rc.3\\n"' \
   'else' \
   '  exit 2' \
   'fi' >"$test_root/package/$package/execwake"

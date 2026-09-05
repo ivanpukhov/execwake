@@ -13,7 +13,7 @@ environment coverage.
 
 ## Status
 
-ExecWake 0.1.0-rc.2 is a Linux alpha. The collector records:
+ExecWake 0.1.0-rc.3 is a Linux alpha. The collector records:
 
 - process fork, clone, exec, exit, exit code, and terminating signal;
 - file operations and verified final state deltas;
@@ -42,7 +42,7 @@ The installer requires Linux, `curl`, `cosign`, `sha256sum`, and `tar`. Download
 it from the same tag as the release, inspect it, and run it with that exact tag:
 
 ```sh
-tag=v0.1.0-rc.2
+tag=v0.1.0-rc.3
 curl --fail --location --proto '=https' --tlsv1.2 --remote-name \
   "https://raw.githubusercontent.com/ivanpukhov/execwake/$tag/scripts/install-linux.sh"
 less install-linux.sh
@@ -171,10 +171,11 @@ use the [diagnostic checklist](docs/diagnostics.md) before opening an issue.
 
 ## Linux package
 
-On Linux, build a versioned archive and SHA-256 file with:
+On Linux, build and verify two byte-identical copies of the versioned archive
+with:
 
 ```sh
-scripts/package-linux.sh
+scripts/verify-reproducible-package.sh "$(rustc -vV | sed -n 's/^host: //p')"
 (cd dist && sha256sum --check *.tar.gz.sha256)
 ```
 

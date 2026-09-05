@@ -59,7 +59,8 @@ staging=$(mktemp -d)
 trap 'rm -rf -- "$staging"' EXIT
 mkdir -p "$staging/$package/docs/assets" "$staging/$package/benchmarks"
 install -m 0755 "$binary" "$staging/$package/execwake"
-install -m 0644 LICENSE README.md README.ru.md SECURITY.md SECURITY.ru.md \
+install -m 0644 CHANGELOG.md CHANGELOG.ru.md LICENSE README.md README.ru.md \
+  SECURITY.md SECURITY.ru.md \
   "$staging/$package/"
 install -m 0644 docs/diagnostics.md docs/diagnostics.ru.md \
   "$staging/$package/docs/"
