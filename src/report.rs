@@ -899,11 +899,14 @@ fn query_findings(connection: &Connection) -> rusqlite::Result<Vec<FindingReport
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{load_event_page, load_report, EventQuery, ReportServer, BODY_LIMIT};
     use crate::session::SessionMode;
     use crate::storage::{SessionOutcome, SessionStore};
+
+    static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     struct TestDirectory(PathBuf);
 
@@ -913,10 +916,11 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock should be after the Unix epoch")
                 .as_nanos();
-            Self(
-                std::env::temp_dir()
-                    .join(format!("execwake-report-{}-{nonce}", std::process::id())),
-            )
+            let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "execwake-report-{}-{nonce}-{sequence}",
+                std::process::id()
+            )))
         }
     }
 

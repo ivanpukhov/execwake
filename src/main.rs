@@ -40,10 +40,12 @@ fn main() {
         Command::Run(args) => {
             match execwake::runner::run(args.command, args.node_enrichment, args.collector) {
                 Ok(result) => {
+                    if let Err(error) = report_launch::print_run_summary(&result.session) {
+                        eprintln!("Summary unavailable: {error}");
+                        report_launch::print_session_path(&result.session);
+                    }
                     if result.status.code().is_some() {
                         report_launch::present(&result.session);
-                    } else {
-                        report_launch::print_session_path(&result.session);
                     }
                     execwake::runner::exit_with_status(result.status);
                 }

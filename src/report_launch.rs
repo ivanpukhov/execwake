@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use execwake::semantic_diff::SemanticDiff;
 use execwake::storage::{SessionId, SessionPaths, SessionStore};
+use rusqlite::{Connection, OpenFlags};
 
 const INTERNAL_REPORT_COMMAND: &str = "__serve-report";
 const INTERNAL_DIFF_REPORT_COMMAND: &str = "__serve-diff";
@@ -54,7 +55,6 @@ pub fn present_diff(before: &Path, after: &Path, diff: &SemanticDiff) -> io::Res
 
 pub fn present(session: &SessionPaths) {
     if !should_open_report() {
-        print_session_path(session);
         return;
     }
 
@@ -62,7 +62,6 @@ pub fn present(session: &SessionPaths) {
         Ok(report) => report,
         Err(error) => {
             eprintln!("Report unavailable: {error}");
-            print_session_path(session);
             return;
         }
     };
@@ -72,13 +71,152 @@ pub fn present(session: &SessionPaths) {
         Err(error) => {
             stop_child(&mut server);
             eprintln!("Report unavailable: {error}");
-            print_session_path(session);
         }
     }
 }
 
 pub fn print_session_path(session: &SessionPaths) {
     eprintln!("Session: {}", session.database().display());
+}
+
+pub fn print_run_summary(session: &SessionPaths) -> io::Result<()> {
+    let summary = load_run_summary(session)?;
+    let stderr = io::stderr();
+    let mut output = stderr.lock();
+    write_run_summary(&mut output, &summary, session.database())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RunSummary {
+    collector_requested: String,
+    collector_backend: Option<String>,
+    collector_fallback_reason: Option<String>,
+    categories: Vec<RunCategorySummary>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RunCategorySummary {
+    label: &'static str,
+    count: i64,
+    coverage: String,
+    lost_events: i64,
+}
+
+fn load_run_summary(session: &SessionPaths) -> io::Result<RunSummary> {
+    let connection = Connection::open_with_flags(
+        session.database(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(database_error)?;
+    let (collector_requested, collector_backend, collector_fallback_reason) = connection
+        .query_row(
+            "SELECT collector_requested, collector_backend, collector_fallback_reason
+             FROM session WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(database_error)?;
+    let counts = [
+        (
+            "Processes",
+            connection
+                .query_row("SELECT COUNT(*) FROM process", [], |row| row.get(0))
+                .map_err(database_error)?,
+            "processes",
+        ),
+        (
+            "Filesystem events",
+            event_count(&connection, "filesystem")?,
+            "filesystem",
+        ),
+        (
+            "Network events",
+            event_count(&connection, "network")?,
+            "network",
+        ),
+        (
+            "Environment records",
+            connection
+                .query_row("SELECT COUNT(*) FROM environment_variable", [], |row| {
+                    row.get(0)
+                })
+                .map_err(database_error)?,
+            "environment",
+        ),
+    ];
+    let mut categories = Vec::with_capacity(counts.len());
+    for (label, count, category) in counts {
+        let (coverage, lost_events) = connection
+            .query_row(
+                "SELECT state, lost_events FROM coverage WHERE category = ?1",
+                [category],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(database_error)?;
+        categories.push(RunCategorySummary {
+            label,
+            count,
+            coverage,
+            lost_events,
+        });
+    }
+
+    Ok(RunSummary {
+        collector_requested,
+        collector_backend,
+        collector_fallback_reason,
+        categories,
+    })
+}
+
+fn event_count(connection: &Connection, category: &str) -> io::Result<i64> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM event WHERE category = ?1",
+            [category],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
+}
+
+fn write_run_summary(
+    output: &mut impl Write,
+    summary: &RunSummary,
+    database: &Path,
+) -> io::Result<()> {
+    writeln!(output, "ExecWake session finalized")?;
+    write!(output, "Collector: ")?;
+    match summary.collector_backend.as_deref() {
+        Some(backend) => write!(output, "{backend}")?,
+        None => write!(output, "unavailable")?,
+    }
+    write!(output, " (requested: {}", summary.collector_requested)?;
+    if let Some(reason) = summary.collector_fallback_reason.as_deref() {
+        write!(output, "; fallback: {reason}")?;
+    }
+    writeln!(output, ")")?;
+    for category in &summary.categories {
+        if category.coverage == "unavailable" {
+            writeln!(output, "{}: unavailable", category.label)?;
+            continue;
+        }
+        write!(
+            output,
+            "{}: {} ({} coverage",
+            category.label, category.count, category.coverage
+        )?;
+        if category.lost_events > 0 {
+            write!(output, "; {} lost", category.lost_events)?;
+        }
+        writeln!(output, ")")?;
+    }
+    writeln!(output, "Session: {}", database.display())
+}
+
+fn database_error(error: rusqlite::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 fn serve(arguments: &[OsString]) -> io::Result<()> {
@@ -349,7 +487,12 @@ fn invalid_input(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{report_open_allowed, validated_diff_url, validated_report_url};
+    use std::path::Path;
+
+    use super::{
+        report_open_allowed, validated_diff_url, validated_report_url, write_run_summary,
+        RunCategorySummary, RunSummary,
+    };
     use execwake::storage::SessionId;
 
     #[test]
@@ -372,5 +515,48 @@ mod tests {
         assert!(!report_open_allowed(true, false, false, true));
         assert!(!report_open_allowed(true, true, true, true));
         assert!(!report_open_allowed(true, true, false, false));
+    }
+
+    #[test]
+    fn summary_distinguishes_partial_and_unavailable_coverage() {
+        let summary = RunSummary {
+            collector_requested: "auto".to_owned(),
+            collector_backend: Some("ptrace".to_owned()),
+            collector_fallback_reason: Some("permission_denied".to_owned()),
+            categories: vec![
+                RunCategorySummary {
+                    label: "Processes",
+                    count: 6,
+                    coverage: "complete".to_owned(),
+                    lost_events: 0,
+                },
+                RunCategorySummary {
+                    label: "Filesystem events",
+                    count: 412,
+                    coverage: "partial".to_owned(),
+                    lost_events: 3,
+                },
+                RunCategorySummary {
+                    label: "Network events",
+                    count: 0,
+                    coverage: "unavailable".to_owned(),
+                    lost_events: 0,
+                },
+            ],
+        };
+        let mut output = Vec::new();
+
+        write_run_summary(&mut output, &summary, Path::new("/tmp/session.sqlite3"))
+            .expect("the summary should be written");
+
+        assert_eq!(
+            String::from_utf8(output).expect("summary output should be UTF-8"),
+            "ExecWake session finalized\n\
+             Collector: ptrace (requested: auto; fallback: permission_denied)\n\
+             Processes: 6 (complete coverage)\n\
+             Filesystem events: 412 (partial coverage; 3 lost)\n\
+             Network events: unavailable\n\
+             Session: /tmp/session.sqlite3\n"
+        );
     }
 }
