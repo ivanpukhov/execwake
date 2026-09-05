@@ -2,6 +2,8 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::session::CollectorRequest;
+
 #[derive(Debug)]
 pub struct Cli {
     pub command: Command,
@@ -17,6 +19,7 @@ pub enum Command {
 pub struct RunArgs {
     pub command: Vec<OsString>,
     pub node_enrichment: bool,
+    pub collector: CollectorRequest,
 }
 
 #[derive(Debug)]
@@ -96,10 +99,10 @@ impl Cli {
 pub fn help_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::Root => {
-            "ExecWake\n\nUsage:\n  execwake run [--node-enrichment] [--] <command> [arguments...]\n  execwake diff <before> <after>\n"
+            "ExecWake\n\nUsage:\n  execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--] <command> [arguments...]\n  execwake diff <before> <after>\n"
         }
         HelpTopic::Run => {
-            "Usage: execwake run [--node-enrichment] [--] <command> [arguments...]\n"
+            "Usage: execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--] <command> [arguments...]\n"
         }
         HelpTopic::Diff => "Usage: execwake diff <before> <after>\n",
     }
@@ -113,11 +116,24 @@ fn parse_run(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
     }
 
     let mut node_enrichment = false;
+    let mut collector = CollectorRequest::Auto;
     loop {
         match arguments.first().map(OsString::as_os_str) {
             Some(value) if value == OsStr::new("--node-enrichment") => {
                 node_enrichment = true;
                 arguments.remove(0);
+            }
+            Some(value) if value == OsStr::new("--collector") => {
+                if arguments.len() < 2 {
+                    return Err(ParseError::new("--collector requires a value"));
+                }
+                let value = arguments
+                    .get(1)
+                    .and_then(|value| value.to_str())
+                    .and_then(CollectorRequest::parse)
+                    .ok_or_else(|| ParseError::new("collector must be auto, ebpf, or ptrace"))?;
+                collector = value;
+                arguments.drain(0..2);
             }
             Some(value) if value == OsStr::new("--") => {
                 arguments.remove(0);
@@ -135,6 +151,7 @@ fn parse_run(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
         command: Command::Run(RunArgs {
             command: arguments,
             node_enrichment,
+            collector,
         }),
     }))
 }
@@ -164,6 +181,7 @@ mod tests {
     use std::path::Path;
 
     use super::{Cli, Command, HelpTopic, ParseResult};
+    use crate::session::CollectorRequest;
 
     #[test]
     fn parses_run_arguments_without_interpreting_command_flags() {
@@ -203,6 +221,7 @@ mod tests {
 
         assert_eq!(args.command, [OsStr::new("printf"), OsStr::new("--help")]);
         assert!(!args.node_enrichment);
+        assert_eq!(args.collector, CollectorRequest::Auto);
     }
 
     #[test]
@@ -240,6 +259,46 @@ mod tests {
         assert_eq!(
             args.command,
             [OsStr::new("--node-enrichment"), OsStr::new("fixture.cjs")]
+        );
+    }
+
+    #[test]
+    fn selects_a_collector_only_before_the_separator() {
+        let result = Cli::parse_from([
+            "execwake",
+            "run",
+            "--collector",
+            "ptrace",
+            "--",
+            "command",
+            "--collector",
+            "ebpf",
+        ])
+        .expect("collector selection should parse");
+        let ParseResult::Command(cli) = result else {
+            panic!("expected command");
+        };
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.collector, CollectorRequest::Ptrace);
+        assert_eq!(
+            args.command,
+            [
+                OsStr::new("command"),
+                OsStr::new("--collector"),
+                OsStr::new("ebpf")
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_collector_selection() {
+        assert!(Cli::parse_from(["execwake", "run", "--collector"]).is_err());
+        assert!(
+            Cli::parse_from(["execwake", "run", "--collector", "unknown", "--", "command"])
+                .is_err()
         );
     }
 

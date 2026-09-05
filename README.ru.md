@@ -84,6 +84,19 @@ execwake run -- npm install some-package
 execwake run -- cargo test
 ```
 
+По умолчанию используется выбор collector `auto`. Чтобы потребовать конкретный
+backend, укажите параметр перед разделителем argv:
+
+```sh
+execwake run --collector ebpf -- npm install some-package
+execwake run --collector ptrace -- cargo test
+```
+
+При явном выборе `ebpf` команда завершится с ошибкой, если eBPF невозможно
+инициализировать. Выбор `ptrace` не пытается загрузить eBPF. Запрошенный и
+фактический backend, а также ограниченный код причины fallback сохраняются в
+сессии.
+
 Сохраняется поведение stdin, stdout, stderr, сигналов, определения терминала и
 кода завершения дочернего процесса. В интерактивном графическом терминале
 локальный отчёт открывается автоматически. В CI и headless-среде выводится путь

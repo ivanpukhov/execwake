@@ -37,23 +37,29 @@ fn main() {
     };
 
     match cli.command {
-        Command::Run(args) => match execwake::runner::run(args.command, args.node_enrichment) {
-            Ok(result) => {
-                if result.status.code().is_some() {
-                    report_launch::present(&result.session);
-                } else {
-                    report_launch::print_session_path(&result.session);
+        Command::Run(args) => {
+            match execwake::runner::run(args.command, args.node_enrichment, args.collector) {
+                Ok(result) => {
+                    if result.status.code().is_some() {
+                        report_launch::present(&result.session);
+                    } else {
+                        report_launch::print_session_path(&result.session);
+                    }
+                    execwake::runner::exit_with_status(result.status);
                 }
-                execwake::runner::exit_with_status(result.status);
-            }
-            Err(error) => {
-                eprintln!("error: {error}");
-                if let execwake::runner::RunError::Command { session, .. } = &error {
-                    eprintln!("Session: {}", session.display());
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    match &error {
+                        execwake::runner::RunError::Collector { session, .. }
+                        | execwake::runner::RunError::Command { session, .. } => {
+                            eprintln!("Session: {}", session.display());
+                        }
+                        _ => {}
+                    }
+                    process::exit(1);
                 }
-                process::exit(1);
             }
-        },
+        }
         Command::Diff(args) => {
             match execwake::semantic_diff::compare_paths(&args.before, &args.after) {
                 Ok(diff) => {

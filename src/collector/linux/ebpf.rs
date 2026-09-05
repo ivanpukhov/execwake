@@ -32,48 +32,75 @@ use crate::session::{
 static CGROUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub enum LinuxCollector {
-    Ebpf(EbpfCollector),
+    Ebpf {
+        collector: EbpfCollector,
+        requested: CollectorRequest,
+    },
     Ptrace {
         collector: PtraceCollector,
+        requested: CollectorRequest,
         fallback_reason: Option<CollectorFallbackReason>,
     },
 }
 
 impl LinuxCollector {
-    pub fn new(root_executable: String) -> Self {
+    pub fn new(root_executable: String, requested: CollectorRequest) -> io::Result<Self> {
         #[cfg(test)]
-        if std::env::var_os("EXECWAKE_FORCE_PTRACE").is_some() {
-            return Self::Ptrace {
+        if requested == CollectorRequest::Auto
+            && std::env::var_os("EXECWAKE_FORCE_PTRACE").is_some()
+        {
+            return Ok(Self::Ptrace {
                 collector: PtraceCollector::new(root_executable),
+                requested,
                 fallback_reason: None,
-            };
+            });
         }
-        match EbpfCollector::new(root_executable.clone()) {
-            Ok(collector) => Self::Ebpf(collector),
-            Err(error) => {
-                #[cfg(test)]
-                if std::env::var_os("EXECWAKE_REQUIRE_EBPF").is_some() {
-                    panic!("eBPF collector is required for this test: {error:?}");
-                }
-                Self::Ptrace {
-                    collector: PtraceCollector::new(root_executable),
-                    fallback_reason: Some(fallback_reason(&error)),
-                }
+
+        match requested {
+            CollectorRequest::Ptrace => Ok(Self::Ptrace {
+                collector: PtraceCollector::new(root_executable),
+                requested,
+                fallback_reason: None,
+            }),
+            CollectorRequest::Ebpf => {
+                EbpfCollector::new(root_executable).map(|collector| Self::Ebpf {
+                    collector,
+                    requested,
+                })
             }
+            CollectorRequest::Auto => match EbpfCollector::new(root_executable.clone()) {
+                Ok(collector) => Ok(Self::Ebpf {
+                    collector,
+                    requested,
+                }),
+                Err(error) => {
+                    #[cfg(test)]
+                    if std::env::var_os("EXECWAKE_REQUIRE_EBPF").is_some() {
+                        panic!("eBPF collector is required for this test: {error:?}");
+                    }
+                    Ok(Self::Ptrace {
+                        collector: PtraceCollector::new(root_executable),
+                        requested,
+                        fallback_reason: Some(fallback_reason(&error)),
+                    })
+                }
+            },
         }
     }
 
     pub fn decision(&self) -> CollectorDecision {
         match self {
-            Self::Ebpf(_) => CollectorDecision {
-                requested: CollectorRequest::Auto,
+            Self::Ebpf { requested, .. } => CollectorDecision {
+                requested: *requested,
                 backend: CollectorBackend::Ebpf,
                 fallback_reason: None,
             },
             Self::Ptrace {
-                fallback_reason, ..
+                requested,
+                fallback_reason,
+                ..
             } => CollectorDecision {
-                requested: CollectorRequest::Auto,
+                requested: *requested,
                 backend: CollectorBackend::Ptrace,
                 fallback_reason: *fallback_reason,
             },
@@ -82,7 +109,7 @@ impl LinuxCollector {
 
     pub fn ignore_paths(&mut self, paths: &[&Path]) {
         match self {
-            Self::Ebpf(collector) => collector
+            Self::Ebpf { collector, .. } => collector
                 .ignored_paths
                 .extend(paths.iter().map(|path| path.to_path_buf())),
             Self::Ptrace { collector, .. } => collector.ignore_paths(paths),
@@ -93,14 +120,14 @@ impl LinuxCollector {
 impl Collector for LinuxCollector {
     fn backend_name(&self) -> &'static str {
         match self {
-            Self::Ebpf(collector) => collector.backend_name(),
+            Self::Ebpf { collector, .. } => collector.backend_name(),
             Self::Ptrace { collector, .. } => collector.backend_name(),
         }
     }
 
     fn prepare(&mut self, command: &mut Command) -> io::Result<()> {
         match self {
-            Self::Ebpf(collector) => collector.prepare(command),
+            Self::Ebpf { collector, .. } => collector.prepare(command),
             Self::Ptrace { collector, .. } => collector.prepare(command),
         }
     }
@@ -111,7 +138,7 @@ impl Collector for LinuxCollector {
         sink: &mut dyn CollectorSink,
     ) -> io::Result<ExitStatus> {
         match self {
-            Self::Ebpf(collector) => collector.collect(child, sink),
+            Self::Ebpf { collector, .. } => collector.collect(child, sink),
             Self::Ptrace { collector, .. } => collector.collect(child, sink),
         }
     }
@@ -569,12 +596,23 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
-    use crate::session::CoverageState;
+    use crate::session::{CollectorBackend, CollectorRequest, CoverageState};
 
     use super::protocol::{EventKind, SyscallOperation};
-    use super::{ebpf_coverage, CgroupScope, EbpfProbe};
+    use super::{ebpf_coverage, CgroupScope, EbpfProbe, LinuxCollector};
 
     static TEST_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn explicit_ptrace_selection_does_not_initialize_ebpf() {
+        let collector = LinuxCollector::new("fixture".to_owned(), CollectorRequest::Ptrace)
+            .expect("ptrace selection should not depend on eBPF availability");
+        let decision = collector.decision();
+
+        assert_eq!(decision.requested, CollectorRequest::Ptrace);
+        assert_eq!(decision.backend, CollectorBackend::Ptrace);
+        assert_eq!(decision.fallback_reason, None);
+    }
 
     #[test]
     fn buffer_loss_marks_every_category_partial() {

@@ -19,8 +19,8 @@ use crate::node_enrichment::{
 };
 use crate::privacy::CURRENT_PRIVACY_PROFILE;
 use crate::session::{
-    CategoryCoverage, CollectorBackend, CollectorDecision, EvidenceKind, SessionCoverage,
-    SessionMode, CURRENT_SCHEMA_VERSION,
+    CategoryCoverage, CollectorBackend, CollectorDecision, CollectorRequest, EvidenceKind,
+    SessionCoverage, SessionMode, CURRENT_SCHEMA_VERSION,
 };
 
 #[derive(Debug)]
@@ -361,6 +361,15 @@ impl CaptureLosses {
 impl ActiveSession {
     pub fn paths(&self) -> &SessionPaths {
         &self.paths
+    }
+
+    pub fn set_collector_request(&mut self, requested: CollectorRequest) -> Result<(), StoreError> {
+        self.flush_capture_batch()?;
+        self.connection.execute(
+            "UPDATE session SET collector_requested = ?1 WHERE singleton = 1",
+            [requested.as_str()],
+        )?;
+        Ok(())
     }
 
     pub fn set_collector_decision(

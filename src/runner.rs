@@ -7,13 +7,14 @@ use std::process::{Command, ExitStatus, Stdio};
 #[cfg(target_os = "linux")]
 use crate::collector::{Collector, LinuxCollector};
 use crate::node_enrichment::NodeEnrichmentCapture;
-use crate::session::SessionMode;
+use crate::session::{CollectorRequest, SessionMode};
 use crate::storage::{SessionOutcome, SessionPaths, SessionStore, StoreError};
 
 #[derive(Debug)]
 pub enum RunError {
     Store(StoreError),
     Signal(io::Error),
+    Collector { source: io::Error, session: PathBuf },
     Command { source: io::Error, session: PathBuf },
 }
 
@@ -22,6 +23,9 @@ impl fmt::Display for RunError {
         match self {
             Self::Store(error) => error.fmt(formatter),
             Self::Signal(error) => write!(formatter, "signal handling failed: {error}"),
+            Self::Collector { source, .. } => {
+                write!(formatter, "collector initialization failed: {source}")
+            }
             Self::Command { source, .. } => write!(formatter, "command failed: {source}"),
         }
     }
@@ -32,6 +36,7 @@ impl std::error::Error for RunError {
         match self {
             Self::Store(error) => Some(error),
             Self::Signal(error) => Some(error),
+            Self::Collector { source, .. } => Some(source),
             Self::Command { source, .. } => Some(source),
         }
     }
@@ -49,21 +54,26 @@ pub struct RunResult {
     pub status: ExitStatus,
 }
 
-pub fn run(argv: Vec<OsString>, node_enrichment: bool) -> Result<RunResult, RunError> {
+pub fn run(
+    argv: Vec<OsString>,
+    node_enrichment: bool,
+    collector: CollectorRequest,
+) -> Result<RunResult, RunError> {
     let store = SessionStore::discover().map_err(StoreError::from)?;
     store.recover_interrupted()?;
-    run_in_store_with_options(argv, &store, node_enrichment)
+    run_in_store_with_options(argv, &store, node_enrichment, collector)
 }
 
 #[cfg(test)]
 fn run_in_store(argv: Vec<OsString>, store: &SessionStore) -> Result<RunResult, RunError> {
-    run_in_store_with_options(argv, store, false)
+    run_in_store_with_options(argv, store, false, CollectorRequest::Auto)
 }
 
 fn run_in_store_with_options(
     argv: Vec<OsString>,
     store: &SessionStore,
     node_enrichment: bool,
+    collector_request: CollectorRequest,
 ) -> Result<RunResult, RunError> {
     let executable = argv
         .first()
@@ -75,6 +85,7 @@ fn run_in_store_with_options(
         SessionMode::Observe
     };
     let mut session = store.begin_in_mode(&command_name, argv.len().saturating_sub(1), mode)?;
+    session.set_collector_request(collector_request)?;
     let forwarder = SignalForwarder::start().map_err(RunError::Signal)?;
 
     let mut command = Command::new(executable);
@@ -101,8 +112,33 @@ fn run_in_store_with_options(
         None
     };
 
+    #[cfg(not(target_os = "linux"))]
+    if collector_request != CollectorRequest::Auto {
+        forwarder.stop();
+        let session_path = session.paths().database().to_owned();
+        session.finalize(SessionOutcome::without_status())?;
+        return Err(RunError::Collector {
+            source: io::Error::new(
+                io::ErrorKind::Unsupported,
+                "collector selection is supported only on Linux",
+            ),
+            session: session_path,
+        });
+    }
+
     #[cfg(target_os = "linux")]
-    let mut collector = LinuxCollector::new(command_name);
+    let mut collector = match LinuxCollector::new(command_name, collector_request) {
+        Ok(collector) => collector,
+        Err(source) => {
+            forwarder.stop();
+            let session_path = session.paths().database().to_owned();
+            session.finalize(SessionOutcome::without_status())?;
+            return Err(RunError::Collector {
+                source,
+                session: session_path,
+            });
+        }
+    };
     #[cfg(target_os = "linux")]
     session.set_collector_decision(collector.decision())?;
     #[cfg(target_os = "linux")]
@@ -317,6 +353,10 @@ mod tests {
     use rusqlite::Connection;
 
     use super::run_in_store;
+    #[cfg(target_os = "linux")]
+    use super::run_in_store_with_options;
+    #[cfg(target_os = "linux")]
+    use crate::session::CollectorRequest;
     use crate::storage::SessionStore;
 
     struct TestDirectory(PathBuf);
@@ -398,6 +438,35 @@ mod tests {
                 .expect("the collector backend should be stored");
             assert_eq!(backend, "ptrace");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn honors_an_explicit_ptrace_selection() {
+        let directory = TestDirectory::new();
+        let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+        let result =
+            run_in_store_with_options(exit_command(0), &store, false, CollectorRequest::Ptrace)
+                .expect("the command should run under ptrace");
+        let connection =
+            Connection::open(result.session.database()).expect("the database should open");
+        let decision = connection
+            .query_row(
+                "SELECT collector_requested, collector_backend,
+                        collector_fallback_reason
+                 FROM session WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .expect("the collector decision should be stored");
+
+        assert_eq!(decision, ("ptrace".to_owned(), "ptrace".to_owned(), None));
     }
 
     #[cfg(target_os = "linux")]

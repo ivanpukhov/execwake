@@ -83,6 +83,18 @@ execwake run -- npm install some-package
 execwake run -- cargo test
 ```
 
+Collector selection defaults to `auto`. To require one backend, put the option
+before the argv separator:
+
+```sh
+execwake run --collector ebpf -- npm install some-package
+execwake run --collector ptrace -- cargo test
+```
+
+An explicit `ebpf` selection fails if eBPF cannot be initialized. An explicit
+`ptrace` selection does not attempt to load eBPF. The requested backend, selected
+backend, and bounded fallback reason are stored in the session.
+
 stdin, stdout, stderr, signals, terminal detection, and the child exit status
 are preserved. Interactive graphical terminals open the local report. CI and
 headless runs print the SQLite session path.
