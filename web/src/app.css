@@ -30,6 +30,10 @@ h2 { font-size: 16px; letter-spacing: -0.01em; }
 .content-grid { display: grid; grid-template-columns: minmax(280px, 0.72fr) minmax(460px, 1.28fr); gap: 16px; margin-bottom: 16px; }
 .panel { margin-bottom: 16px; padding: 16px; border: 1px solid #ccd4ce; background: #f8faf8; box-shadow: 0 1px 2px rgb(31 45 36 / 5%); }
 .panel-heading { display: flex; justify-content: space-between; align-items: center; min-height: 28px; margin-bottom: 14px; }
+.collector-status { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+.collector-status div { display: flex; gap: 8px; align-items: baseline; padding: 8px 10px; border: 1px solid #dce2dd; background: #fff; }
+.collector-status dt { color: #68766d; font-size: 10px; text-transform: uppercase; }
+.collector-status dd { margin: 0; font: 700 11px ui-monospace, monospace; text-transform: uppercase; }
 .coverage-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .coverage-row { display: flex; align-items: center; justify-content: space-between; padding: 10px; border: 1px solid #dce2dd; background: #fff; font-size: 12px; text-transform: capitalize; }
 .coverage-row strong { color: #34513e; font: 700 10px ui-monospace, monospace; text-transform: uppercase; }

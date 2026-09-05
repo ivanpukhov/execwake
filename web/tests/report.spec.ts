@@ -8,6 +8,9 @@ const session = {
   finalized: true,
   commandName: '<img src=x onerror="window.reportInjected=true">',
   argumentCount: 2,
+  collectorRequested: 'auto',
+  collectorBackend: 'ptrace',
+  collectorFallbackReason: 'permission_denied',
   startedAtMs: 1_000,
   endedAtMs: 2_500,
   exitCode: 0,
@@ -106,6 +109,10 @@ test('renders a large session without inserting report text as markup', async ({
   await expect(page.getByLabel('Process hierarchy')).toContainText('/usr/bin/node');
   await expect(page.getByLabel('Process hierarchy')).toContainText('/usr/bin/git');
   await expect(page.getByText('sensitive-path-read v1')).toBeVisible();
+  const collector = page.getByLabel('Collector selection');
+  await expect(collector).toContainText('Requestedauto');
+  await expect(collector).toContainText('Selectedptrace');
+  await expect(collector).toContainText('Fallback permission denied');
 
   const timeline = page.getByLabel('Process and event timeline');
   await expect(timeline).toBeVisible();

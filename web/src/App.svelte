@@ -40,6 +40,10 @@
     if (coverage.lostEvents === 0) return coverage.state;
     return `${coverage.state} · ${coverage.lostEvents} lost`;
   }
+
+  function collectorReason(reason: string): string {
+    return reason.replaceAll('_', ' ');
+  }
 </script>
 
 <svelte:head>
@@ -93,6 +97,16 @@
       <div class="panel-heading">
         <div><p class="eyebrow">Coverage</p><h2>Observation status</h2></div>
       </div>
+      <dl class="collector-status" aria-label="Collector selection">
+        <div><dt>Requested</dt><dd>{report.collectorRequested}</dd></div>
+        <div><dt>Selected</dt><dd>{report.collectorBackend ?? 'unavailable'}</dd></div>
+        {#if report.collectorFallbackReason}
+          <div>
+            <dt>Fallback</dt>
+            <dd>{collectorReason(report.collectorFallbackReason)}</dd>
+          </div>
+        {/if}
+      </dl>
       <div class="coverage-grid">
         {#each report.coverage as coverage}
           <div class="coverage-row">

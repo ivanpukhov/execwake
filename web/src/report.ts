@@ -56,6 +56,14 @@ export interface SessionReport {
   finalized: boolean;
   commandName: string;
   argumentCount: number;
+  collectorRequested: 'auto' | 'ebpf' | 'ptrace';
+  collectorBackend: 'ebpf' | 'ptrace' | null;
+  collectorFallbackReason:
+    | 'cgroup_unavailable'
+    | 'permission_denied'
+    | 'platform_incompatible'
+    | 'initialization_failed'
+    | null;
   startedAtMs: number;
   endedAtMs: number | null;
   exitCode: number | null;
