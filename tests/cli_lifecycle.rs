@@ -37,7 +37,7 @@ impl Drop for TestDirectory {
 fn passes_stdin_and_explicit_shell_pipelines() {
     let stdin_state = TestDirectory::new("stdin");
     let mut child = command(&stdin_state.0)
-        .args(["run", "--", "/bin/cat"])
+        .args(["run", "--collector", "ptrace", "--", "/bin/cat"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -60,7 +60,15 @@ fn passes_stdin_and_explicit_shell_pipelines() {
     let pipeline_state = TestDirectory::new("pipeline");
     let output = run(
         &pipeline_state.0,
-        &["run", "--", "/bin/sh", "-c", "printf pipeline | tr a-z A-Z"],
+        &[
+            "run",
+            "--collector",
+            "ptrace",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf pipeline | tr a-z A-Z",
+        ],
     );
 
     assert!(output.status.success());
@@ -71,7 +79,18 @@ fn passes_stdin_and_explicit_shell_pipelines() {
 #[test]
 fn preserves_nonzero_and_crash_statuses() {
     let nonzero_state = TestDirectory::new("nonzero");
-    let output = run(&nonzero_state.0, &["run", "--", "/bin/sh", "-c", "exit 23"]);
+    let output = run(
+        &nonzero_state.0,
+        &[
+            "run",
+            "--collector",
+            "ptrace",
+            "--",
+            "/bin/sh",
+            "-c",
+            "exit 23",
+        ],
+    );
 
     assert_eq!(output.status.code(), Some(23));
     assert_session_finalized(&session_path(&output));
@@ -79,7 +98,15 @@ fn preserves_nonzero_and_crash_statuses() {
     let crash_state = TestDirectory::new("crash");
     let output = run(
         &crash_state.0,
-        &["run", "--", "/bin/sh", "-c", "kill -SEGV $$"],
+        &[
+            "run",
+            "--collector",
+            "ptrace",
+            "--",
+            "/bin/sh",
+            "-c",
+            "kill -SEGV $$",
+        ],
     );
 
     assert_eq!(output.status.signal(), Some(libc::SIGSEGV));
@@ -90,7 +117,7 @@ fn preserves_nonzero_and_crash_statuses() {
 fn ctrl_c_finalizes_the_session_and_stops_the_collector() {
     let state = TestDirectory::new("interrupt");
     let child = command(&state.0)
-        .args(["run", "--", "/bin/sleep", "30"])
+        .args(["run", "--collector", "ptrace", "--", "/bin/sleep", "30"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -126,6 +153,8 @@ fn preserves_terminal_file_descriptors() {
         .env("CI", "1")
         .args([
             "run",
+            "--collector",
+            "ptrace",
             "--",
             "/bin/sh",
             "-c",
@@ -173,18 +202,39 @@ fn session_path(output: &Output) -> PathBuf {
 
 fn assert_session_finalized(path: &Path) {
     let connection = Connection::open(path).expect("the session database should open");
-    let (state, finalized, unfinished): (String, i64, i64) = connection
+    let (state, finalized, unfinished, requested, backend, fallback): (
+        String,
+        i64,
+        i64,
+        String,
+        String,
+        Option<String>,
+    ) = connection
         .query_row(
             "SELECT state, finalized,
-                    (SELECT COUNT(*) FROM process WHERE ended_at_ms IS NULL)
+                    (SELECT COUNT(*) FROM process WHERE ended_at_ms IS NULL),
+                    collector_requested, collector_backend,
+                    collector_fallback_reason
              FROM session WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .expect("the session lifecycle should be readable");
     assert_eq!(state, "finalized");
     assert_eq!(finalized, 1);
     assert_eq!(unfinished, 0);
+    assert_eq!(requested, "ptrace");
+    assert_eq!(backend, "ptrace");
+    assert_eq!(fallback, None);
     assert!(path.with_extension("finalized").is_file());
     assert!(!path.with_extension("lock").exists());
 }
