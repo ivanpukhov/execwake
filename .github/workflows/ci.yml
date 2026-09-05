@@ -60,7 +60,7 @@ jobs:
       - run: tests/release_workflow.sh
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
+      - run: EXECWAKE_FORCE_PTRACE=1 cargo test --all-targets
 
   ebpf-conformance:
     name: eBPF conformance (${{ matrix.runner }})
@@ -122,7 +122,7 @@ jobs:
   package-smoke:
     name: Package smoke (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
     strategy:
@@ -147,10 +147,7 @@ jobs:
           CARGO_BUILD_JOBS: 2
           EXECWAKE_TARGET: ${{ matrix.target }}
         run: |
-          scripts/package-linux.sh
-          version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
-          archive="dist/execwake-v${version}-${EXECWAKE_TARGET}.tar.gz"
-          scripts/verify-linux-package.sh "$archive" "$EXECWAKE_TARGET"
+          scripts/verify-reproducible-package.sh "$EXECWAKE_TARGET"
       - name: Run packaged binary
         env:
           EXECWAKE_TARGET: ${{ matrix.target }}

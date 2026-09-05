@@ -38,19 +38,15 @@ jobs:
           archive="dist/execwake-v${version}-${TARGET}.tar.gz"
           echo "archive=$archive" >>"$GITHUB_OUTPUT"
           mkdir -p dist
-          docker volume create execwake-release-target >/dev/null
           docker run --rm \
             --platform "$PLATFORM" \
-            -e "EXECWAKE_TARGET=$TARGET" \
             -e "SOURCE_DATE_EPOCH=$source_date_epoch" \
             -e CARGO_BUILD_JOBS=2 \
-            -e CARGO_TARGET_DIR=/target \
             -v "$PWD:/work:ro" \
             -v "$PWD/dist:/work/dist" \
-            -v execwake-release-target:/target \
             -w /work \
             "$RUST_IMAGE" \
-            scripts/package-linux.sh
+            scripts/verify-reproducible-package.sh "$TARGET"
       - name: Verify Linux package
         env:
           PLATFORM: ${{ matrix.platform }}
