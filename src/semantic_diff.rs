@@ -14,7 +14,10 @@ use crate::display_text::sanitize;
 use crate::findings::Severity;
 use crate::limits::{MAX_IMPORTED_EVENTS, MAX_IMPORTED_FINDINGS, MAX_IMPORTED_PROCESSES};
 use crate::privacy::CURRENT_PRIVACY_PROFILE;
-use crate::session::{SessionMode, CURRENT_SCHEMA_VERSION};
+use crate::session::{
+    CollectorBackend, CollectorFallbackReason, CollectorRequest, SessionMode,
+    CURRENT_SCHEMA_VERSION,
+};
 use crate::session_input::{canonical_session_file, check_integrity, configure_read_only};
 use crate::storage::SessionId;
 
@@ -54,7 +57,9 @@ impl From<rusqlite::Error> for DiffError {
 pub struct SessionInfo {
     pub id: String,
     pub schema_version: u32,
+    pub requested_backend: Option<String>,
     pub backend: Option<String>,
+    pub fallback_reason: Option<String>,
     pub privacy_profile: Option<String>,
     pub command_name: String,
 }
@@ -256,14 +261,44 @@ impl SessionSnapshot {
                 "session schema version is unsupported".to_owned(),
             ));
         }
-        let backend =
-            optional_session_text(&connection, "collector_backend")?.map(|value| sanitize(&value));
+        let requested_backend = optional_session_text(&connection, "collector_requested")?;
+        let backend = optional_session_text(&connection, "collector_backend")?;
+        let fallback_reason = optional_session_text(&connection, "collector_fallback_reason")?;
+        if schema_version == CURRENT_SCHEMA_VERSION {
+            let request = requested_backend
+                .as_deref()
+                .and_then(CollectorRequest::parse)
+                .ok_or_else(|| {
+                    DiffError::InvalidSession("collector request is invalid".to_owned())
+                })?;
+            let selected = match backend.as_deref() {
+                Some(value) => Some(CollectorBackend::parse(value).ok_or_else(|| {
+                    DiffError::InvalidSession("collector backend is invalid".to_owned())
+                })?),
+                None => None,
+            };
+            let fallback = match fallback_reason.as_deref() {
+                Some(value) => Some(CollectorFallbackReason::parse(value).ok_or_else(|| {
+                    DiffError::InvalidSession("collector fallback reason is invalid".to_owned())
+                })?),
+                None => None,
+            };
+            if fallback.is_some()
+                && (request != CollectorRequest::Auto || selected != Some(CollectorBackend::Ptrace))
+            {
+                return Err(DiffError::InvalidSession(
+                    "collector decision is inconsistent".to_owned(),
+                ));
+            }
+        }
         let privacy_profile =
             optional_session_text(&connection, "privacy_profile")?.map(|value| sanitize(&value));
         let info = SessionInfo {
             id: id.clone(),
             schema_version,
-            backend,
+            requested_backend: requested_backend.map(|value| sanitize(&value)),
+            backend: backend.map(|value| sanitize(&value)),
+            fallback_reason: fallback_reason.map(|value| sanitize(&value)),
             privacy_profile,
             command_name: sanitize(&command_name),
         };
@@ -886,7 +921,9 @@ mod tests {
             info: SessionInfo {
                 id: "session".to_owned(),
                 schema_version: crate::session::CURRENT_SCHEMA_VERSION,
+                requested_backend: Some("auto".to_owned()),
                 backend: Some(backend.to_owned()),
+                fallback_reason: None,
                 privacy_profile: Some(CURRENT_PRIVACY_PROFILE.to_owned()),
                 command_name: "npm".to_owned(),
             },

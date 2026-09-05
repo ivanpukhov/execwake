@@ -24,30 +24,59 @@ use bytes::BytesMut;
 use super::PtraceCollector;
 use crate::collector::{Collector, CollectorSink};
 use crate::limits::{EBPF_BUFFER_PAGES, EBPF_READ_BATCH, MAX_EBPF_QUEUED_EVENTS};
-use crate::session::{CategoryCoverage, SessionCoverage};
+use crate::session::{
+    CategoryCoverage, CollectorBackend, CollectorDecision, CollectorFallbackReason,
+    CollectorRequest, SessionCoverage,
+};
 
 static CGROUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub enum LinuxCollector {
     Ebpf(EbpfCollector),
-    Ptrace(PtraceCollector),
+    Ptrace {
+        collector: PtraceCollector,
+        fallback_reason: Option<CollectorFallbackReason>,
+    },
 }
 
 impl LinuxCollector {
     pub fn new(root_executable: String) -> Self {
         #[cfg(test)]
         if std::env::var_os("EXECWAKE_FORCE_PTRACE").is_some() {
-            return Self::Ptrace(PtraceCollector::new(root_executable));
+            return Self::Ptrace {
+                collector: PtraceCollector::new(root_executable),
+                fallback_reason: None,
+            };
         }
         match EbpfCollector::new(root_executable.clone()) {
             Ok(collector) => Self::Ebpf(collector),
-            Err(_error) => {
+            Err(error) => {
                 #[cfg(test)]
                 if std::env::var_os("EXECWAKE_REQUIRE_EBPF").is_some() {
-                    panic!("eBPF collector is required for this test: {_error:?}");
+                    panic!("eBPF collector is required for this test: {error:?}");
                 }
-                Self::Ptrace(PtraceCollector::new(root_executable))
+                Self::Ptrace {
+                    collector: PtraceCollector::new(root_executable),
+                    fallback_reason: Some(fallback_reason(&error)),
+                }
             }
+        }
+    }
+
+    pub fn decision(&self) -> CollectorDecision {
+        match self {
+            Self::Ebpf(_) => CollectorDecision {
+                requested: CollectorRequest::Auto,
+                backend: CollectorBackend::Ebpf,
+                fallback_reason: None,
+            },
+            Self::Ptrace {
+                fallback_reason, ..
+            } => CollectorDecision {
+                requested: CollectorRequest::Auto,
+                backend: CollectorBackend::Ptrace,
+                fallback_reason: *fallback_reason,
+            },
         }
     }
 
@@ -56,7 +85,7 @@ impl LinuxCollector {
             Self::Ebpf(collector) => collector
                 .ignored_paths
                 .extend(paths.iter().map(|path| path.to_path_buf())),
-            Self::Ptrace(collector) => collector.ignore_paths(paths),
+            Self::Ptrace { collector, .. } => collector.ignore_paths(paths),
         }
     }
 }
@@ -65,14 +94,14 @@ impl Collector for LinuxCollector {
     fn backend_name(&self) -> &'static str {
         match self {
             Self::Ebpf(collector) => collector.backend_name(),
-            Self::Ptrace(collector) => collector.backend_name(),
+            Self::Ptrace { collector, .. } => collector.backend_name(),
         }
     }
 
     fn prepare(&mut self, command: &mut Command) -> io::Result<()> {
         match self {
             Self::Ebpf(collector) => collector.prepare(command),
-            Self::Ptrace(collector) => collector.prepare(command),
+            Self::Ptrace { collector, .. } => collector.prepare(command),
         }
     }
 
@@ -83,8 +112,19 @@ impl Collector for LinuxCollector {
     ) -> io::Result<ExitStatus> {
         match self {
             Self::Ebpf(collector) => collector.collect(child, sink),
-            Self::Ptrace(collector) => collector.collect(child, sink),
+            Self::Ptrace { collector, .. } => collector.collect(child, sink),
         }
+    }
+}
+
+fn fallback_reason(error: &io::Error) -> CollectorFallbackReason {
+    match error.kind() {
+        io::ErrorKind::NotFound => CollectorFallbackReason::CgroupUnavailable,
+        io::ErrorKind::PermissionDenied => CollectorFallbackReason::PermissionDenied,
+        io::ErrorKind::InvalidData | io::ErrorKind::Unsupported => {
+            CollectorFallbackReason::PlatformIncompatible
+        }
+        _ => CollectorFallbackReason::InitializationFailed,
     }
 }
 

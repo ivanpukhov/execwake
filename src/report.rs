@@ -21,7 +21,10 @@ use serde::{Deserialize, Serialize};
 use crate::display_text::sanitize;
 use crate::node_enrichment::sanitize_http_fact;
 use crate::privacy::is_valid_environment_name;
-use crate::session::{SessionMode, CURRENT_SCHEMA_VERSION};
+use crate::session::{
+    CollectorBackend, CollectorFallbackReason, CollectorRequest, SessionMode,
+    CURRENT_SCHEMA_VERSION,
+};
 use crate::session_input::{canonical_session_file, check_integrity, configure_read_only};
 use crate::storage::SessionPaths;
 
@@ -412,9 +415,19 @@ fn validate_session(session: &SessionPaths) -> io::Result<()> {
             "report session database is corrupt",
         ));
     }
-    let (id, schema_version, mode, state, finalized) = connection
+    let (
+        id,
+        schema_version,
+        mode,
+        state,
+        finalized,
+        collector_requested,
+        collector_backend,
+        collector_fallback_reason,
+    ) = connection
         .query_row(
-            "SELECT id, schema_version, mode, state, finalized
+            "SELECT id, schema_version, mode, state, finalized,
+                    collector_requested, collector_backend, collector_fallback_reason
              FROM session WHERE singleton = 1",
             [],
             |row| {
@@ -424,6 +437,9 @@ fn validate_session(session: &SessionPaths) -> io::Result<()> {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         )
@@ -432,6 +448,17 @@ fn validate_session(session: &SessionPaths) -> io::Result<()> {
     if id != session.id().as_str()
         || schema_version != i64::from(CURRENT_SCHEMA_VERSION)
         || SessionMode::parse(&mode).is_none()
+        || CollectorRequest::parse(&collector_requested).is_none()
+        || matches!(
+            collector_backend.as_deref(),
+            Some(backend) if CollectorBackend::parse(backend).is_none()
+        )
+        || matches!(
+            collector_fallback_reason.as_deref(),
+            Some(reason) if CollectorFallbackReason::parse(reason).is_none()
+        )
+        || (collector_fallback_reason.is_some()
+            && (collector_requested != "auto" || collector_backend.as_deref() != Some("ptrace")))
         || finalized != 1
         || !matches!(state.as_str(), "finalized" | "interrupted")
     {
@@ -460,6 +487,9 @@ struct SessionReport {
     finalized: bool,
     command_name: String,
     argument_count: i64,
+    collector_requested: String,
+    collector_backend: Option<String>,
+    collector_fallback_reason: Option<String>,
     started_at_ms: i64,
     ended_at_ms: Option<i64>,
     exit_code: Option<i64>,
@@ -563,7 +593,8 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
     configure_read_only(&connection)?;
     let mut report = connection.query_row(
         "SELECT id, schema_version, mode, state, finalized, command_name,
-                argument_count, started_at_ms, ended_at_ms, exit_code,
+                argument_count, collector_requested, collector_backend,
+                collector_fallback_reason, started_at_ms, ended_at_ms, exit_code,
                 termination_signal, interruption
          FROM session WHERE singleton = 1",
         [],
@@ -576,12 +607,15 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
                 finalized: row.get::<_, i64>(4)? == 1,
                 command_name: sanitize(&row.get::<_, String>(5)?),
                 argument_count: row.get(6)?,
-                started_at_ms: row.get(7)?,
-                ended_at_ms: row.get(8)?,
-                exit_code: row.get(9)?,
-                termination_signal: row.get(10)?,
+                collector_requested: row.get(7)?,
+                collector_backend: row.get(8)?,
+                collector_fallback_reason: row.get(9)?,
+                started_at_ms: row.get(10)?,
+                ended_at_ms: row.get(11)?,
+                exit_code: row.get(12)?,
+                termination_signal: row.get(13)?,
                 interruption: row
-                    .get::<_, Option<String>>(11)?
+                    .get::<_, Option<String>>(14)?
                     .map(|value| sanitize(&value)),
                 coverage: Vec::new(),
                 process_count: 0,

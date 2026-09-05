@@ -104,6 +104,8 @@ fn run_in_store_with_options(
     #[cfg(target_os = "linux")]
     let mut collector = LinuxCollector::new(command_name);
     #[cfg(target_os = "linux")]
+    session.set_collector_decision(collector.decision())?;
+    #[cfg(target_os = "linux")]
     if let Some(capture) = node_capture.as_ref() {
         collector.ignore_paths(&capture.internal_paths());
     }

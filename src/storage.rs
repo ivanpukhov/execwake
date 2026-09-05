@@ -19,7 +19,8 @@ use crate::node_enrichment::{
 };
 use crate::privacy::CURRENT_PRIVACY_PROFILE;
 use crate::session::{
-    CategoryCoverage, EvidenceKind, SessionCoverage, SessionMode, CURRENT_SCHEMA_VERSION,
+    CategoryCoverage, CollectorBackend, CollectorDecision, EvidenceKind, SessionCoverage,
+    SessionMode, CURRENT_SCHEMA_VERSION,
 };
 
 #[derive(Debug)]
@@ -362,6 +363,25 @@ impl ActiveSession {
         &self.paths
     }
 
+    pub fn set_collector_decision(
+        &mut self,
+        decision: CollectorDecision,
+    ) -> Result<(), StoreError> {
+        self.flush_capture_batch()?;
+        self.connection.execute(
+            "UPDATE session
+             SET collector_requested = ?1, collector_backend = ?2,
+                 collector_fallback_reason = ?3
+             WHERE singleton = 1",
+            params![
+                decision.requested.as_str(),
+                decision.backend.as_str(),
+                decision.fallback_reason.map(|reason| reason.as_str()),
+            ],
+        )?;
+        Ok(())
+    }
+
     fn capture_allowed(
         &mut self,
         category: &str,
@@ -663,6 +683,11 @@ impl ActiveSession {
 
 impl CollectorSink for ActiveSession {
     fn set_backend(&mut self, backend: &'static str) -> Result<(), SinkError> {
+        if CollectorBackend::parse(backend).is_none() {
+            return Err(Box::new(StoreError::InvalidInput(
+                "collector backend is invalid",
+            )));
+        }
         self.flush_capture_batch()
             .map_err(|error| Box::new(error) as SinkError)?;
         self.connection
@@ -944,11 +969,24 @@ fn initialize_database(
              started_at_ms INTEGER NOT NULL,
              ended_at_ms INTEGER,
              runner_pid INTEGER NOT NULL,
-             collector_backend TEXT,
+             collector_requested TEXT NOT NULL CHECK (
+                 collector_requested IN ('auto', 'ebpf', 'ptrace')
+             ),
+             collector_backend TEXT CHECK (collector_backend IN ('ebpf', 'ptrace')),
+             collector_fallback_reason TEXT CHECK (
+                 collector_fallback_reason IN (
+                     'cgroup_unavailable', 'permission_denied',
+                     'platform_incompatible', 'initialization_failed'
+                 )
+             ),
              privacy_profile TEXT NOT NULL,
              exit_code INTEGER,
              termination_signal INTEGER,
-             interruption TEXT
+             interruption TEXT,
+             CHECK (
+                 collector_fallback_reason IS NULL
+                 OR (collector_requested = 'auto' AND collector_backend = 'ptrace')
+             )
          );
          CREATE TABLE coverage (
              category TEXT PRIMARY KEY,
@@ -1051,8 +1089,9 @@ fn initialize_database(
     transaction.execute(
         "INSERT INTO session (
              singleton, id, schema_version, mode, state, finalized,
-             command_name, argument_count, started_at_ms, runner_pid, privacy_profile
-         ) VALUES (1, ?1, ?2, ?3, 'running', 0, ?4, ?5, ?6, ?7, ?8)",
+             command_name, argument_count, started_at_ms, runner_pid,
+             collector_requested, privacy_profile
+         ) VALUES (1, ?1, ?2, ?3, 'running', 0, ?4, ?5, ?6, ?7, 'auto', ?8)",
         params![
             paths.id().as_str(),
             i64::from(CURRENT_SCHEMA_VERSION),
@@ -1390,7 +1429,10 @@ mod tests {
     use crate::limits::{CaptureLimits, SQLITE_CAPTURE_BATCH_WRITES};
     use crate::node_enrichment::NodeEnrichmentRecord;
     use crate::privacy::CURRENT_PRIVACY_PROFILE;
-    use crate::session::{CategoryCoverage, EvidenceKind, SessionCoverage, SessionMode};
+    use crate::session::{
+        CategoryCoverage, CollectorBackend, CollectorDecision, CollectorFallbackReason,
+        CollectorRequest, EvidenceKind, SessionCoverage, SessionMode,
+    };
 
     use super::{SessionId, SessionOutcome, SessionStore};
 
@@ -1881,7 +1923,14 @@ mod tests {
         let reused_process = ProcessIdentity::new(2);
 
         session
-            .set_backend("test")
+            .set_collector_decision(CollectorDecision {
+                requested: CollectorRequest::Auto,
+                backend: CollectorBackend::Ptrace,
+                fallback_reason: Some(CollectorFallbackReason::PermissionDenied),
+            })
+            .expect("collector decision should be stored");
+        session
+            .set_backend("ptrace")
             .expect("backend should be stored");
         session
             .record_process(ProcessRecord {
@@ -1953,13 +2002,15 @@ mod tests {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .expect("the coverage row should exist");
-        let backend: String = connection
+        let collector: (String, String, String) = connection
             .query_row(
-                "SELECT collector_backend FROM session WHERE singleton = 1",
+                "SELECT collector_requested, collector_backend,
+                        collector_fallback_reason
+                 FROM session WHERE singleton = 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .expect("the backend should exist");
+            .expect("the collector decision should exist");
         let environment_evidence: String = connection
             .query_row(
                 "SELECT evidence FROM environment_variable WHERE name = 'PATH'",
@@ -1970,7 +2021,14 @@ mod tests {
 
         assert_eq!(process_rows, [(1, 41_000, 81), (2, 41_000, 82)]);
         assert_eq!(coverage, ("partial".to_owned(), 2));
-        assert_eq!(backend, "test");
+        assert_eq!(
+            collector,
+            (
+                "auto".to_owned(),
+                "ptrace".to_owned(),
+                "permission_denied".to_owned(),
+            )
+        );
         assert_eq!(environment_evidence, "observed");
         assert!(connection
             .execute(

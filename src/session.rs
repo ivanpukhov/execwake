@@ -1,6 +1,91 @@
 use crate::privacy::is_valid_environment_name;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 9;
+pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectorRequest {
+    Auto,
+    Ebpf,
+    Ptrace,
+}
+
+impl CollectorRequest {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ebpf => "ebpf",
+            Self::Ptrace => "ptrace",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "ebpf" => Some(Self::Ebpf),
+            "ptrace" => Some(Self::Ptrace),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectorBackend {
+    Ebpf,
+    Ptrace,
+}
+
+impl CollectorBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ebpf => "ebpf",
+            Self::Ptrace => "ptrace",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ebpf" => Some(Self::Ebpf),
+            "ptrace" => Some(Self::Ptrace),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectorFallbackReason {
+    CgroupUnavailable,
+    PermissionDenied,
+    PlatformIncompatible,
+    InitializationFailed,
+}
+
+impl CollectorFallbackReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CgroupUnavailable => "cgroup_unavailable",
+            Self::PermissionDenied => "permission_denied",
+            Self::PlatformIncompatible => "platform_incompatible",
+            Self::InitializationFailed => "initialization_failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "cgroup_unavailable" => Some(Self::CgroupUnavailable),
+            "permission_denied" => Some(Self::PermissionDenied),
+            "platform_incompatible" => Some(Self::PlatformIncompatible),
+            "initialization_failed" => Some(Self::InitializationFailed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectorDecision {
+    pub requested: CollectorRequest,
+    pub backend: CollectorBackend,
+    pub fallback_reason: Option<CollectorFallbackReason>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionMode {
@@ -158,6 +243,7 @@ impl SessionCoverage {
 pub struct SessionManifest {
     pub schema_version: u32,
     pub mode: SessionMode,
+    pub collector: Option<CollectorDecision>,
     pub coverage: SessionCoverage,
 }
 
@@ -170,6 +256,7 @@ impl SessionManifest {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
             mode,
+            collector: None,
             coverage,
         }
     }
@@ -178,8 +265,9 @@ impl SessionManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        CategoryCoverage, CoverageState, EnvironmentRead, EvidenceKind, SessionCoverage,
-        SessionManifest, SessionMode, CURRENT_SCHEMA_VERSION,
+        CategoryCoverage, CollectorBackend, CollectorFallbackReason, CollectorRequest,
+        CoverageState, EnvironmentRead, EvidenceKind, SessionCoverage, SessionManifest,
+        SessionMode, CURRENT_SCHEMA_VERSION,
     };
 
     #[test]
@@ -198,6 +286,25 @@ mod tests {
 
         assert_eq!(manifest.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(manifest.mode, SessionMode::Observe);
+    }
+
+    #[test]
+    fn collector_decision_values_have_stable_storage_names() {
+        assert_eq!(
+            CollectorRequest::parse("auto"),
+            Some(CollectorRequest::Auto)
+        );
+        assert_eq!(
+            CollectorBackend::parse("ebpf"),
+            Some(CollectorBackend::Ebpf)
+        );
+        assert_eq!(
+            CollectorFallbackReason::parse("permission_denied"),
+            Some(CollectorFallbackReason::PermissionDenied)
+        );
+        assert_eq!(CollectorRequest::parse("automatic"), None);
+        assert_eq!(CollectorBackend::parse("strace"), None);
+        assert_eq!(CollectorFallbackReason::parse("unknown error"), None);
     }
 
     #[test]
