@@ -146,6 +146,39 @@ fn automatic_collector_records_a_consistent_decision() {
 }
 
 #[test]
+fn writes_an_explicit_session_output_after_finalization() {
+    let state = TestDirectory::new("output");
+    let destination = state.0.join("saved.sqlite3");
+    let destination_text = destination.to_string_lossy().into_owned();
+    let output = run(
+        &state.0,
+        &[
+            "run",
+            "--collector",
+            "ptrace",
+            "--output",
+            &destination_text,
+            "--",
+            "/bin/true",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "session export failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stored = session_path(&output);
+    assert_ne!(stored, destination);
+    assert_eq!(
+        fs::read(&destination).expect("the saved session should be readable"),
+        fs::read(&stored).expect("the stored session should be readable")
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&format!("Saved session: {}", destination.display())));
+}
+
+#[test]
 fn collector_startup_failure_finalizes_the_session() {
     let Ok(expected) = std::env::var("EXECWAKE_EXPECT_EBPF_STARTUP_FAILURE") else {
         return;

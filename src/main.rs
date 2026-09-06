@@ -40,6 +40,19 @@ fn main() {
         Command::Run(args) => {
             match execwake::runner::run(args.command, args.node_enrichment, args.collector) {
                 Ok(result) => {
+                    if let Some(output) = args.output {
+                        match execwake::storage::export_session(&result.session, &output) {
+                            Ok(path) => eprintln!("Saved session: {}", path.display()),
+                            Err(error) => {
+                                eprintln!("error: could not save session: {error}");
+                                report_launch::print_session_path(&result.session);
+                                if result.status.success() {
+                                    process::exit(1);
+                                }
+                                execwake::runner::exit_with_status(result.status);
+                            }
+                        }
+                    }
                     if let Err(error) = report_launch::print_run_summary(&result.session) {
                         eprintln!("Summary unavailable: {error}");
                         report_launch::print_session_path(&result.session);

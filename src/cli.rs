@@ -20,6 +20,7 @@ pub struct RunArgs {
     pub command: Vec<OsString>,
     pub node_enrichment: bool,
     pub collector: CollectorRequest,
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -99,10 +100,10 @@ impl Cli {
 pub fn help_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::Root => {
-            "ExecWake\n\nUsage:\n  execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--] <command> [arguments...]\n  execwake diff <before> <after>\n"
+            "ExecWake\n\nUsage:\n  execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--output <path>] [--] <command> [arguments...]\n  execwake diff <before> <after>\n"
         }
         HelpTopic::Run => {
-            "Usage: execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--] <command> [arguments...]\n"
+            "Usage: execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--output <path>] [--] <command> [arguments...]\n"
         }
         HelpTopic::Diff => "Usage: execwake diff <before> <after>\n",
     }
@@ -117,6 +118,7 @@ fn parse_run(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
 
     let mut node_enrichment = false;
     let mut collector = CollectorRequest::Auto;
+    let mut output = None;
     loop {
         match arguments.first().map(OsString::as_os_str) {
             Some(value) if value == OsStr::new("--node-enrichment") => {
@@ -135,6 +137,16 @@ fn parse_run(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
                 collector = value;
                 arguments.drain(0..2);
             }
+            Some(value) if value == OsStr::new("--output") => {
+                if output.is_some() {
+                    return Err(ParseError::new("--output may only be specified once"));
+                }
+                if arguments.len() < 2 {
+                    return Err(ParseError::new("--output requires a path"));
+                }
+                output = Some(PathBuf::from(arguments.remove(1)));
+                arguments.remove(0);
+            }
             Some(value) if value == OsStr::new("--") => {
                 arguments.remove(0);
                 break;
@@ -152,6 +164,7 @@ fn parse_run(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
             command: arguments,
             node_enrichment,
             collector,
+            output,
         }),
     }))
 }
@@ -222,6 +235,7 @@ mod tests {
         assert_eq!(args.command, [OsStr::new("printf"), OsStr::new("--help")]);
         assert!(!args.node_enrichment);
         assert_eq!(args.collector, CollectorRequest::Auto);
+        assert_eq!(args.output, None);
     }
 
     #[test]
@@ -291,6 +305,48 @@ mod tests {
                 OsStr::new("ebpf")
             ]
         );
+    }
+
+    #[test]
+    fn parses_an_output_path_only_before_the_separator() {
+        let result = Cli::parse_from([
+            "execwake",
+            "run",
+            "--output",
+            "trace.sqlite3",
+            "--",
+            "command",
+            "--output",
+            "child-value",
+        ])
+        .expect("the output path should parse");
+        let ParseResult::Command(cli) = result else {
+            panic!("expected command");
+        };
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.output.as_deref(), Some(Path::new("trace.sqlite3")));
+        assert_eq!(
+            args.command,
+            [
+                OsStr::new("command"),
+                OsStr::new("--output"),
+                OsStr::new("child-value")
+            ]
+        );
+        assert!(Cli::parse_from(["execwake", "run", "--output"]).is_err());
+        assert!(Cli::parse_from([
+            "execwake",
+            "run",
+            "--output",
+            "one.sqlite3",
+            "--output",
+            "two.sqlite3",
+            "command"
+        ])
+        .is_err());
     }
 
     #[test]

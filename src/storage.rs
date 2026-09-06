@@ -140,6 +140,58 @@ impl SessionPaths {
     }
 }
 
+pub fn export_session(session: &SessionPaths, destination: &Path) -> Result<PathBuf, StoreError> {
+    if !is_regular_file(session.database())? || !is_regular_file(session.finalized())? {
+        return Err(StoreError::InvalidInput("session is not finalized"));
+    }
+    let file_name = destination.file_name().ok_or(StoreError::InvalidInput(
+        "session output path has no file name",
+    ))?;
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent)?;
+    if !fs::metadata(&parent)?.is_dir() {
+        return Err(StoreError::InvalidInput(
+            "session output parent is not a directory",
+        ));
+    }
+    let destination = parent.join(file_name);
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "session output already exists",
+            )
+            .into())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let temporary = parent.join(format!(
+        ".execwake-export-{}.tmp",
+        SessionId::generate()?.as_str()
+    ));
+    let result = (|| -> io::Result<()> {
+        let mut source = open_regular_read_only(session.database())?;
+        let mut output = create_private_file(&temporary)?;
+        io::copy(&mut source, &mut output)?;
+        output.sync_all()?;
+        drop(output);
+        fs::hard_link(&temporary, &destination)?;
+        fs::remove_file(&temporary)?;
+        sync_directory(&parent)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(destination)
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionStore {
     root: PathBuf,
@@ -1233,6 +1285,35 @@ fn create_private_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
+fn open_regular_read_only(path: &Path) -> io::Result<File> {
+    if !fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session input is not a regular file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return File::open(path)?.sync_all();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 fn open_private_lock(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
@@ -1426,9 +1507,9 @@ fn ensure_private_directory(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{fs, io};
 
     use rusqlite::Connection;
 
@@ -1445,7 +1526,7 @@ mod tests {
         CollectorRequest, EvidenceKind, SessionCoverage, SessionMode,
     };
 
-    use super::{SessionId, SessionOutcome, SessionStore};
+    use super::{export_session, SessionId, SessionOutcome, SessionStore, StoreError};
 
     struct TestDirectory(PathBuf);
 
@@ -1595,6 +1676,94 @@ mod tests {
             .expect("the session row should exist");
 
         assert_eq!(row, ("finalized".to_owned(), 1, "printf".to_owned(), 2, 7));
+    }
+
+    #[test]
+    fn exports_a_finalized_session_without_overwriting_files() {
+        let directory = TestDirectory::new();
+        let store =
+            SessionStore::at(directory.0.join("sessions")).expect("storage should be created");
+        let session = store
+            .begin("fixture", 0)
+            .expect("a session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the session should finalize");
+        let exports = directory.0.join("exports");
+        fs::create_dir(&exports).expect("the export directory should be created");
+        let destination = exports.join("trace.sqlite3");
+
+        let exported =
+            export_session(&session, &destination).expect("the session should be exported");
+
+        assert_eq!(
+            exported,
+            fs::canonicalize(&exports)
+                .expect("the export directory should resolve")
+                .join("trace.sqlite3")
+        );
+        assert_eq!(
+            fs::read(&exported).expect("the exported session should be readable"),
+            fs::read(session.database()).expect("the stored session should be readable")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&exported)
+                    .expect("export metadata should be readable")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let error = export_session(&session, &destination)
+            .expect_err("an existing output must not be replaced");
+        assert!(matches!(
+            error,
+            StoreError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_export_does_not_follow_a_destination_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let store =
+            SessionStore::at(directory.0.join("sessions")).expect("storage should be created");
+        let session = store
+            .begin("fixture", 0)
+            .expect("a session should start")
+            .finalize(SessionOutcome::exited(0))
+            .expect("the session should finalize");
+        let target = directory.0.join("target");
+        fs::write(&target, b"unchanged").expect("the target should be created");
+        let destination = directory.0.join("trace.sqlite3");
+        symlink(&target, &destination).expect("the destination symlink should be created");
+
+        assert!(export_session(&session, &destination).is_err());
+        assert_eq!(
+            fs::read(&target).expect("the target should remain readable"),
+            b"unchanged"
+        );
+    }
+
+    #[test]
+    fn session_export_requires_finalization() {
+        let directory = TestDirectory::new();
+        let store =
+            SessionStore::at(directory.0.join("sessions")).expect("storage should be created");
+        let session = store.begin("fixture", 0).expect("a session should start");
+
+        let error = export_session(session.paths(), &directory.0.join("trace.sqlite3"))
+            .expect_err("a running session must not be exported");
+
+        assert!(matches!(
+            error,
+            StoreError::InvalidInput("session is not finalized")
+        ));
     }
 
     #[test]
