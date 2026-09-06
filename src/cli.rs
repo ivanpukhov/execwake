@@ -28,6 +28,7 @@ pub struct DiffArgs {
     pub before: PathBuf,
     pub after: PathBuf,
     pub output: DiffOutput,
+    pub exit_code: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,12 +108,12 @@ impl Cli {
 pub fn help_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::Root => {
-            "ExecWake\n\nUsage:\n  execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--output <path>] [--] <command> [arguments...]\n  execwake diff [--json] <before> <after>\n"
+            "ExecWake\n\nUsage:\n  execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--output <path>] [--] <command> [arguments...]\n  execwake diff [--json] [--exit-code] <before> <after>\n"
         }
         HelpTopic::Run => {
             "Usage: execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--output <path>] [--] <command> [arguments...]\n"
         }
-        HelpTopic::Diff => "Usage: execwake diff [--json] <before> <after>\n",
+        HelpTopic::Diff => "Usage: execwake diff [--json] [--exit-code] <before> <after>\n",
     }
 }
 
@@ -183,15 +184,27 @@ fn parse_diff(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
         return Ok(ParseResult::Help(HelpTopic::Diff));
     }
 
-    let output = if arguments.first().map(OsString::as_os_str) == Some(OsStr::new("--json")) {
-        arguments.remove(0);
-        if arguments.first().map(OsString::as_os_str) == Some(OsStr::new("--json")) {
-            return Err(ParseError::new("--json may only be specified once"));
+    let mut output = DiffOutput::Human;
+    let mut exit_code = false;
+    loop {
+        match arguments.first().map(OsString::as_os_str) {
+            Some(value) if value == OsStr::new("--json") => {
+                if output == DiffOutput::Json {
+                    return Err(ParseError::new("--json may only be specified once"));
+                }
+                output = DiffOutput::Json;
+                arguments.remove(0);
+            }
+            Some(value) if value == OsStr::new("--exit-code") => {
+                if exit_code {
+                    return Err(ParseError::new("--exit-code may only be specified once"));
+                }
+                exit_code = true;
+                arguments.remove(0);
+            }
+            _ => break,
         }
-        DiffOutput::Json
-    } else {
-        DiffOutput::Human
-    };
+    }
 
     if arguments.len() != 2 {
         return Err(ParseError::new("diff requires two session paths"));
@@ -205,6 +218,7 @@ fn parse_diff(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
             before,
             after,
             output,
+            exit_code,
         }),
     }))
 }
@@ -418,6 +432,7 @@ mod tests {
         assert_eq!(args.before, Path::new("before.sqlite3"));
         assert_eq!(args.after, Path::new("after.sqlite3"));
         assert_eq!(args.output, DiffOutput::Human);
+        assert!(!args.exit_code);
     }
 
     #[test]
@@ -441,9 +456,42 @@ mod tests {
         assert_eq!(args.before, Path::new("before.sqlite3"));
         assert_eq!(args.after, Path::new("after.sqlite3"));
         assert_eq!(args.output, DiffOutput::Json);
+        assert!(!args.exit_code);
         assert!(
             Cli::parse_from(["execwake", "diff", "--json", "--json", "after.sqlite3"]).is_err()
         );
+    }
+
+    #[test]
+    fn enables_diff_exit_codes_with_json_in_either_order() {
+        for options in [["--exit-code", "--json"], ["--json", "--exit-code"]] {
+            let result = Cli::parse_from([
+                "execwake",
+                "diff",
+                options[0],
+                options[1],
+                "before.sqlite3",
+                "after.sqlite3",
+            ])
+            .expect("diff options should parse");
+            let ParseResult::Command(cli) = result else {
+                panic!("expected command");
+            };
+            let Command::Diff(args) = cli.command else {
+                panic!("expected diff command");
+            };
+
+            assert_eq!(args.output, DiffOutput::Json);
+            assert!(args.exit_code);
+        }
+        assert!(Cli::parse_from([
+            "execwake",
+            "diff",
+            "--exit-code",
+            "--exit-code",
+            "after.sqlite3"
+        ])
+        .is_err());
     }
 
     #[test]

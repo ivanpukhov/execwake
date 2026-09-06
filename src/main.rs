@@ -78,25 +78,34 @@ fn main() {
         }
         Command::Diff(args) => {
             match execwake::semantic_diff::compare_paths(&args.before, &args.after) {
-                Ok(diff) => match args.output {
-                    DiffOutput::Json => {
-                        let stdout = io::stdout();
-                        let mut output = stdout.lock();
-                        if let Err(error) = execwake::semantic_diff::write_json(&diff, &mut output)
-                        {
-                            eprintln!("error: could not write comparison: {error}");
-                            process::exit(1);
+                Ok(diff) => {
+                    let policy_exit_code = args
+                        .exit_code
+                        .then(|| execwake::semantic_diff::policy_exit_code(&diff));
+                    match args.output {
+                        DiffOutput::Json => {
+                            let stdout = io::stdout();
+                            let mut output = stdout.lock();
+                            if let Err(error) =
+                                execwake::semantic_diff::write_json(&diff, &mut output)
+                            {
+                                eprintln!("error: could not write comparison: {error}");
+                                process::exit(1);
+                            }
+                        }
+                        DiffOutput::Human => {
+                            if let Err(error) =
+                                report_launch::present_diff(&args.before, &args.after, &diff)
+                            {
+                                eprintln!("error: could not present comparison: {error}");
+                                process::exit(1);
+                            }
                         }
                     }
-                    DiffOutput::Human => {
-                        if let Err(error) =
-                            report_launch::present_diff(&args.before, &args.after, &diff)
-                        {
-                            eprintln!("error: could not present comparison: {error}");
-                            process::exit(1);
-                        }
+                    if let Some(code) = policy_exit_code.filter(|code| *code != 0) {
+                        process::exit(code);
                     }
-                },
+                }
                 Err(error) => {
                     eprintln!("error: comparison failed: {error}");
                     process::exit(1);

@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use execwake::behavior::{BehaviorCategory, BehaviorKey, BehaviorValue};
@@ -183,6 +184,61 @@ fn repeated_npm_run_matches_the_golden_diff() {
 
     let diff = compare(&before, &after);
     assert_golden(&diff, include_str!("golden/repeat_run.json"));
+}
+
+#[test]
+fn diff_exit_policy_is_exposed_by_the_command() {
+    let directory = TestDirectory::new("exit-policy");
+    let store = SessionStore::at(directory.0.clone()).expect("session storage should be created");
+    let unchanged = record_repeat_session(&store, 81_001, 45_101);
+    let mut changed = begin_npm_session(&store, 82_001);
+    record_event(
+        &mut changed,
+        "filesystem",
+        "read",
+        "$HOME/.gitconfig".to_owned(),
+        ROOT_PROCESS,
+        10,
+    );
+    let changed = finish(changed);
+
+    let same = diff_command(&unchanged, &unchanged);
+    assert_eq!(same.status.code(), Some(0));
+
+    let different = diff_command(&unchanged, &changed);
+    assert_eq!(different.status.code(), Some(10));
+    let document: serde_json::Value =
+        serde_json::from_slice(&different.stdout).expect("stdout should contain the JSON diff");
+    assert!(document["behavior"]
+        .as_array()
+        .expect("behavior should be an array")
+        .iter()
+        .any(|change| change["status"] != "UNCHANGED"));
+
+    let connection = rusqlite::Connection::open(changed.database())
+        .expect("the changed session should open for the fixture update");
+    connection
+        .execute(
+            "UPDATE session SET collector_backend = 'ebpf' WHERE singleton = 1",
+            [],
+        )
+        .expect("the fixture backend should change");
+    drop(connection);
+
+    let incomparable = diff_command(&unchanged, &changed);
+    assert_eq!(incomparable.status.code(), Some(11));
+}
+
+fn diff_command(before: &SessionPaths, after: &SessionPaths) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_execwake"))
+        .arg("diff")
+        .arg("--json")
+        .arg("--exit-code")
+        .arg(before.database())
+        .arg(after.database())
+        .env("CI", "1")
+        .output()
+        .expect("the diff command should run")
 }
 
 fn begin_npm_session(store: &SessionStore, operating_system_id: u32) -> ActiveSession {

@@ -23,6 +23,9 @@ use crate::session_input::{
 };
 use crate::storage::SessionId;
 
+pub const DIFF_CHANGED_EXIT_CODE: i32 = 10;
+pub const DIFF_INCOMPARABLE_EXIT_CODE: i32 = 11;
+
 #[derive(Debug)]
 pub enum DiffError {
     Io(io::Error),
@@ -191,6 +194,28 @@ pub fn write_json(diff: &SemanticDiff, output: &mut impl Write) -> io::Result<()
     serde_json::to_writer(&mut *output, diff)
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
     writeln!(output)
+}
+
+pub fn policy_exit_code(diff: &SemanticDiff) -> i32 {
+    if diff
+        .compatibility
+        .iter()
+        .any(|category| !category.comparable)
+    {
+        DIFF_INCOMPARABLE_EXIT_CODE
+    } else if diff
+        .behavior
+        .iter()
+        .any(|change| change.status != ChangeStatus::Unchanged)
+        || diff
+            .findings
+            .iter()
+            .any(|change| change.status != ChangeStatus::Unchanged)
+    {
+        DIFF_CHANGED_EXIT_CODE
+    } else {
+        0
+    }
 }
 
 pub fn compare(before: SessionSnapshot, after: SessionSnapshot) -> SemanticDiff {
@@ -843,8 +868,9 @@ mod tests {
     use crate::storage::{SessionOutcome, SessionStore};
 
     use super::{
-        compare, write_json, ChangeStatus, CompatibilityIssue, CoverageSnapshot, DiffError,
-        FindingSnapshot, SessionInfo, SessionSnapshot,
+        compare, policy_exit_code, write_json, ChangeStatus, CompatibilityIssue, CoverageSnapshot,
+        DiffError, FindingSnapshot, SessionInfo, SessionSnapshot, DIFF_CHANGED_EXIT_CODE,
+        DIFF_INCOMPARABLE_EXIT_CODE,
     };
 
     struct TestDirectory(PathBuf);
@@ -1318,6 +1344,34 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_slice(&first).expect("the diff should be valid JSON");
         assert_eq!(parsed["behavior"][0]["status"], "NEW");
+    }
+
+    #[test]
+    fn assigns_distinct_exit_codes_to_changes_and_incomparable_inputs() {
+        let coverage = CoverageSnapshot {
+            state: "complete".to_owned(),
+            lost_events: 0,
+        };
+        let unchanged = snapshot("ptrace", coverage.clone(), Vec::new());
+        assert_eq!(policy_exit_code(&compare(unchanged.clone(), unchanged)), 0);
+
+        let before = snapshot("ptrace", coverage.clone(), Vec::new());
+        let after = snapshot(
+            "ptrace",
+            coverage.clone(),
+            vec![fact("$WORKSPACE/new", &["read"], 8)],
+        );
+        assert_eq!(
+            policy_exit_code(&compare(before, after)),
+            DIFF_CHANGED_EXIT_CODE
+        );
+
+        let before = snapshot("ptrace", coverage.clone(), Vec::new());
+        let after = snapshot("ebpf", coverage, Vec::new());
+        assert_eq!(
+            policy_exit_code(&compare(before, after)),
+            DIFF_INCOMPARABLE_EXIT_CODE
+        );
     }
 
     #[test]
