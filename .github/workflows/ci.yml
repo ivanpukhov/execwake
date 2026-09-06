@@ -128,6 +128,39 @@ jobs:
       - name: Test ptrace as an unprivileged user
         run: scripts/test-linux-ptrace.sh
 
+  automatic-collector:
+    name: Automatic collector (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.67.0
+      - name: Mount tracing filesystems
+        run: |
+          mountpoint -q /sys/kernel/debug || sudo mount -t debugfs debugfs /sys/kernel/debug
+          sudo mkdir -p /sys/kernel/debug/tracing
+          mountpoint -q /sys/kernel/debug/tracing || sudo mount -t tracefs tracefs /sys/kernel/debug/tracing
+      - name: Test automatic fallback after tracepoint attachment fails
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "HOME=$HOME" \
+            "RUSTUP_HOME=$(rustup show home)" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            EXECWAKE_EXPECT_AUTO_FALLBACK=tracepoint_attach_failed \
+            cargo test --test cli_lifecycle \
+              automatic_collector_records_a_consistent_decision -- --exact
+
   package-smoke:
     name: Package smoke (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}

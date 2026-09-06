@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use execwake::session::CollectorFallbackReason;
 use rusqlite::Connection;
 
 struct TestDirectory(PathBuf);
@@ -114,6 +115,37 @@ fn preserves_nonzero_and_crash_statuses() {
 }
 
 #[test]
+fn automatic_collector_records_a_consistent_decision() {
+    let state = TestDirectory::new("auto");
+    let output = run(&state.0, &["run", "--collector", "auto", "--", "/bin/true"]);
+
+    assert!(
+        output.status.success(),
+        "automatic collection failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = session_path(&output);
+    let lifecycle = session_lifecycle(&path);
+    assert_finalized(&path, &lifecycle);
+    assert_eq!(lifecycle.requested, "auto");
+    match lifecycle.backend.as_str() {
+        "ebpf" => assert_eq!(lifecycle.fallback, None),
+        "ptrace" => {
+            let fallback = lifecycle
+                .fallback
+                .as_deref()
+                .and_then(CollectorFallbackReason::parse);
+            assert!(fallback.is_some(), "ptrace fallback reason is missing");
+        }
+        backend => panic!("unexpected collector backend: {backend}"),
+    }
+    if let Ok(expected) = std::env::var("EXECWAKE_EXPECT_AUTO_FALLBACK") {
+        assert_eq!(lifecycle.backend, "ptrace");
+        assert_eq!(lifecycle.fallback.as_deref(), Some(expected.as_str()));
+    }
+}
+
+#[test]
 fn ctrl_c_finalizes_the_session_and_stops_the_collector() {
     let state = TestDirectory::new("interrupt");
     let child = command(&state.0)
@@ -201,15 +233,25 @@ fn session_path(output: &Output) -> PathBuf {
 }
 
 fn assert_session_finalized(path: &Path) {
+    let lifecycle = session_lifecycle(path);
+    assert_finalized(path, &lifecycle);
+    assert_eq!(lifecycle.requested, "ptrace");
+    assert_eq!(lifecycle.backend, "ptrace");
+    assert_eq!(lifecycle.fallback, None);
+}
+
+struct SessionLifecycle {
+    state: String,
+    finalized: i64,
+    unfinished: i64,
+    requested: String,
+    backend: String,
+    fallback: Option<String>,
+}
+
+fn session_lifecycle(path: &Path) -> SessionLifecycle {
     let connection = Connection::open(path).expect("the session database should open");
-    let (state, finalized, unfinished, requested, backend, fallback): (
-        String,
-        i64,
-        i64,
-        String,
-        String,
-        Option<String>,
-    ) = connection
+    connection
         .query_row(
             "SELECT state, finalized,
                     (SELECT COUNT(*) FROM process WHERE ended_at_ms IS NULL),
@@ -218,23 +260,23 @@ fn assert_session_finalized(path: &Path) {
              FROM session WHERE singleton = 1",
             [],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
+                Ok(SessionLifecycle {
+                    state: row.get(0)?,
+                    finalized: row.get(1)?,
+                    unfinished: row.get(2)?,
+                    requested: row.get(3)?,
+                    backend: row.get(4)?,
+                    fallback: row.get(5)?,
+                })
             },
         )
-        .expect("the session lifecycle should be readable");
-    assert_eq!(state, "finalized");
-    assert_eq!(finalized, 1);
-    assert_eq!(unfinished, 0);
-    assert_eq!(requested, "ptrace");
-    assert_eq!(backend, "ptrace");
-    assert_eq!(fallback, None);
+        .expect("the session lifecycle should be readable")
+}
+
+fn assert_finalized(path: &Path, lifecycle: &SessionLifecycle) {
+    assert_eq!(lifecycle.state, "finalized");
+    assert_eq!(lifecycle.finalized, 1);
+    assert_eq!(lifecycle.unfinished, 0);
     assert!(path.with_extension("finalized").is_file());
     assert!(!path.with_extension("lock").exists());
 }
