@@ -64,8 +64,114 @@ pub(crate) fn check_integrity(connection: &Connection) -> rusqlite::Result<bool>
         .map(|result| result == "ok")
 }
 
+pub(crate) fn table_has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns.iter().any(|candidate| candidate == column))
+}
+
+pub(crate) fn optional_session_text(
+    connection: &Connection,
+    column: &'static str,
+) -> rusqlite::Result<Option<String>> {
+    if !table_has_column(connection, "session", column)? {
+        return Ok(None);
+    }
+
+    connection.query_row(
+        &format!("SELECT {column} FROM session WHERE singleton = 1"),
+        [],
+        |row| row.get(0),
+    )
+}
+
 fn invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    use rusqlite::{params, Connection};
+
+    const SCHEMA_9: &str = include_str!("../tests/fixtures/session_schema_9.sql");
+    const SCHEMA_10: &str = include_str!("../tests/fixtures/session_schema_10.sql");
+
+    pub(crate) fn rewrite_as_release_schema(path: &Path, id: &str, version: u32) {
+        let schema = match version {
+            9 => SCHEMA_9,
+            10 => SCHEMA_10,
+            _ => panic!("unsupported test schema: {version}"),
+        };
+        let connection = Connection::open(path).expect("the session fixture should open");
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE session;")
+            .expect("the current session table should be removed");
+        connection
+            .execute_batch(schema)
+            .expect("the release session table should be created");
+        if version == 9 {
+            connection
+                .execute(
+                    "INSERT INTO session (
+                         singleton, id, schema_version, mode, state, finalized,
+                         command_name, argument_count, started_at_ms, ended_at_ms,
+                         runner_pid, collector_backend, privacy_profile, exit_code
+                     ) VALUES (
+                         1, ?1, 9, 'observe', 'finalized', 1,
+                         'fixture', 0, 1, 2, 100, 'ptrace', 'paths-v1', 0
+                     )",
+                    [id],
+                )
+                .expect("the schema 9 session should be inserted");
+        } else {
+            connection
+                .execute(
+                    "INSERT INTO session (
+                         singleton, id, schema_version, mode, state, finalized,
+                         command_name, argument_count, started_at_ms, ended_at_ms,
+                         runner_pid, collector_requested, collector_backend,
+                         collector_fallback_reason, privacy_profile, exit_code
+                     ) VALUES (
+                         1, ?1, 10, 'observe', 'finalized', 1,
+                         'fixture', 0, 1, 2, 100, 'auto', 'ptrace',
+                         'permission_denied', 'paths-v1', 0
+                     )",
+                    [id],
+                )
+                .expect("the schema 10 session should be inserted");
+        }
+        connection
+            .execute(
+                "INSERT INTO process (
+                     process_id, operating_system_id, parent_process_id, executable,
+                     started_at_ms, ended_at_ms, exit_code, evidence
+                 ) VALUES (1, 101, NULL, 'fixture', 1, 2, 0, 'observed')",
+                [],
+            )
+            .expect("the fixture process should be inserted");
+        connection
+            .execute(
+                "INSERT INTO event (
+                     category, operation, target, process_id, occurred_at_ms, evidence
+                 ) VALUES ('filesystem', 'read', '$WORKSPACE/input', 1, 1, 'observed')",
+                [],
+            )
+            .expect("the fixture event should be inserted");
+        connection
+            .execute(
+                "UPDATE coverage SET state = 'partial' WHERE category = 'filesystem'",
+                params![],
+            )
+            .expect("the fixture coverage should be updated");
+    }
 }
 
 #[cfg(test)]

@@ -15,10 +15,12 @@ use crate::findings::Severity;
 use crate::limits::{MAX_IMPORTED_EVENTS, MAX_IMPORTED_FINDINGS, MAX_IMPORTED_PROCESSES};
 use crate::privacy::CURRENT_PRIVACY_PROFILE;
 use crate::session::{
-    CollectorBackend, CollectorFallbackReason, CollectorRequest, SessionMode,
-    CURRENT_SCHEMA_VERSION,
+    supports_behavior_schema, CollectorBackend, CollectorFallbackReason, CollectorRequest,
+    SessionMode, CURRENT_SCHEMA_VERSION,
 };
-use crate::session_input::{canonical_session_file, check_integrity, configure_read_only};
+use crate::session_input::{
+    canonical_session_file, check_integrity, configure_read_only, optional_session_text,
+};
 use crate::storage::SessionId;
 
 #[derive(Debug)]
@@ -264,7 +266,7 @@ impl SessionSnapshot {
         let requested_backend = optional_session_text(&connection, "collector_requested")?;
         let backend = optional_session_text(&connection, "collector_backend")?;
         let fallback_reason = optional_session_text(&connection, "collector_fallback_reason")?;
-        if schema_version == CURRENT_SCHEMA_VERSION {
+        if schema_version >= 10 {
             let request = requested_backend
                 .as_deref()
                 .and_then(CollectorRequest::parse)
@@ -278,9 +280,17 @@ impl SessionSnapshot {
                 None => None,
             };
             let fallback = match fallback_reason.as_deref() {
-                Some(value) => Some(CollectorFallbackReason::parse(value).ok_or_else(|| {
-                    DiffError::InvalidSession("collector fallback reason is invalid".to_owned())
-                })?),
+                Some(value) => {
+                    let reason = CollectorFallbackReason::parse(value).ok_or_else(|| {
+                        DiffError::InvalidSession("collector fallback reason is invalid".to_owned())
+                    })?;
+                    if !reason.is_valid_for_schema(schema_version) {
+                        return Err(DiffError::InvalidSession(
+                            "collector fallback reason is invalid".to_owned(),
+                        ));
+                    }
+                    Some(reason)
+                }
                 None => None,
             };
             if fallback.is_some()
@@ -290,6 +300,12 @@ impl SessionSnapshot {
                     "collector decision is inconsistent".to_owned(),
                 ));
             }
+        } else if supports_behavior_schema(schema_version)
+            && matches!(backend.as_deref(), Some(value) if CollectorBackend::parse(value).is_none())
+        {
+            return Err(DiffError::InvalidSession(
+                "collector backend is invalid".to_owned(),
+            ));
         }
         let privacy_profile =
             optional_session_text(&connection, "privacy_profile")?.map(|value| sanitize(&value));
@@ -304,7 +320,7 @@ impl SessionSnapshot {
         };
         let coverage = load_coverage(&connection)?;
 
-        if schema_version != CURRENT_SCHEMA_VERSION {
+        if !supports_behavior_schema(schema_version) {
             return Ok(Self {
                 info,
                 coverage,
@@ -324,29 +340,6 @@ impl SessionSnapshot {
             findings,
         })
     }
-}
-
-fn table_has_column(connection: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(columns.iter().any(|candidate| candidate == column))
-}
-
-fn optional_session_text(
-    connection: &Connection,
-    column: &'static str,
-) -> rusqlite::Result<Option<String>> {
-    if !table_has_column(connection, "session", column)? {
-        return Ok(None);
-    }
-
-    connection.query_row(
-        &format!("SELECT {column} FROM session WHERE singleton = 1"),
-        [],
-        |row| row.get(0),
-    )
 }
 
 fn load_coverage(
@@ -536,8 +529,8 @@ fn compare_compatibility(
             if before.info.schema_version != after.info.schema_version {
                 issues.insert(CompatibilityIssue::SchemaMismatch);
             }
-            if before.info.schema_version != CURRENT_SCHEMA_VERSION
-                || after.info.schema_version != CURRENT_SCHEMA_VERSION
+            if !supports_behavior_schema(before.info.schema_version)
+                || !supports_behavior_schema(after.info.schema_version)
             {
                 issues.insert(CompatibilityIssue::UnsupportedSchema);
             }
@@ -1149,6 +1142,36 @@ mod tests {
                     .issues
                     .contains(&CompatibilityIssue::UnsupportedSchema)
         }));
+    }
+
+    #[test]
+    fn loads_release_candidate_behavior_without_modifying_the_session() {
+        use crate::session_input::test_support::rewrite_as_release_schema;
+
+        for version in [9, 10] {
+            let directory = TestDirectory::new();
+            let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+            let session = store
+                .begin("fixture", 0)
+                .expect("a session should start")
+                .finalize(SessionOutcome::exited(0))
+                .expect("the session should finalize");
+            rewrite_as_release_schema(session.database(), session.id().as_str(), version);
+            let before = fs::read(session.database()).expect("the fixture should be readable");
+
+            let snapshot = SessionSnapshot::load(session.database())
+                .expect("the release candidate session should load");
+            assert_eq!(snapshot.info.schema_version, version);
+            assert_eq!(snapshot.info.backend.as_deref(), Some("ptrace"));
+            assert!(!snapshot.behavior.facts.is_empty());
+            let comparison = compare(snapshot.clone(), snapshot);
+            assert!(comparison.compatibility.iter().all(|entry| !entry
+                .issues
+                .contains(&CompatibilityIssue::UnsupportedSchema)));
+
+            let after = fs::read(session.database()).expect("the fixture should remain readable");
+            assert_eq!(after, before);
+        }
     }
 
     #[test]

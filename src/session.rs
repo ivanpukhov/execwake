@@ -1,6 +1,11 @@
 use crate::privacy::is_valid_environment_name;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+pub const MIN_BEHAVIOR_SCHEMA_VERSION: u32 = 9;
+
+pub const fn supports_behavior_schema(version: u32) -> bool {
+    version >= MIN_BEHAVIOR_SCHEMA_VERSION && version <= CURRENT_SCHEMA_VERSION
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectorRequest {
@@ -88,6 +93,20 @@ impl CollectorFallbackReason {
             "event_buffer_unavailable" => Some(Self::EventBufferUnavailable),
             "initialization_failed" => Some(Self::InitializationFailed),
             _ => None,
+        }
+    }
+
+    pub const fn is_valid_for_schema(self, schema_version: u32) -> bool {
+        match schema_version {
+            10 => matches!(
+                self,
+                Self::CgroupUnavailable
+                    | Self::PermissionDenied
+                    | Self::PlatformIncompatible
+                    | Self::InitializationFailed
+            ),
+            11..=CURRENT_SCHEMA_VERSION => true,
+            _ => false,
         }
     }
 }
@@ -298,6 +317,15 @@ mod tests {
 
         assert_eq!(manifest.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(manifest.mode, SessionMode::Observe);
+    }
+
+    #[test]
+    fn behavior_schema_support_is_bounded() {
+        assert!(!super::supports_behavior_schema(8));
+        assert!(super::supports_behavior_schema(9));
+        assert!(super::supports_behavior_schema(10));
+        assert!(super::supports_behavior_schema(CURRENT_SCHEMA_VERSION));
+        assert!(!super::supports_behavior_schema(CURRENT_SCHEMA_VERSION + 1));
     }
 
     #[test]

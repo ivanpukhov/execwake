@@ -22,10 +22,12 @@ use crate::display_text::sanitize;
 use crate::node_enrichment::sanitize_http_fact;
 use crate::privacy::is_valid_environment_name;
 use crate::session::{
-    CollectorBackend, CollectorFallbackReason, CollectorRequest, SessionMode,
-    CURRENT_SCHEMA_VERSION,
+    supports_behavior_schema, CollectorBackend, CollectorFallbackReason, CollectorRequest,
+    SessionMode,
 };
-use crate::session_input::{canonical_session_file, check_integrity, configure_read_only};
+use crate::session_input::{
+    canonical_session_file, check_integrity, configure_read_only, optional_session_text,
+};
 use crate::storage::SessionPaths;
 
 const BODY_LIMIT: usize = crate::limits::REPORT_REQUEST_BYTES;
@@ -415,19 +417,9 @@ fn validate_session(session: &SessionPaths) -> io::Result<()> {
             "report session database is corrupt",
         ));
     }
-    let (
-        id,
-        schema_version,
-        mode,
-        state,
-        finalized,
-        collector_requested,
-        collector_backend,
-        collector_fallback_reason,
-    ) = connection
+    let (id, schema_version, mode, state, finalized, collector_backend) = connection
         .query_row(
-            "SELECT id, schema_version, mode, state, finalized,
-                    collector_requested, collector_backend, collector_fallback_reason
+            "SELECT id, schema_version, mode, state, finalized, collector_backend
              FROM session WHERE singleton = 1",
             [],
             |row| {
@@ -437,28 +429,51 @@ fn validate_session(session: &SessionPaths) -> io::Result<()> {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )
         .map_err(server_error)?;
+    let schema_version = u32::try_from(schema_version).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "report session schema is invalid",
+        )
+    })?;
+    let collector_requested =
+        optional_session_text(&connection, "collector_requested").map_err(server_error)?;
+    let collector_fallback_reason =
+        optional_session_text(&connection, "collector_fallback_reason").map_err(server_error)?;
+    let collector_metadata_valid = if schema_version >= 10 {
+        let request = collector_requested
+            .as_deref()
+            .and_then(CollectorRequest::parse);
+        let backend = collector_backend
+            .as_deref()
+            .and_then(CollectorBackend::parse);
+        let fallback = collector_fallback_reason
+            .as_deref()
+            .and_then(CollectorFallbackReason::parse);
+        request.is_some()
+            && collector_backend.is_none() == backend.is_none()
+            && collector_fallback_reason.is_none() == fallback.is_none()
+            && fallback.map_or(true, |reason| reason.is_valid_for_schema(schema_version))
+            && (fallback.is_none()
+                || (request == Some(CollectorRequest::Auto)
+                    && backend == Some(CollectorBackend::Ptrace)))
+    } else {
+        collector_requested.is_none()
+            && collector_fallback_reason.is_none()
+            && !matches!(
+                collector_backend.as_deref(),
+                Some(backend) if CollectorBackend::parse(backend).is_none()
+            )
+    };
 
     if id != session.id().as_str()
-        || schema_version != i64::from(CURRENT_SCHEMA_VERSION)
+        || !supports_behavior_schema(schema_version)
         || SessionMode::parse(&mode).is_none()
-        || CollectorRequest::parse(&collector_requested).is_none()
-        || matches!(
-            collector_backend.as_deref(),
-            Some(backend) if CollectorBackend::parse(backend).is_none()
-        )
-        || matches!(
-            collector_fallback_reason.as_deref(),
-            Some(reason) if CollectorFallbackReason::parse(reason).is_none()
-        )
-        || (collector_fallback_reason.is_some()
-            && (collector_requested != "auto" || collector_backend.as_deref() != Some("ptrace")))
+        || !collector_metadata_valid
         || finalized != 1
         || !matches!(state.as_str(), "finalized" | "interrupted")
     {
@@ -593,9 +608,8 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
     configure_read_only(&connection)?;
     let mut report = connection.query_row(
         "SELECT id, schema_version, mode, state, finalized, command_name,
-                argument_count, collector_requested, collector_backend,
-                collector_fallback_reason, started_at_ms, ended_at_ms, exit_code,
-                termination_signal, interruption
+                argument_count, collector_backend, started_at_ms, ended_at_ms,
+                exit_code, termination_signal, interruption
          FROM session WHERE singleton = 1",
         [],
         |row| {
@@ -607,15 +621,15 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
                 finalized: row.get::<_, i64>(4)? == 1,
                 command_name: sanitize(&row.get::<_, String>(5)?),
                 argument_count: row.get(6)?,
-                collector_requested: row.get(7)?,
-                collector_backend: row.get(8)?,
-                collector_fallback_reason: row.get(9)?,
-                started_at_ms: row.get(10)?,
-                ended_at_ms: row.get(11)?,
-                exit_code: row.get(12)?,
-                termination_signal: row.get(13)?,
+                collector_requested: "auto".to_owned(),
+                collector_backend: row.get(7)?,
+                collector_fallback_reason: None,
+                started_at_ms: row.get(8)?,
+                ended_at_ms: row.get(9)?,
+                exit_code: row.get(10)?,
+                termination_signal: row.get(11)?,
                 interruption: row
-                    .get::<_, Option<String>>(14)?
+                    .get::<_, Option<String>>(12)?
                     .map(|value| sanitize(&value)),
                 coverage: Vec::new(),
                 process_count: 0,
@@ -629,6 +643,10 @@ fn load_report(database: PathBuf) -> rusqlite::Result<SessionReport> {
             })
         },
     )?;
+    report.collector_requested = optional_session_text(&connection, "collector_requested")?
+        .unwrap_or_else(|| "auto".to_owned());
+    report.collector_fallback_reason =
+        optional_session_text(&connection, "collector_fallback_reason")?;
 
     report.coverage = query_coverage(&connection)?;
     report.process_count = query_count(&connection, "process")?;
@@ -904,6 +922,7 @@ mod tests {
 
     use super::{load_event_page, load_report, EventQuery, ReportServer, BODY_LIMIT};
     use crate::session::SessionMode;
+    use crate::session_input::test_support::rewrite_as_release_schema;
     use crate::storage::{SessionOutcome, SessionStore};
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -942,6 +961,33 @@ mod tests {
 
         ReportServer::bind(session, Duration::from_secs(1))
             .expect("an instrumented report should bind");
+    }
+
+    #[test]
+    fn reads_release_candidate_sessions_without_modifying_them() {
+        for version in [9, 10] {
+            let directory = TestDirectory::new();
+            let store = SessionStore::at(directory.0.clone()).expect("storage should be created");
+            let session = store
+                .begin("fixture", 0)
+                .expect("a session should start")
+                .finalize(SessionOutcome::exited(0))
+                .expect("the session should finalize");
+            rewrite_as_release_schema(session.database(), session.id().as_str(), version);
+            let before = fs::read(session.database()).expect("the fixture should be readable");
+
+            let report = load_report(session.database().to_owned())
+                .expect("the release candidate report should load");
+            assert_eq!(report.schema_version, i64::from(version));
+            assert_eq!(report.collector_requested, "auto");
+            assert_eq!(report.collector_backend.as_deref(), Some("ptrace"));
+            assert_eq!(report.event_count, 1);
+            ReportServer::bind(session.clone(), Duration::from_secs(1))
+                .expect("the release candidate report should bind");
+
+            let after = fs::read(session.database()).expect("the fixture should remain readable");
+            assert_eq!(after, before);
+        }
     }
 
     #[tokio::test]
