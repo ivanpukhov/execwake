@@ -524,7 +524,7 @@ impl ProbeRun {
                 drain_buffers(&mut buffers, &mut output, &mut events, &mut lost_events);
                 thread::yield_now();
             }
-            drain_buffers(&mut buffers, &mut output, &mut events, &mut lost_events);
+            while drain_buffers(&mut buffers, &mut output, &mut events, &mut lost_events) > 0 {}
             ProbeOutput {
                 events,
                 lost_events,
@@ -546,10 +546,12 @@ fn drain_buffers(
     output: &mut [BytesMut],
     captured: &mut Vec<protocol::Event>,
     lost: &mut u64,
-) {
+) -> usize {
+    let mut drained = 0;
     for buffer in buffers.iter_mut().filter(|buffer| buffer.readable()) {
         match buffer.read_events(output) {
             Ok(events) => {
+                drained += events.read;
                 *lost = lost.saturating_add(events.lost as u64);
                 for event in output.iter_mut().take(events.read) {
                     match protocol::decode(event) {
@@ -570,6 +572,7 @@ fn drain_buffers(
             }
         }
     }
+    drained
 }
 
 fn valid_event(event: &protocol::Event) -> bool {
