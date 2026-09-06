@@ -61,6 +61,12 @@ jobs:
             scripts/verify-linux-package.sh \
             "${{ steps.package.outputs.archive }}" \
             "$TARGET"
+      - name: Verify glibc baseline and Debian 12 runtime
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+        run: scripts/verify-linux-compatibility.sh "$ARCHIVE" "$TARGET" "$PLATFORM"
       - name: Create SPDX SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:

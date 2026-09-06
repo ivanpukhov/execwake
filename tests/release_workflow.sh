@@ -5,6 +5,7 @@ repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 workflow=$repository/.github/workflows/release.yml
 ci_workflow=$repository/.github/workflows/ci.yml
 reproducibility_script=$repository/scripts/verify-reproducible-package.sh
+compatibility_script=$repository/scripts/verify-linux-compatibility.sh
 
 publish_job=$(sed -n '/^  publish:/,$p' "$workflow")
 
@@ -29,6 +30,19 @@ if ! grep -Fq 'scripts/verify-reproducible-package.sh "$TARGET"' "$workflow"; th
 fi
 if ! grep -Fq 'scripts/verify-reproducible-package.sh "$EXECWAKE_TARGET"' "$ci_workflow"; then
   echo "CI packages must pass the reproducibility check" >&2
+  exit 1
+fi
+if ! grep -Fq 'scripts/verify-linux-compatibility.sh "$ARCHIVE" "$TARGET" "$PLATFORM"' "$workflow"; then
+  echo "release packages must pass distribution compatibility checks" >&2
+  exit 1
+fi
+if ! grep -Fq 'scripts/verify-linux-compatibility.sh' "$ci_workflow"; then
+  echo "CI packages must pass distribution compatibility checks" >&2
+  exit 1
+fi
+if ! grep -Fq 'scripts/verify-glibc-baseline.sh' "$compatibility_script" ||
+  ! grep -Fq 'debian:12-slim@sha256:' "$compatibility_script"; then
+  echo "compatibility checks must enforce the glibc baseline and pinned Debian runtime" >&2
   exit 1
 fi
 if ! grep -Fq 'for build in first second' "$reproducibility_script" ||

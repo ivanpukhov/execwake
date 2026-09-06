@@ -181,12 +181,20 @@ jobs:
         include:
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            platform: linux/amd64
+            compatibility: true
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            platform: linux/amd64
+            compatibility: false
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
+            platform: linux/arm64
+            compatibility: true
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            platform: linux/arm64
+            compatibility: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
@@ -238,3 +246,13 @@ jobs:
               exit 1
             fi
           done < <(find "$sessions" -maxdepth 1 -type f -print)
+      - name: Verify glibc baseline and Debian 12 runtime
+        if: matrix.compatibility
+        env:
+          EXECWAKE_PLATFORM: ${{ matrix.platform }}
+          EXECWAKE_TARGET: ${{ matrix.target }}
+        run: |
+          version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          archive="dist/execwake-v${version}-${EXECWAKE_TARGET}.tar.gz"
+          scripts/verify-linux-compatibility.sh \
+            "$archive" "$EXECWAKE_TARGET" "$EXECWAKE_PLATFORM"

@@ -1305,7 +1305,7 @@ fn open_regular_read_only(path: &Path) -> io::Result<File> {
 fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        return File::open(path)?.sync_all();
+        File::open(path)?.sync_all()
     }
     #[cfg(not(target_os = "linux"))]
     {
