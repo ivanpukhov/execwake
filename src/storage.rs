@@ -984,8 +984,10 @@ fn initialize_database(
              collector_backend TEXT CHECK (collector_backend IN ('ebpf', 'ptrace')),
              collector_fallback_reason TEXT CHECK (
                  collector_fallback_reason IN (
-                     'cgroup_unavailable', 'permission_denied',
-                     'platform_incompatible', 'initialization_failed'
+                     'cgroup_unavailable', 'cgroup_setup_failed',
+                     'permission_denied', 'platform_incompatible',
+                     'program_load_failed', 'tracepoint_attach_failed',
+                     'event_buffer_unavailable', 'initialization_failed'
                  )
              ),
              privacy_profile TEXT NOT NULL,

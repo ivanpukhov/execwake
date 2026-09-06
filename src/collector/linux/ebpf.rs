@@ -62,12 +62,12 @@ impl LinuxCollector {
                 requested,
                 fallback_reason: None,
             }),
-            CollectorRequest::Ebpf => {
-                EbpfCollector::new(root_executable).map(|collector| Self::Ebpf {
+            CollectorRequest::Ebpf => EbpfCollector::new(root_executable)
+                .map(|collector| Self::Ebpf {
                     collector,
                     requested,
                 })
-            }
+                .map_err(EbpfInitializationError::into_io),
             CollectorRequest::Auto => match EbpfCollector::new(root_executable.clone()) {
                 Ok(collector) => Ok(Self::Ebpf {
                     collector,
@@ -81,7 +81,7 @@ impl LinuxCollector {
                     Ok(Self::Ptrace {
                         collector: PtraceCollector::new(root_executable),
                         requested,
-                        fallback_reason: Some(fallback_reason(&error)),
+                        fallback_reason: Some(error.reason),
                     })
                 }
             },
@@ -144,14 +144,34 @@ impl Collector for LinuxCollector {
     }
 }
 
-fn fallback_reason(error: &io::Error) -> CollectorFallbackReason {
-    match error.kind() {
-        io::ErrorKind::NotFound => CollectorFallbackReason::CgroupUnavailable,
-        io::ErrorKind::PermissionDenied => CollectorFallbackReason::PermissionDenied,
-        io::ErrorKind::InvalidData | io::ErrorKind::Unsupported => {
-            CollectorFallbackReason::PlatformIncompatible
+#[derive(Debug)]
+struct EbpfInitializationError {
+    reason: CollectorFallbackReason,
+    error: io::Error,
+}
+
+impl EbpfInitializationError {
+    fn new(reason: CollectorFallbackReason, context: &str, error: impl std::fmt::Display) -> Self {
+        Self {
+            reason,
+            error: io::Error::new(io::ErrorKind::Other, format!("{context}: {error}")),
         }
-        _ => CollectorFallbackReason::InitializationFailed,
+    }
+
+    fn cgroup(error: io::Error) -> Self {
+        let reason = match error.kind() {
+            io::ErrorKind::NotFound => CollectorFallbackReason::CgroupUnavailable,
+            io::ErrorKind::PermissionDenied => CollectorFallbackReason::PermissionDenied,
+            io::ErrorKind::InvalidData | io::ErrorKind::Unsupported => {
+                CollectorFallbackReason::PlatformIncompatible
+            }
+            _ => CollectorFallbackReason::CgroupSetupFailed,
+        };
+        Self::new(reason, "creating collector cgroup", error)
+    }
+
+    fn into_io(self) -> io::Error {
+        self.error
     }
 }
 
@@ -164,12 +184,19 @@ pub struct EbpfCollector {
 }
 
 impl EbpfCollector {
-    fn new(root_executable: String) -> io::Result<Self> {
-        let scope = CgroupScope::create()?;
+    fn new(root_executable: String) -> Result<Self, EbpfInitializationError> {
+        let scope = CgroupScope::create().map_err(EbpfInitializationError::cgroup)?;
         let probe = EbpfProbe::load(scope.id())?;
+        let root_cwd = std::env::current_dir().map_err(|error| {
+            EbpfInitializationError::new(
+                CollectorFallbackReason::InitializationFailed,
+                "reading current directory",
+                error,
+            )
+        })?;
         Ok(Self {
             root_executable,
-            root_cwd: std::env::current_dir()?,
+            root_cwd,
             ignored_paths: Vec::new(),
             scope,
             probe,
@@ -331,23 +358,65 @@ struct EbpfProbe {
 }
 
 impl EbpfProbe {
-    fn load(cgroup_id: u64) -> io::Result<Self> {
+    fn load(cgroup_id: u64) -> Result<Self, EbpfInitializationError> {
         let mut bpf = Bpf::load(aya::include_bytes_aligned!("../../../bpf/collector.bpf.o"))
-            .map_err(other_error)?;
+            .map_err(|error| {
+                EbpfInitializationError::new(
+                    CollectorFallbackReason::ProgramLoadFailed,
+                    "loading embedded eBPF object",
+                    error,
+                )
+            })?;
         let mut target =
-            Array::<_, u64>::try_from(bpf.map_mut("TARGET_CGROUP").map_err(other_error)?)
-                .map_err(other_error)?;
-        target.set(0, cgroup_id, 0).map_err(other_error)?;
+            Array::<_, u64>::try_from(bpf.map_mut("TARGET_CGROUP").map_err(|error| {
+                EbpfInitializationError::new(
+                    CollectorFallbackReason::ProgramLoadFailed,
+                    "opening target cgroup map",
+                    error,
+                )
+            })?)
+            .map_err(|error| {
+                EbpfInitializationError::new(
+                    CollectorFallbackReason::ProgramLoadFailed,
+                    "opening target cgroup map",
+                    error,
+                )
+            })?;
+        target.set(0, cgroup_id, 0).map_err(|error| {
+            EbpfInitializationError::new(
+                CollectorFallbackReason::ProgramLoadFailed,
+                "configuring target cgroup map",
+                error,
+            )
+        })?;
         drop(target);
 
         let mut operation_map = BpfHashMap::<_, i64, u32>::try_from(
-            bpf.map_mut("SYSCALL_OPERATIONS").map_err(other_error)?,
+            bpf.map_mut("SYSCALL_OPERATIONS").map_err(|error| {
+                EbpfInitializationError::new(
+                    CollectorFallbackReason::ProgramLoadFailed,
+                    "opening syscall operation map",
+                    error,
+                )
+            })?,
         )
-        .map_err(other_error)?;
+        .map_err(|error| {
+            EbpfInitializationError::new(
+                CollectorFallbackReason::ProgramLoadFailed,
+                "opening syscall operation map",
+                error,
+            )
+        })?;
         for (number, operation) in syscall_operations() {
             operation_map
                 .insert(number, operation as u32, 0)
-                .map_err(other_error)?;
+                .map_err(|error| {
+                    EbpfInitializationError::new(
+                        CollectorFallbackReason::ProgramLoadFailed,
+                        "configuring syscall operation map",
+                        error,
+                    )
+                })?;
         }
         drop(operation_map);
 
@@ -371,14 +440,38 @@ impl EbpfProbe {
             "sys_exit",
         )?;
 
-        let mut event_array = PerfEventArray::try_from(bpf.map_mut("EVENTS").map_err(other_error)?)
-            .map_err(other_error)?;
+        let mut event_array = PerfEventArray::try_from(bpf.map_mut("EVENTS").map_err(|error| {
+            EbpfInitializationError::new(
+                CollectorFallbackReason::EventBufferUnavailable,
+                "opening event buffer map",
+                error,
+            )
+        })?)
+        .map_err(|error| {
+            EbpfInitializationError::new(
+                CollectorFallbackReason::EventBufferUnavailable,
+                "opening event buffer map",
+                error,
+            )
+        })?;
         let mut buffers = Vec::new();
-        for cpu in online_cpus()? {
+        for cpu in online_cpus().map_err(|error| {
+            EbpfInitializationError::new(
+                CollectorFallbackReason::EventBufferUnavailable,
+                "enumerating online CPUs",
+                error,
+            )
+        })? {
             buffers.push(
                 event_array
                     .open(cpu, Some(EBPF_BUFFER_PAGES))
-                    .map_err(other_error)?,
+                    .map_err(|error| {
+                        EbpfInitializationError::new(
+                            CollectorFallbackReason::EventBufferUnavailable,
+                            "opening per-CPU event buffer",
+                            error,
+                        )
+                    })?,
             );
         }
         Ok(Self {
@@ -411,22 +504,36 @@ fn attach_tracepoint(
     program_name: &str,
     category: &str,
     event: &str,
-) -> io::Result<()> {
+) -> Result<(), EbpfInitializationError> {
     let program: &mut TracePoint = bpf
         .program_mut(program_name)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "eBPF program is missing"))?
+        .ok_or_else(|| {
+            EbpfInitializationError::new(
+                CollectorFallbackReason::ProgramLoadFailed,
+                "locating eBPF program",
+                program_name,
+            )
+        })?
         .try_into()
-        .map_err(other_error)?;
+        .map_err(|error| {
+            EbpfInitializationError::new(
+                CollectorFallbackReason::ProgramLoadFailed,
+                "opening eBPF tracepoint program",
+                error,
+            )
+        })?;
     program.load().map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("loading {program_name} eBPF program: {error}"),
+        EbpfInitializationError::new(
+            CollectorFallbackReason::ProgramLoadFailed,
+            &format!("loading {program_name} eBPF program"),
+            error,
         )
     })?;
     program.attach(category, event).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("attaching {program_name} eBPF program: {error}"),
+        EbpfInitializationError::new(
+            CollectorFallbackReason::TracepointAttachFailed,
+            &format!("attaching {program_name} eBPF program"),
+            error,
         )
     })?;
     Ok(())

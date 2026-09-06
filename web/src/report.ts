@@ -60,8 +60,12 @@ export interface SessionReport {
   collectorBackend: 'ebpf' | 'ptrace' | null;
   collectorFallbackReason:
     | 'cgroup_unavailable'
+    | 'cgroup_setup_failed'
     | 'permission_denied'
     | 'platform_incompatible'
+    | 'program_load_failed'
+    | 'tracepoint_attach_failed'
+    | 'event_buffer_unavailable'
     | 'initialization_failed'
     | null;
   startedAtMs: number;

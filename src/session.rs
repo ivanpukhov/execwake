@@ -1,6 +1,6 @@
 use crate::privacy::is_valid_environment_name;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectorRequest {
@@ -54,8 +54,12 @@ impl CollectorBackend {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectorFallbackReason {
     CgroupUnavailable,
+    CgroupSetupFailed,
     PermissionDenied,
     PlatformIncompatible,
+    ProgramLoadFailed,
+    TracepointAttachFailed,
+    EventBufferUnavailable,
     InitializationFailed,
 }
 
@@ -63,8 +67,12 @@ impl CollectorFallbackReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CgroupUnavailable => "cgroup_unavailable",
+            Self::CgroupSetupFailed => "cgroup_setup_failed",
             Self::PermissionDenied => "permission_denied",
             Self::PlatformIncompatible => "platform_incompatible",
+            Self::ProgramLoadFailed => "program_load_failed",
+            Self::TracepointAttachFailed => "tracepoint_attach_failed",
+            Self::EventBufferUnavailable => "event_buffer_unavailable",
             Self::InitializationFailed => "initialization_failed",
         }
     }
@@ -72,8 +80,12 @@ impl CollectorFallbackReason {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "cgroup_unavailable" => Some(Self::CgroupUnavailable),
+            "cgroup_setup_failed" => Some(Self::CgroupSetupFailed),
             "permission_denied" => Some(Self::PermissionDenied),
             "platform_incompatible" => Some(Self::PlatformIncompatible),
+            "program_load_failed" => Some(Self::ProgramLoadFailed),
+            "tracepoint_attach_failed" => Some(Self::TracepointAttachFailed),
+            "event_buffer_unavailable" => Some(Self::EventBufferUnavailable),
             "initialization_failed" => Some(Self::InitializationFailed),
             _ => None,
         }
@@ -302,6 +314,17 @@ mod tests {
             CollectorFallbackReason::parse("permission_denied"),
             Some(CollectorFallbackReason::PermissionDenied)
         );
+        for reason in [
+            CollectorFallbackReason::CgroupSetupFailed,
+            CollectorFallbackReason::ProgramLoadFailed,
+            CollectorFallbackReason::TracepointAttachFailed,
+            CollectorFallbackReason::EventBufferUnavailable,
+        ] {
+            assert_eq!(
+                CollectorFallbackReason::parse(reason.as_str()),
+                Some(reason)
+            );
+        }
         assert_eq!(CollectorRequest::parse("automatic"), None);
         assert_eq!(CollectorBackend::parse("strace"), None);
         assert_eq!(CollectorFallbackReason::parse("unknown error"), None);
