@@ -171,7 +171,10 @@ impl EbpfInitializationError {
     }
 
     fn into_io(self) -> io::Error {
-        self.error
+        io::Error::new(
+            self.error.kind(),
+            format!("{}: {}", self.reason.as_str(), self.error),
+        )
     }
 }
 
@@ -247,9 +250,16 @@ impl Collector for EbpfCollector {
             let _ = self.probe.stop(run);
             return Err(error);
         }
-        let result = child.wait();
+        let status = match child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = self.probe.stop(run);
+                return Err(error);
+            }
+        };
         let output = self.probe.stop(run)?;
-        let status = result?;
         sink.set_coverage(ebpf_coverage(output.lost_events))
             .map_err(sink_error)?;
         normalizer.replay(output.events, status, sink)?;
@@ -609,7 +619,7 @@ fn syscall_operations() -> Vec<(i64, protocol::SyscallOperation)> {
 
 struct ProbeRun {
     stop: Arc<AtomicBool>,
-    thread: thread::JoinHandle<ProbeOutput>,
+    thread: Option<thread::JoinHandle<ProbeOutput>>,
 }
 
 struct ProbeOutput {
@@ -637,14 +647,31 @@ impl ProbeRun {
                 lost_events,
             }
         });
-        Self { stop, thread }
+        Self {
+            stop,
+            thread: Some(thread),
+        }
     }
 
-    fn stop(self) -> io::Result<ProbeOutput> {
+    fn stop(mut self) -> io::Result<ProbeOutput> {
+        self.join()
+    }
+
+    fn join(&mut self) -> io::Result<ProbeOutput> {
         self.stop.store(true, Ordering::Release);
         self.thread
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "eBPF reader already stopped"))?
             .join()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "eBPF reader thread failed"))
+    }
+}
+
+impl Drop for ProbeRun {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            let _ = self.join();
+        }
     }
 }
 

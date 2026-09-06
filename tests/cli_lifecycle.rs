@@ -128,21 +128,40 @@ fn automatic_collector_records_a_consistent_decision() {
     let lifecycle = session_lifecycle(&path);
     assert_finalized(&path, &lifecycle);
     assert_eq!(lifecycle.requested, "auto");
-    match lifecycle.backend.as_str() {
-        "ebpf" => assert_eq!(lifecycle.fallback, None),
-        "ptrace" => {
+    match lifecycle.backend.as_deref() {
+        Some("ebpf") => assert_eq!(lifecycle.fallback, None),
+        Some("ptrace") => {
             let fallback = lifecycle
                 .fallback
                 .as_deref()
                 .and_then(CollectorFallbackReason::parse);
             assert!(fallback.is_some(), "ptrace fallback reason is missing");
         }
-        backend => panic!("unexpected collector backend: {backend}"),
+        backend => panic!("unexpected collector backend: {backend:?}"),
     }
     if let Ok(expected) = std::env::var("EXECWAKE_EXPECT_AUTO_FALLBACK") {
-        assert_eq!(lifecycle.backend, "ptrace");
+        assert_eq!(lifecycle.backend.as_deref(), Some("ptrace"));
         assert_eq!(lifecycle.fallback.as_deref(), Some(expected.as_str()));
     }
+}
+
+#[test]
+fn collector_startup_failure_finalizes_the_session() {
+    let Ok(expected) = std::env::var("EXECWAKE_EXPECT_EBPF_STARTUP_FAILURE") else {
+        return;
+    };
+    let state = TestDirectory::new("collector-startup-failure");
+    let output = run(&state.0, &["run", "--collector", "ebpf", "--", "/bin/true"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&expected), "unexpected error: {stderr}");
+    let path = session_path(&output);
+    let lifecycle = session_lifecycle(&path);
+    assert_finalized(&path, &lifecycle);
+    assert_eq!(lifecycle.requested, "ebpf");
+    assert_eq!(lifecycle.backend, None);
+    assert_eq!(lifecycle.fallback, None);
 }
 
 #[test]
@@ -236,7 +255,7 @@ fn assert_session_finalized(path: &Path) {
     let lifecycle = session_lifecycle(path);
     assert_finalized(path, &lifecycle);
     assert_eq!(lifecycle.requested, "ptrace");
-    assert_eq!(lifecycle.backend, "ptrace");
+    assert_eq!(lifecycle.backend.as_deref(), Some("ptrace"));
     assert_eq!(lifecycle.fallback, None);
 }
 
@@ -245,7 +264,7 @@ struct SessionLifecycle {
     finalized: i64,
     unfinished: i64,
     requested: String,
-    backend: String,
+    backend: Option<String>,
     fallback: Option<String>,
 }
 

@@ -86,7 +86,7 @@ fn run_in_store_with_options(
     };
     let mut session = store.begin_in_mode(&command_name, argv.len().saturating_sub(1), mode)?;
     session.set_collector_request(collector_request)?;
-    let forwarder = SignalForwarder::start().map_err(RunError::Signal)?;
+    let mut forwarder = SignalForwarder::start().map_err(RunError::Signal)?;
 
     let mut command = Command::new(executable);
     command
@@ -191,6 +191,8 @@ fn run_in_store_with_options(
     let status = match status_result {
         Ok(status) => status,
         Err(source) => {
+            let _ = child.kill();
+            let _ = child.wait();
             forwarder.stop();
             let session_path = session.paths().database().to_owned();
             session.finalize(SessionOutcome::without_status())?;
@@ -297,11 +299,21 @@ impl SignalForwarder {
         }
     }
 
-    fn stop(mut self) {
+    fn stop(&mut self) {
+        if self.thread.is_none() {
+            return;
+        }
         self.handle.close();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalForwarder {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -324,7 +336,7 @@ impl SignalForwarder {
 
     fn set_child(&self, _child_id: u32) {}
 
-    fn stop(self) {}
+    fn stop(&mut self) {}
 }
 
 fn display_name(executable: &OsStr) -> String {
