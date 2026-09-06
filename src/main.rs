@@ -2,9 +2,10 @@ mod report_launch;
 
 use std::env;
 use std::ffi::OsString;
+use std::io;
 use std::process;
 
-use execwake::cli::{help_text, Cli, Command, HelpTopic, ParseResult};
+use execwake::cli::{help_text, Cli, Command, DiffOutput, HelpTopic, ParseResult};
 
 fn main() {
     let arguments: Vec<OsString> = env::args_os().collect();
@@ -77,14 +78,25 @@ fn main() {
         }
         Command::Diff(args) => {
             match execwake::semantic_diff::compare_paths(&args.before, &args.after) {
-                Ok(diff) => {
-                    if let Err(error) =
-                        report_launch::present_diff(&args.before, &args.after, &diff)
-                    {
-                        eprintln!("error: could not present comparison: {error}");
-                        process::exit(1);
+                Ok(diff) => match args.output {
+                    DiffOutput::Json => {
+                        let stdout = io::stdout();
+                        let mut output = stdout.lock();
+                        if let Err(error) = execwake::semantic_diff::write_json(&diff, &mut output)
+                        {
+                            eprintln!("error: could not write comparison: {error}");
+                            process::exit(1);
+                        }
                     }
-                }
+                    DiffOutput::Human => {
+                        if let Err(error) =
+                            report_launch::present_diff(&args.before, &args.after, &diff)
+                        {
+                            eprintln!("error: could not present comparison: {error}");
+                            process::exit(1);
+                        }
+                    }
+                },
                 Err(error) => {
                     eprintln!("error: comparison failed: {error}");
                     process::exit(1);

@@ -27,6 +27,13 @@ pub struct RunArgs {
 pub struct DiffArgs {
     pub before: PathBuf,
     pub after: PathBuf,
+    pub output: DiffOutput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiffOutput {
+    Human,
+    Json,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,12 +107,12 @@ impl Cli {
 pub fn help_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::Root => {
-            "ExecWake\n\nUsage:\n  execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--output <path>] [--] <command> [arguments...]\n  execwake diff <before> <after>\n"
+            "ExecWake\n\nUsage:\n  execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--output <path>] [--] <command> [arguments...]\n  execwake diff [--json] <before> <after>\n"
         }
         HelpTopic::Run => {
             "Usage: execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--output <path>] [--] <command> [arguments...]\n"
         }
-        HelpTopic::Diff => "Usage: execwake diff <before> <after>\n",
+        HelpTopic::Diff => "Usage: execwake diff [--json] <before> <after>\n",
     }
 }
 
@@ -176,6 +183,16 @@ fn parse_diff(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
         return Ok(ParseResult::Help(HelpTopic::Diff));
     }
 
+    let output = if arguments.first().map(OsString::as_os_str) == Some(OsStr::new("--json")) {
+        arguments.remove(0);
+        if arguments.first().map(OsString::as_os_str) == Some(OsStr::new("--json")) {
+            return Err(ParseError::new("--json may only be specified once"));
+        }
+        DiffOutput::Json
+    } else {
+        DiffOutput::Human
+    };
+
     if arguments.len() != 2 {
         return Err(ParseError::new("diff requires two session paths"));
     }
@@ -184,7 +201,11 @@ fn parse_diff(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
     let before = PathBuf::from(arguments.pop().expect("length was checked"));
 
     Ok(ParseResult::Command(Cli {
-        command: Command::Diff(DiffArgs { before, after }),
+        command: Command::Diff(DiffArgs {
+            before,
+            after,
+            output,
+        }),
     }))
 }
 
@@ -193,7 +214,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
 
-    use super::{Cli, Command, HelpTopic, ParseResult};
+    use super::{Cli, Command, DiffOutput, HelpTopic, ParseResult};
     use crate::session::CollectorRequest;
 
     #[test]
@@ -396,6 +417,33 @@ mod tests {
 
         assert_eq!(args.before, Path::new("before.sqlite3"));
         assert_eq!(args.after, Path::new("after.sqlite3"));
+        assert_eq!(args.output, DiffOutput::Human);
+    }
+
+    #[test]
+    fn selects_json_diff_output() {
+        let result = Cli::parse_from([
+            "execwake",
+            "diff",
+            "--json",
+            "before.sqlite3",
+            "after.sqlite3",
+        ])
+        .expect("JSON diff arguments should parse");
+
+        let ParseResult::Command(cli) = result else {
+            panic!("expected command");
+        };
+        let Command::Diff(args) = cli.command else {
+            panic!("expected diff command");
+        };
+
+        assert_eq!(args.before, Path::new("before.sqlite3"));
+        assert_eq!(args.after, Path::new("after.sqlite3"));
+        assert_eq!(args.output, DiffOutput::Json);
+        assert!(
+            Cli::parse_from(["execwake", "diff", "--json", "--json", "after.sqlite3"]).is_err()
+        );
     }
 
     #[test]

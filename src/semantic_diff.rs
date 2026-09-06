@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
@@ -185,6 +185,12 @@ pub fn compare_paths(before: &Path, after: &Path) -> Result<SemanticDiff, DiffEr
         SessionSnapshot::load(before)?,
         SessionSnapshot::load(after)?,
     ))
+}
+
+pub fn write_json(diff: &SemanticDiff, output: &mut impl Write) -> io::Result<()> {
+    serde_json::to_writer(&mut *output, diff)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    writeln!(output)
 }
 
 pub fn compare(before: SessionSnapshot, after: SessionSnapshot) -> SemanticDiff {
@@ -837,8 +843,8 @@ mod tests {
     use crate::storage::{SessionOutcome, SessionStore};
 
     use super::{
-        compare, ChangeStatus, CompatibilityIssue, CoverageSnapshot, DiffError, FindingSnapshot,
-        SessionInfo, SessionSnapshot,
+        compare, write_json, ChangeStatus, CompatibilityIssue, CoverageSnapshot, DiffError,
+        FindingSnapshot, SessionInfo, SessionSnapshot,
     };
 
     struct TestDirectory(PathBuf);
@@ -1285,6 +1291,33 @@ mod tests {
             serde_json::to_vec(&first.what_changed).expect("summary should serialize"),
             serde_json::to_vec(&second.what_changed).expect("summary should serialize")
         );
+    }
+
+    #[test]
+    fn writes_deterministic_machine_readable_output() {
+        let coverage = CoverageSnapshot {
+            state: "complete".to_owned(),
+            lost_events: 0,
+        };
+        let before = snapshot("ptrace", coverage.clone(), Vec::new());
+        let after = snapshot(
+            "ptrace",
+            coverage,
+            vec![fact("$WORKSPACE/new", &["read"], 8)],
+        );
+        let diff = compare(before, after);
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+
+        write_json(&diff, &mut first).expect("the diff should serialize");
+        write_json(&diff, &mut second).expect("the diff should serialize again");
+
+        assert_eq!(first, second);
+        assert_eq!(first.last(), Some(&b'\n'));
+        assert!(!first.contains(&b'\r'));
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&first).expect("the diff should be valid JSON");
+        assert_eq!(parsed["behavior"][0]["status"], "NEW");
     }
 
     #[test]
