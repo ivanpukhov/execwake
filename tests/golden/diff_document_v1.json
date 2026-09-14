@@ -1,0 +1,97 @@
+{
+  "counts": {
+    "behavior": {
+      "changed": 0,
+      "new": 0,
+      "removed": 0,
+      "unchanged": 0
+    },
+    "findings": {
+      "changed": 0,
+      "new": 0,
+      "removed": 0,
+      "unchanged": 0
+    },
+    "incomparableCategories": 0
+  },
+  "diff": {
+    "after": {
+      "backend": "ptrace",
+      "commandName": "true",
+      "fallbackReason": null,
+      "id": "session",
+      "privacyProfile": "paths-v2",
+      "requestedBackend": "auto",
+      "schemaVersion": 11
+    },
+    "before": {
+      "backend": "ptrace",
+      "commandName": "true",
+      "fallbackReason": null,
+      "id": "session",
+      "privacyProfile": "paths-v2",
+      "requestedBackend": "auto",
+      "schemaVersion": 11
+    },
+    "behavior": [],
+    "compatibility": [
+      {
+        "after": {
+          "lostEvents": 0,
+          "state": "complete"
+        },
+        "before": {
+          "lostEvents": 0,
+          "state": "complete"
+        },
+        "category": "filesystem",
+        "comparable": true,
+        "issues": []
+      },
+      {
+        "after": {
+          "lostEvents": 0,
+          "state": "complete"
+        },
+        "before": {
+          "lostEvents": 0,
+          "state": "complete"
+        },
+        "category": "network",
+        "comparable": true,
+        "issues": []
+      },
+      {
+        "after": {
+          "lostEvents": 0,
+          "state": "complete"
+        },
+        "before": {
+          "lostEvents": 0,
+          "state": "complete"
+        },
+        "category": "process",
+        "comparable": true,
+        "issues": []
+      },
+      {
+        "after": {
+          "lostEvents": 0,
+          "state": "complete"
+        },
+        "before": {
+          "lostEvents": 0,
+          "state": "complete"
+        },
+        "category": "environment",
+        "comparable": true,
+        "issues": []
+      }
+    ],
+    "findings": [],
+    "whatChanged": [
+      "No comparable finding changes."
+    ]
+  },
+  "formatVersion": 1
+}

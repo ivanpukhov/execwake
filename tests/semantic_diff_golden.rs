@@ -209,7 +209,8 @@ fn diff_exit_policy_is_exposed_by_the_command() {
     assert_eq!(different.status.code(), Some(10));
     let document: serde_json::Value =
         serde_json::from_slice(&different.stdout).expect("stdout should contain the JSON diff");
-    assert!(document["behavior"]
+    assert_eq!(document["formatVersion"], 1);
+    assert!(document["diff"]["behavior"]
         .as_array()
         .expect("behavior should be an array")
         .iter()
@@ -227,6 +228,30 @@ fn diff_exit_policy_is_exposed_by_the_command() {
 
     let incomparable = diff_command(&unchanged, &changed);
     assert_eq!(incomparable.status.code(), Some(11));
+}
+
+#[test]
+fn machine_diff_document_matches_the_golden_contract() {
+    let directory = TestDirectory::new("machine-contract");
+    let store = SessionStore::at(directory.0.clone()).expect("session storage should be created");
+    let mut active = store.begin("true", 0).expect("the session should start");
+    active
+        .set_backend("ptrace")
+        .expect("the backend should be recorded");
+    let session = finish(active);
+    let output = diff_command(&session, &session);
+    assert_eq!(output.status.code(), Some(0));
+
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should contain the JSON diff");
+    document["diff"]["before"]["id"] = "session".into();
+    document["diff"]["after"]["id"] = "session".into();
+    let actual = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&document).expect("the JSON document should serialize")
+    );
+
+    assert_eq!(actual, include_str!("golden/diff_document_v1.json"));
 }
 
 fn diff_command(before: &SessionPaths, after: &SessionPaths) -> std::process::Output {
