@@ -159,14 +159,7 @@ impl EbpfInitializationError {
     }
 
     fn cgroup(error: io::Error) -> Self {
-        let reason = match error.kind() {
-            io::ErrorKind::NotFound => CollectorFallbackReason::CgroupUnavailable,
-            io::ErrorKind::PermissionDenied => CollectorFallbackReason::PermissionDenied,
-            io::ErrorKind::InvalidData | io::ErrorKind::Unsupported => {
-                CollectorFallbackReason::PlatformIncompatible
-            }
-            _ => CollectorFallbackReason::CgroupSetupFailed,
-        };
+        let reason = cgroup_fallback_reason(error.kind());
         Self::new(reason, "creating collector cgroup", error)
     }
 
@@ -175,6 +168,17 @@ impl EbpfInitializationError {
             self.error.kind(),
             format!("{}: {}", self.reason.as_str(), self.error),
         )
+    }
+}
+
+fn cgroup_fallback_reason(kind: io::ErrorKind) -> CollectorFallbackReason {
+    match kind {
+        io::ErrorKind::NotFound => CollectorFallbackReason::CgroupUnavailable,
+        io::ErrorKind::PermissionDenied => CollectorFallbackReason::PermissionDenied,
+        io::ErrorKind::InvalidData | io::ErrorKind::Unsupported => {
+            CollectorFallbackReason::PlatformIncompatible
+        }
+        _ => CollectorFallbackReason::CgroupSetupFailed,
     }
 }
 
@@ -738,10 +742,15 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
-    use crate::session::{CollectorBackend, CollectorRequest, CoverageState};
+    use crate::session::{
+        CollectorBackend, CollectorFallbackReason, CollectorRequest, CoverageState,
+    };
 
     use super::protocol::{EventKind, SyscallOperation};
-    use super::{add_lost_events, ebpf_coverage, CgroupScope, EbpfProbe, LinuxCollector};
+    use super::{
+        add_lost_events, cgroup_fallback_reason, ebpf_coverage, CgroupScope, EbpfProbe,
+        LinuxCollector,
+    };
 
     static TEST_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -754,6 +763,36 @@ mod tests {
         assert_eq!(decision.requested, CollectorRequest::Ptrace);
         assert_eq!(decision.backend, CollectorBackend::Ptrace);
         assert_eq!(decision.fallback_reason, None);
+    }
+
+    #[test]
+    fn classifies_cgroup_startup_failures() {
+        use std::io::ErrorKind;
+
+        for (kind, expected) in [
+            (
+                ErrorKind::NotFound,
+                CollectorFallbackReason::CgroupUnavailable,
+            ),
+            (
+                ErrorKind::PermissionDenied,
+                CollectorFallbackReason::PermissionDenied,
+            ),
+            (
+                ErrorKind::InvalidData,
+                CollectorFallbackReason::PlatformIncompatible,
+            ),
+            (
+                ErrorKind::Unsupported,
+                CollectorFallbackReason::PlatformIncompatible,
+            ),
+            (
+                ErrorKind::AlreadyExists,
+                CollectorFallbackReason::CgroupSetupFailed,
+            ),
+        ] {
+            assert_eq!(cgroup_fallback_reason(kind), expected);
+        }
     }
 
     #[test]
