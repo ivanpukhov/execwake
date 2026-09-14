@@ -25,6 +25,7 @@ use crate::storage::SessionId;
 
 pub const DIFF_CHANGED_EXIT_CODE: i32 = 10;
 pub const DIFF_INCOMPARABLE_EXIT_CODE: i32 = 11;
+pub const DIFF_JSON_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug)]
 pub enum DiffError {
@@ -176,6 +177,13 @@ pub struct SemanticDiff {
     pub what_changed: Vec<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiffDocument<'a> {
+    format_version: u32,
+    diff: &'a SemanticDiff,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FindingKey {
     rule_id: String,
@@ -191,7 +199,11 @@ pub fn compare_paths(before: &Path, after: &Path) -> Result<SemanticDiff, DiffEr
 }
 
 pub fn write_json(diff: &SemanticDiff, output: &mut impl Write) -> io::Result<()> {
-    serde_json::to_writer(&mut *output, diff)
+    let document = DiffDocument {
+        format_version: DIFF_JSON_FORMAT_VERSION,
+        diff,
+    };
+    serde_json::to_writer(&mut *output, &document)
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
     writeln!(output)
 }
@@ -870,7 +882,7 @@ mod tests {
     use super::{
         compare, policy_exit_code, write_json, ChangeStatus, CompatibilityIssue, CoverageSnapshot,
         DiffError, FindingSnapshot, SessionInfo, SessionSnapshot, DIFF_CHANGED_EXIT_CODE,
-        DIFF_INCOMPARABLE_EXIT_CODE,
+        DIFF_INCOMPARABLE_EXIT_CODE, DIFF_JSON_FORMAT_VERSION,
     };
 
     struct TestDirectory(PathBuf);
@@ -1343,7 +1355,8 @@ mod tests {
         assert!(!first.contains(&b'\r'));
         let parsed: serde_json::Value =
             serde_json::from_slice(&first).expect("the diff should be valid JSON");
-        assert_eq!(parsed["behavior"][0]["status"], "NEW");
+        assert_eq!(parsed["formatVersion"], DIFF_JSON_FORMAT_VERSION);
+        assert_eq!(parsed["diff"]["behavior"][0]["status"], "NEW");
     }
 
     #[test]
