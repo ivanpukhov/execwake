@@ -502,9 +502,10 @@ impl EbpfProbe {
         let mut output = run.stop()?;
         let losses = Array::<_, u64>::try_from(self.bpf.map_mut("LOSSES").map_err(other_error)?)
             .map_err(other_error)?;
-        output.lost_events = output
-            .lost_events
-            .saturating_add(losses.get(&0, 0).map_err(other_error)?);
+        add_lost_events(
+            &mut output.lost_events,
+            losses.get(&0, 0).map_err(other_error)?,
+        );
         Ok(output)
     }
 }
@@ -686,7 +687,7 @@ fn drain_buffers(
         match buffer.read_events(output) {
             Ok(events) => {
                 drained += events.read;
-                *lost = lost.saturating_add(events.lost as u64);
+                add_lost_events(lost, events.lost as u64);
                 for event in output.iter_mut().take(events.read) {
                     match protocol::decode(event) {
                         Ok(event)
@@ -695,18 +696,22 @@ fn drain_buffers(
                             captured.push(event);
                         }
                         Ok(_) | Err(_) => {
-                            *lost = lost.saturating_add(1);
+                            add_lost_events(lost, 1);
                         }
                     }
                     event.clear();
                 }
             }
             Err(_) => {
-                *lost = lost.saturating_add(1);
+                add_lost_events(lost, 1);
             }
         }
     }
     drained
+}
+
+fn add_lost_events(total: &mut u64, count: u64) {
+    *total = total.saturating_add(count);
 }
 
 fn valid_event(event: &protocol::Event) -> bool {
@@ -736,7 +741,7 @@ mod tests {
     use crate::session::{CollectorBackend, CollectorRequest, CoverageState};
 
     use super::protocol::{EventKind, SyscallOperation};
-    use super::{ebpf_coverage, CgroupScope, EbpfProbe, LinuxCollector};
+    use super::{add_lost_events, ebpf_coverage, CgroupScope, EbpfProbe, LinuxCollector};
 
     static TEST_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -764,6 +769,16 @@ mod tests {
             assert_eq!(category.state(), CoverageState::Partial);
             assert_eq!(category.lost_events(), 19);
         }
+    }
+
+    #[test]
+    fn combines_reader_and_kernel_loss_without_overflow() {
+        let mut lost_events = 7;
+        add_lost_events(&mut lost_events, 11);
+        assert_eq!(lost_events, 18);
+
+        add_lost_events(&mut lost_events, u64::MAX);
+        assert_eq!(lost_events, u64::MAX);
     }
 
     #[test]
