@@ -108,12 +108,12 @@ impl Cli {
 pub fn help_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::Root => {
-            "ExecWake\n\nUsage:\n  execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--output <path>] [--] <command> [arguments...]\n  execwake diff [--json] [--exit-code] <before> <after>\n"
+            "ExecWake\n\nUsage:\n  execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--output <path>] [--] <command> [arguments...]\n  execwake diff [--json] [--exit-code] [--] <before> <after>\n"
         }
         HelpTopic::Run => {
             "Usage: execwake run [--node-enrichment] [--collector auto|ebpf|ptrace] [--output <path>] [--] <command> [arguments...]\n"
         }
-        HelpTopic::Diff => "Usage: execwake diff [--json] [--exit-code] <before> <after>\n",
+        HelpTopic::Diff => "Usage: execwake diff [--json] [--exit-code] [--] <before> <after>\n",
     }
 }
 
@@ -211,6 +211,21 @@ fn parse_diff(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
                 }
                 exit_code = true;
                 arguments.remove(0);
+            }
+            Some(value) if value == OsStr::new("--") => {
+                arguments.remove(0);
+                break;
+            }
+            Some(value)
+                if value
+                    .to_str()
+                    .map(|value| value.starts_with('-'))
+                    .unwrap_or(false) =>
+            {
+                return Err(ParseError::new(format!(
+                    "unknown diff option: {}",
+                    value.to_string_lossy()
+                )));
             }
             _ => break,
         }
@@ -524,6 +539,22 @@ mod tests {
             "after.sqlite3"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn uses_a_separator_for_diff_paths_that_start_with_a_dash() {
+        let result = Cli::parse_from(["execwake", "diff", "--", "-before", "-after"])
+            .expect("paths after the separator should parse");
+        let ParseResult::Command(cli) = result else {
+            panic!("expected command");
+        };
+        let Command::Diff(args) = cli.command else {
+            panic!("expected diff command");
+        };
+
+        assert_eq!(args.before, Path::new("-before"));
+        assert_eq!(args.after, Path::new("-after"));
+        assert!(Cli::parse_from(["execwake", "diff", "--unknown", "before", "after"]).is_err());
     }
 
     #[test]
