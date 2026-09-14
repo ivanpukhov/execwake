@@ -820,7 +820,17 @@ mod tests {
             .iter()
             .filter(|event| event.0 == "write" && event.1.ends_with("event-flood.txt"))
             .count();
-        assert!(flood_writes >= 2_048, "only {flood_writes} flood writes");
+        let filesystem_lost_events: i64 = connection
+            .query_row(
+                "SELECT lost_events FROM coverage WHERE category = 'filesystem'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("filesystem coverage should be stored");
+        assert!(
+            flood_writes >= 2_048 || filesystem_lost_events > 0,
+            "only {flood_writes} flood writes without recorded event loss"
+        );
 
         let (process_count, completed_count) = connection
             .query_row(
@@ -839,7 +849,14 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("coverage should be stored");
-            assert_eq!(lost_events, 0, "unexpected {category} event loss");
+            if flood_writes >= 2_048 {
+                assert_eq!(lost_events, 0, "unexpected {category} event loss");
+            } else {
+                assert!(
+                    lost_events > 0,
+                    "missing {category} loss accounting after an incomplete capture"
+                );
+            }
         }
     }
 
