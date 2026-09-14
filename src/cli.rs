@@ -126,14 +126,23 @@ fn parse_run(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
 
     let mut node_enrichment = false;
     let mut collector = CollectorRequest::Auto;
+    let mut collector_selected = false;
     let mut output = None;
     loop {
         match arguments.first().map(OsString::as_os_str) {
             Some(value) if value == OsStr::new("--node-enrichment") => {
+                if node_enrichment {
+                    return Err(ParseError::new(
+                        "--node-enrichment may only be specified once",
+                    ));
+                }
                 node_enrichment = true;
                 arguments.remove(0);
             }
             Some(value) if value == OsStr::new("--collector") => {
+                if collector_selected {
+                    return Err(ParseError::new("--collector may only be specified once"));
+                }
                 if arguments.len() < 2 {
                     return Err(ParseError::new("--collector requires a value"));
                 }
@@ -143,6 +152,7 @@ fn parse_run(mut arguments: Vec<OsString>) -> Result<ParseResult, ParseError> {
                     .and_then(CollectorRequest::parse)
                     .ok_or_else(|| ParseError::new("collector must be auto, ebpf, or ptrace"))?;
                 collector = value;
+                collector_selected = true;
                 arguments.drain(0..2);
             }
             Some(value) if value == OsStr::new("--output") => {
@@ -391,6 +401,28 @@ mod tests {
             Cli::parse_from(["execwake", "run", "--collector", "unknown", "--", "command"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_repeated_run_options() {
+        assert!(Cli::parse_from([
+            "execwake",
+            "run",
+            "--node-enrichment",
+            "--node-enrichment",
+            "command"
+        ])
+        .is_err());
+        assert!(Cli::parse_from([
+            "execwake",
+            "run",
+            "--collector",
+            "auto",
+            "--collector",
+            "ptrace",
+            "command"
+        ])
+        .is_err());
     }
 
     #[test]
