@@ -181,7 +181,59 @@ pub struct SemanticDiff {
 #[serde(rename_all = "camelCase")]
 struct DiffDocument<'a> {
     format_version: u32,
+    counts: DiffCounts,
     diff: &'a SemanticDiff,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiffCounts {
+    behavior: ChangeCounts,
+    findings: ChangeCounts,
+    incomparable_categories: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangeCounts {
+    new: u64,
+    removed: u64,
+    changed: u64,
+    unchanged: u64,
+}
+
+impl ChangeCounts {
+    fn from_statuses(statuses: impl IntoIterator<Item = ChangeStatus>) -> Self {
+        let mut counts = Self {
+            new: 0,
+            removed: 0,
+            changed: 0,
+            unchanged: 0,
+        };
+        for status in statuses {
+            match status {
+                ChangeStatus::New => counts.new += 1,
+                ChangeStatus::Removed => counts.removed += 1,
+                ChangeStatus::Changed => counts.changed += 1,
+                ChangeStatus::Unchanged => counts.unchanged += 1,
+            }
+        }
+        counts
+    }
+}
+
+impl DiffCounts {
+    fn from_diff(diff: &SemanticDiff) -> Self {
+        Self {
+            behavior: ChangeCounts::from_statuses(diff.behavior.iter().map(|change| change.status)),
+            findings: ChangeCounts::from_statuses(diff.findings.iter().map(|change| change.status)),
+            incomparable_categories: diff
+                .compatibility
+                .iter()
+                .filter(|category| !category.comparable)
+                .count() as u64,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -201,6 +253,7 @@ pub fn compare_paths(before: &Path, after: &Path) -> Result<SemanticDiff, DiffEr
 pub fn write_json(diff: &SemanticDiff, output: &mut impl Write) -> io::Result<()> {
     let document = DiffDocument {
         format_version: DIFF_JSON_FORMAT_VERSION,
+        counts: DiffCounts::from_diff(diff),
         diff,
     };
     serde_json::to_writer(&mut *output, &document)
@@ -1356,6 +1409,9 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_slice(&first).expect("the diff should be valid JSON");
         assert_eq!(parsed["formatVersion"], DIFF_JSON_FORMAT_VERSION);
+        assert_eq!(parsed["counts"]["behavior"]["new"], 1);
+        assert_eq!(parsed["counts"]["behavior"]["unchanged"], 0);
+        assert_eq!(parsed["counts"]["incomparableCategories"], 0);
         assert_eq!(parsed["diff"]["behavior"][0]["status"], "NEW");
     }
 
