@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.0-rc.4 — 2026-09-14
+
+- Made eBPF event draining account for the complete final buffer and classify
+  overload as partial coverage.
+- Added bounded eBPF startup failure reasons and required automatic fallback
+  checks on restricted Ubuntu 24.04 runners.
+- Hardened signal forwarding, collector shutdown, and failed-start session
+  finalization.
+- Added read-only report and diff support for session schemas written by the
+  first three release candidates.
+- Added `run --output` for exporting a finalized session without overwriting an
+  existing path.
+- Added deterministic `diff --json` output and opt-in CI exit codes for changed
+  and incomparable results.
+- Added package smoke tests on Debian 12 and a GLIBC 2.35 compatibility ceiling
+  for release artifacts on amd64 and arm64.
+
 ## 0.1.0-rc.3 — 2026-09-06
 
 - Added explicit `auto`, `ebpf`, and `ptrace` collector selection.

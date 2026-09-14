@@ -13,7 +13,7 @@ environment coverage.
 
 ## Status
 
-ExecWake 0.1.0-rc.3 is a Linux alpha. The collector records:
+ExecWake 0.1.0-rc.4 is a Linux alpha. The collector records:
 
 - process fork, clone, exec, exit, exit code, and terminating signal;
 - file operations and verified final state deltas;
@@ -36,13 +36,19 @@ are unavailable. The selected backend is stored in every session manifest.
 Current overhead measurements are published in
 [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 
+Release CI requires eBPF conformance on Ubuntu 22.04 amd64. eBPF jobs on
+Ubuntu 22.04 arm64 and Ubuntu 24.04 are advisory: the arm64 flood case and
+tracepoint attachment on the Ubuntu 24.04 hosted runners are not yet reliable.
+Required `auto` tests on Ubuntu 24.04 verify that these startup failures are
+recorded and fall back to ptrace.
+
 ## Install
 
 The installer requires Linux, `curl`, `cosign`, `sha256sum`, and `tar`. Download
 it from the same tag as the release, inspect it, and run it with that exact tag:
 
 ```sh
-tag=v0.1.0-rc.3
+tag=v0.1.0-rc.4
 curl --fail --location --proto '=https' --tlsv1.2 --remote-name \
   "https://raw.githubusercontent.com/ivanpukhov/execwake/$tag/scripts/install-linux.sh"
 less install-linux.sh
@@ -82,6 +88,16 @@ shell command string.
 execwake run -- npm install some-package
 execwake run -- cargo test
 ```
+
+To keep a finalized copy at a specific path, use `--output` before the argv
+separator:
+
+```sh
+execwake run --output ./install-session.sqlite3 -- npm install some-package
+```
+
+The destination must not already exist. The original session remains in the
+private ExecWake state directory.
 
 Collector selection defaults to `auto`. To require one backend, put the option
 before the argv separator:
@@ -150,10 +166,25 @@ Compare two finalized session files with:
 execwake diff before.sqlite3 after.sqlite3
 ```
 
+For a stable machine-readable result, write compact JSON to stdout:
+
+```sh
+execwake diff --json before.sqlite3 after.sqlite3
+```
+
+`--exit-code` is opt-in and can be combined with `--json`. It returns `0` when
+there are no changes, `10` when comparable behavior changed, and `11` when at
+least one category is incomparable. Parse or input failures continue to return
+the normal command error codes.
+
 The comparison classifies comparable behavior as `NEW`, `REMOVED`, `CHANGED`,
 or `UNCHANGED`. Categories with incompatible schema, backend, privacy profile,
 coverage, or lost-event state are marked incomparable instead of being treated
 as absent.
+
+This release reads session behavior from schemas 9, 10, and 11, covering files
+written by rc.1 through rc.4. Imported files remain read-only. Unknown newer
+schemas are rejected.
 
 ## Local report security
 
@@ -181,7 +212,9 @@ scripts/verify-reproducible-package.sh "$(rustc -vV | sed -n 's/^host: //p')"
 
 The packaging script uses the current architecture and refuses to overwrite an
 existing archive. Tagged builds and manual runs of the release workflow produce
-artifacts for x86_64 and arm64.
+artifacts for x86_64 and arm64. Package CI runs on Ubuntu 22.04 and 24.04 for
+both architectures. Release-compatible builds are also run in Debian 12, and
+the workflow rejects a binary requiring a glibc version newer than 2.35.
 
 ![Static ExecWake report overview](docs/assets/execwake-report.jpg)
 
