@@ -217,17 +217,39 @@ jobs:
           trap 'rm -rf -- "$staging"' EXIT
           tar -xzf "dist/$package.tar.gz" -C "$staging" "$package/execwake"
           binary="$staging/$package/execwake"
+          first_session="$RUNNER_TEMP/execwake-first.sqlite3"
+          second_session="$RUNNER_TEMP/execwake-second.sqlite3"
 
-          "$binary" run -- /usr/bin/true
+          "$binary" run --output "$first_session" -- /usr/bin/true
 
           set +e
-          "$binary" run -- /bin/sh -c 'exit 17'
+          "$binary" run --output "$second_session" -- /bin/sh -c 'exit 17'
           status=$?
           set -e
           if (( status != 17 )); then
             echo "Expected exit code 17, got $status." >&2
             exit 1
           fi
+
+          "$binary" diff --json --exit-code "$first_session" "$first_session" \
+            | jq -e '.formatVersion == 1 and .counts.incomparableCategories == 0' >/dev/null
+          set +e
+          "$binary" diff --json --exit-code "$first_session" "$second_session" \
+            | jq -e '.formatVersion == 1 and (.counts.behavior.new + .counts.behavior.removed + .counts.behavior.changed > 0)' >/dev/null
+          statuses=("${PIPESTATUS[@]}")
+          diff_status=${statuses[0]}
+          json_status=${statuses[1]}
+          set -e
+          if (( diff_status != 10 || json_status != 0 )); then
+            echo "Packaged diff returned $diff_status and JSON validation returned $json_status." >&2
+            exit 1
+          fi
+          for exported in "$first_session" "$second_session"; do
+            if [[ ! -f "$exported" || $(stat -c '%a' "$exported") != 600 ]]; then
+              echo "Exported session is missing or not private: $exported" >&2
+              exit 1
+            fi
+          done
 
           sessions="$XDG_STATE_HOME/execwake/sessions"
           database_count=$(find "$sessions" -maxdepth 1 -type f -name '*.sqlite3' | wc -l)
