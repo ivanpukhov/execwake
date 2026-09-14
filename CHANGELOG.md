@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.0-rc.5 — 2026-09-15
+
+- Made eBPF load conformance accept incomplete flood capture only when the
+  trace records event loss and partial coverage.
+- Added explicit tests for bounded eBPF loss totals and cgroup fallback reason
+  classification.
+- Rejected repeated `run` options and added `diff --` for session paths that
+  begin with a dash.
+- Versioned the `diff --json` document and added deterministic behavior,
+  finding, and incomparable-category counts.
+- Added a golden machine-format contract and exercised exported sessions,
+  JSON output, and diff exit policies with packaged binaries.
+
 ## 0.1.0-rc.4 — 2026-09-14
 
 - Made eBPF event draining account for the complete final buffer and classify

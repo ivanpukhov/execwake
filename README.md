@@ -13,7 +13,7 @@ environment coverage.
 
 ## Status
 
-ExecWake 0.1.0-rc.4 is a Linux alpha. The collector records:
+ExecWake 0.1.0-rc.5 is a Linux alpha. The collector records:
 
 - process fork, clone, exec, exit, exit code, and terminating signal;
 - file operations and verified final state deltas;
@@ -48,7 +48,7 @@ The installer requires Linux, `curl`, `cosign`, `sha256sum`, and `tar`. Download
 it from the same tag as the release, inspect it, and run it with that exact tag:
 
 ```sh
-tag=v0.1.0-rc.4
+tag=v0.1.0-rc.5
 curl --fail --location --proto '=https' --tlsv1.2 --remote-name \
   "https://raw.githubusercontent.com/ivanpukhov/execwake/$tag/scripts/install-linux.sh"
 less install-linux.sh
@@ -172,6 +172,11 @@ For a stable machine-readable result, write compact JSON to stdout:
 execwake diff --json before.sqlite3 after.sqlite3
 ```
 
+The top-level JSON object contains `formatVersion`, deterministic result
+`counts`, and the full `diff`. Version 1 is the current machine format;
+consumers should reject a format version they do not support. Use `--` before
+the paths if either file name starts with a dash.
+
 `--exit-code` is opt-in and can be combined with `--json`. It returns `0` when
 there are no changes, `10` when comparable behavior changed, and `11` when at
 least one category is incomparable. Parse or input failures continue to return
@@ -183,7 +188,7 @@ coverage, or lost-event state are marked incomparable instead of being treated
 as absent.
 
 This release reads session behavior from schemas 9, 10, and 11, covering files
-written by rc.1 through rc.4. Imported files remain read-only. Unknown newer
+written by rc.1 through rc.5. Imported files remain read-only. Unknown newer
 schemas are rejected.
 
 ## Local report security
